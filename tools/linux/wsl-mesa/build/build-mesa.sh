@@ -17,6 +17,8 @@ set -euo pipefail
 MESA_BRANCH="${MESA_BRANCH:-25.3}"
 MESA_SRC="${MESA_SRC:-$HOME/mesa}"
 PREFIX="${PREFIX:-/opt/wsl-mesa}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+PATCH_DIR="${PATCH_DIR:-$SCRIPT_DIR/../patches}"
 
 echo "==> Installing build dependencies (apt build-dep mesa + LLVM 21 dev pkgs)"
 sudo apt-get update
@@ -32,6 +34,20 @@ echo "==> Cloning Mesa $MESA_BRANCH"
 
 echo "==> Configuring meson (prefix=$PREFIX)"
 cd "$MESA_SRC"
+if [[ -d "$PATCH_DIR" ]]; then
+    echo "==> Applying AppSandbox Mesa patches"
+    for patch in "$PATCH_DIR"/*.patch; do
+        [[ -e "$patch" ]] || continue
+        if git apply --reverse --check "$patch" >/dev/null 2>&1; then
+            echo "    already applied: $(basename "$patch")"
+        else
+            git apply --check "$patch"
+            git apply "$patch"
+            echo "    applied: $(basename "$patch")"
+        fi
+    done
+fi
+
 rm -rf build
 meson setup --prefix="$PREFIX" --buildtype=release --strip \
     -D gallium-drivers=llvmpipe,d3d12 \

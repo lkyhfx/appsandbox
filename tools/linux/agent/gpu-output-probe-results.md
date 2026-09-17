@@ -111,5 +111,31 @@ appsandbox-gpu env GALLIUM_DRIVER=llvmpipe MESA_LOADER_DRIVER_OVERRIDE=llvmpipe 
 3. 待单纹理共享、像素正确性和同步复用通过后，再接入隔离 Mutter 的
    render target；最后才替换生产桌面输出及现有 CPU 采集协议。
 
+## 第三轮准备（尚未计入上述实测结论）
+
+已加入 Mesa 25.3.6 补丁和 GBM 共享分配探针，供下一轮构建后验证：
+
+- `../wsl-mesa/patches/0001-d3d12-fix-shared-resource-export.patch`：检查
+  `CreateSharedHandle` 的 HRESULT/无效句柄，并让 EGL 在 FD 查询失败时返回
+  `EGL_FALSE`，不再出现“成功但 fd=-1”。补丁刻意不把
+  `D3D12_HEAP_FLAG_SHARED` 的 dxg/NT shared-object FD 当作 DMA-BUF 导出。
+- `gbm-shared-export-probe.c`：走 GBM 预分配共享纹理路径，并用
+  `drmPrimeFDToHandle` 验证导出的描述符确实是 DRM PRIME dma-buf；D3D12
+  opaque shared fd 不能冒充通过。
+
+编译和运行：
+
+```sh
+gcc -std=gnu11 -O2 -Wall -Wextra -Werror \
+    -Ideps/usr/include -I/usr/include/libdrm gbm-shared-export-probe.c \
+    -l:libgbm.so.1 -l:libdrm.so.2 -o gbm-shared-export-probe
+bash gpu-gbm-share-probe.sh results-gbm-share
+```
+
+当前未打补丁的 Guest 上，两个 GBM 节点均复现 `export_fd=-1`，停在
+`gbm-export-valid-fd`。补丁后的预期变化是 EGL/GBM 明确返回导出失败，而非
+假成功；零拷贝验收仍须由后续真正的 dma-buf bridge 或匹配的 D3D12 native
+consumer 同时满足有效句柄、类型、像素 round-trip 和同步复用检查。
+
 本轮将阻塞从“可能不兼容”收敛到可重复的 GPU 纹理导出失败，
 并验证无头合成器可独立启动；尚不足以修改生产桌面的软件合成兜底。

@@ -455,3 +455,5 @@ src/app_mac/xcconfig/LocalUser.xcconfig
 !/vendor/qemu-ivshmem/dist/bin/
 !/vendor/qemu-ivshmem/dist/bin/*
 mac-gpu/
+
+/build

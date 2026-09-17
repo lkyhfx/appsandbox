@@ -1,0 +1,104 @@
+From: AppSandbox contributors
+Subject: [PATCH] d3d12: reject failed resource handle exports
+
+EGL_MESA_image_dma_buf_export reaches d3d12_resource_get_handle with an FD
+winsys handle.  On Linux, CreateSharedHandle can return a failed HRESULT and
+INVALID_HANDLE_VALUE.  The old code ignored the HRESULT, treated -1 as a
+non-null handle, and made eglExportDMABUFImageMESA report success with fd=-1.
+
+Validate both the HRESULT and returned handle, and propagate an FD-query
+failure through EGL.  Do not make PIPE_BIND_SHARED allocations use
+D3D12_HEAP_FLAG_SHARED here: dxgkrnl resource FDs are NT shared-object FDs,
+not DRM PRIME dma-bufs, so exporting one through this EGL API would violate
+the API contract.
+
+---
+ src/egl/drivers/dri2/egl_dri2.c              | 11 ++++++++---
+ src/gallium/drivers/d3d12/d3d12_resource.cpp | 24 +++++++++++++++++-------
+ 2 files changed, 25 insertions(+), 10 deletions(-)
+
+diff --git a/src/egl/drivers/dri2/egl_dri2.c b/src/egl/drivers/dri2/egl_dri2.c
+index bec8af9..4490ac4 100644
+--- a/src/egl/drivers/dri2/egl_dri2.c
++++ b/src/egl/drivers/dri2/egl_dri2.c
+@@ -2566,6 +2566,7 @@ dri2_export_dma_buf_image_mesa(_EGLDisplay *disp, _EGLImage *img, int *fds,
+                        &is_disjoint);
+    }
+ 
++   EGLBoolean exported = EGL_TRUE;
+    for (int i = 0; i < nplanes; i++) {
+       struct dri_image *image = dri2_img->dri_image;
+       if (i)
+@@ -2576,8 +2577,12 @@ dri2_export_dma_buf_image_mesa(_EGLDisplay *disp, _EGLImage *img, int *fds,
+           *    "If the number of fds is less than the number of planes, then
+           *    subsequent fd slots should contain -1."
+           */
+-         if (i == 0 || is_disjoint)
+-            dri2_query_image(image, __DRI_IMAGE_ATTRIB_FD, &fds[i]);
++         if (i == 0 || is_disjoint) {
++            if (!dri2_query_image(image, __DRI_IMAGE_ATTRIB_FD, &fds[i])) {
++               fds[i] = -1;
++               exported = EGL_FALSE;
++            }
++         }
+          else
+             fds[i] = -1;
+       }
+@@ -2594,7 +2599,7 @@ dri2_export_dma_buf_image_mesa(_EGLDisplay *disp, _EGLImage *img, int *fds,
+ 
+    mtx_unlock(&dri2_dpy->lock);
+ 
+-   return EGL_TRUE;
++   return exported;
+ }
+ 
+ #endif
+diff --git a/src/gallium/drivers/d3d12/d3d12_resource.cpp b/src/gallium/drivers/d3d12/d3d12_resource.cpp
+index 4db371b..b294149 100644
+--- a/src/gallium/drivers/d3d12/d3d12_resource.cpp
++++ b/src/gallium/drivers/d3d12/d3d12_resource.cpp
+@@ -39,6 +39,7 @@
+ #include "frontend/sw_winsys.h"
+ 
+ #include <dxguids/dxguids.h>
++#include <limits.h>
+ #include <memory>
+ 
+ #ifndef _GAMING_XBOX
+@@ -819,18 +820,27 @@ d3d12_resource_get_handle(struct pipe_screen *pscreen,
+    case WINSYS_HANDLE_TYPE_FD: {
+       HANDLE d3d_handle = nullptr;
+ 
+-      screen->dev->CreateSharedHandle(d3d12_resource_resource(res),
+-                                      nullptr,
+-                                      GENERIC_ALL,
+-                                      nullptr,
+-                                      &d3d_handle);
+-      if (!d3d_handle)
++      HRESULT hr = screen->dev->CreateSharedHandle(d3d12_resource_resource(res),
++                                                   nullptr,
++                                                   GENERIC_ALL,
++                                                   nullptr,
++                                                   &d3d_handle);
++      if (FAILED(hr) || !d3d_handle || (intptr_t)d3d_handle == -1) {
++         debug_printf("d3d12: CreateSharedHandle failed for resource %p (HRESULT 0x%08x, handle %p)\n",
++                      d3d12_resource_resource(res), (unsigned)hr, d3d_handle);
+          return false;
++      }
+       
+ #ifdef _WIN32
+       handle->handle = d3d_handle;
+ #else
+-      handle->handle = (int)(intptr_t)d3d_handle;
++      intptr_t fd = (intptr_t)d3d_handle;
++      if (fd < 0 || fd > INT_MAX) {
++         debug_printf("d3d12: CreateSharedHandle returned invalid Linux fd %ld\n",
++                      (long)fd);
++         return false;
++      }
++      handle->handle = (int)fd;
+ #endif
+       handle->format = pres->format;
+       handle->modifier = ~0ull;
+-- 
+2.51.0
