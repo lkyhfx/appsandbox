@@ -81,7 +81,7 @@ disable:
 	-systemctl disable --now appsandbox-agent.service
 
 clean:
-	rm -f $(BINS) d3d12-native-share-probe
+	rm -f $(BINS) d3d12-native-share-probe d3d12-cross-process-share-probe
 
 # Diagnostic only: requires Microsoft's WSL libd3d12/libdxcore runtime and
 # the official DirectX-Headers development package.  Keep it out of `all` so
@@ -91,4 +91,14 @@ d3d12-native-share-probe: d3d12-native-share-probe.cpp
 	       -Werror -Wno-unknown-pragmas -o $@ $< \
 	       $$(pkg-config --cflags --libs DirectX-Headers) -ld3d12 -ldxcore
 
-.PHONY: all install install-pointer enable disable clean
+# Cross-process diagnostic: producer and consumer are fork+exec children and
+# exchange native dxg resource/event descriptors with SCM_RIGHTS.  Keep this
+# out of `all`; it requires the same opt-in WSL D3D12 runtime as the probe
+# above, plus a 4K render/copy workload.
+d3d12-cross-process-share-probe: d3d12-cross-process-share-probe.cpp
+	$(CXX) -std=c++17 $(CXXFLAGS) -D_GNU_SOURCE -D_WIN32_WINNT=0x0A00 \
+	       -O2 -Wall -Wextra -Werror -Wno-unknown-pragmas -o $@ $< \
+	       $$(pkg-config --cflags --libs DirectX-Headers) -ld3d12 -ldxcore
+
+.PHONY: all install install-pointer enable disable clean \
+	d3d12-native-share-probe d3d12-cross-process-share-probe

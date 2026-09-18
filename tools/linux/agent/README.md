@@ -71,6 +71,36 @@ resource+fence acceptance.
 The Make target deliberately remains outside `all`, so the five production
 agents do not acquire a D3D12 runtime dependency.
 
+## D3D12 cross-process 4K60 share probe
+
+`d3d12-cross-process-share-probe` is the next-stage gate for native sharing.
+The launcher `fork+exec`s independent producer and consumer processes; the
+consumer never inherits a producer D3D12 device. The producer exports three
+3840x2160 BGRA8 resources and sends their native dxg descriptors with
+`SCM_RIGHTS`. The consumer opens them with its own
+`ID3D12Device::OpenSharedHandle()` and both sides close the resource transport
+descriptors after the open acknowledgement.
+
+The frame path uses a three-slot ring. Producer readiness and consumer
+completion each use `SetEventOnCompletion()` on Linux `eventfd`s, with the
+other process waiting through `poll()`. The consumer performs a GPU-only
+texture copy into a private default-heap texture. CPU readback is limited to
+one diagnostic check every 120 frames. The probe is paced at 60 Hz for 3600
+frames and fails on any timeout, resource reopen failure, sequence mismatch,
+or sustained-rate failure.
+
+Build and run inside the GPU-PV guest:
+
+```sh
+make d3d12-cross-process-share-probe
+bash gpu-d3d12-cross-process-share-probe.sh results-d3d12-cross-process
+```
+
+Set `GPU_RUNNER=` when launching the binary directly instead of through the
+guest's `appsandbox-gpu` wrapper. The expected successful run ends with
+`PASS d3d12-cross-process-zero-copy`; the measured log is recorded in
+`gpu-d3d12-cross-process-share-probe-results.md`.
+
 ## Uninstall
 
 ```sh
