@@ -1,0 +1,21 @@
+[Unit]
+Description=AppSandbox D3D12 display encoder
+ConditionPathExists=/usr/local/libexec/appsandbox-display-d3d12
+ConditionPathExists=/dev/dxg
+After=appsandbox-agent.service
+Before=appsandbox-display.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/appsandbox-display-d3d12
+Restart=always
+RestartSec=2
+RuntimeDirectory=appsandbox
+RuntimeDirectoryMode=0750
+User=root
+Environment=LD_LIBRARY_PATH=/opt/appsandbox/wsl-deps
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

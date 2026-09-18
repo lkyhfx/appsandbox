@@ -47,6 +47,12 @@ compile: agents modules
 # libxcb for clipboard).
 agents:
 	$(MAKE) -C agent
+	@if pkg-config --exists DirectX-Headers 2>/dev/null && \
+	    [ -f /opt/appsandbox/wsl-deps/libd3d12.so ]; then \
+		$(MAKE) -C agent d3d12-helper; \
+	else \
+		echo "  D3D12 helper skipped (DirectX-Headers/runtime unavailable)"; \
+	fi
 
 install-agents: agents
 	@install -d $(DISTDIR)
@@ -57,6 +63,11 @@ install-agents: agents
 	        echo "  installed $(DISTDIR)/$$bin"; \
 	    fi; \
 	done
+	@if [ -f agent/appsandbox-display-d3d12 ]; then \
+		install -d $(DISTDIR)/libexec; \
+		install -m 0755 agent/appsandbox-display-d3d12 $(DISTDIR)/libexec/; \
+		echo "  installed $(DISTDIR)/libexec/appsandbox-display-d3d12"; \
+	fi
 	install -d $(DISTDIR)/gnome/appsandbox-pointer@appsandbox
 	install -m 0644 agent/gnome/appsandbox-pointer@appsandbox/*.json agent/gnome/appsandbox-pointer@appsandbox/*.js $(DISTDIR)/gnome/appsandbox-pointer@appsandbox/
 

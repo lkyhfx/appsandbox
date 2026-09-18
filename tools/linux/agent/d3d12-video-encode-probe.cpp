@@ -26,6 +26,10 @@
 #include <algorithm>
 #include <fstream>
 #include <limits>
+#include <memory>
+#include <ostream>
+
+#include "display_protocol.h"
 
 namespace {
 
@@ -612,7 +616,7 @@ static UINT64 align_up(UINT64 value, UINT64 alignment)
     return (value + alignment - 1) / alignment * alignment;
 }
 
-static bool collect_encoded_slot(EncodeSlot *slot, std::ofstream *stream,
+static bool collect_encoded_slot(EncodeSlot *slot, std::ostream *stream,
                                  UINT64 bitstream_capacity,
                                  UINT64 metadata_size,
                                  std::uint64_t *encoded_frames,
@@ -728,6 +732,76 @@ static bool collect_encoded_slot(EncodeSlot *slot, std::ofstream *stream,
     slot->copy_pending = false;
     return true;
 }
+
+class EncodedPacketStreamBuf final : public std::streambuf {
+public:
+    explicit EncodedPacketStreamBuf(int fd) : fd_(fd) {}
+
+protected:
+    std::streamsize xsputn(const char *data, std::streamsize count) override
+    {
+        if (count <= 0)
+            return count;
+        if (!configured_) {
+            AsbEncodedVideoConfig config = {};
+            config.magic = ASB_DISPLAY_VIDEO_CONFIG_MAGIC;
+            config.version = ASB_DISPLAY_PROTOCOL_VERSION;
+            config.header_size = sizeof(config);
+            config.generation = 1;
+            config.codec = ASB_DISPLAY_CODEC_HEVC;
+            config.width = kWidth;
+            config.height = kHeight;
+            config.fps_num = kFrameRateNumerator;
+            config.fps_den = kFrameRateDenominator;
+            config.flags = ASB_DISPLAY_VIDEO_FLAG_DISCONTINUITY;
+            config.extradata_size = static_cast<std::uint32_t>(count);
+            if (!send_message(&config, sizeof(config), data,
+                              static_cast<std::size_t>(count)))
+                return 0;
+            configured_ = true;
+            return count;
+        }
+        AsbEncodedVideoFrame frame = {};
+        frame.magic = ASB_DISPLAY_VIDEO_FRAME_MAGIC;
+        frame.version = ASB_DISPLAY_PROTOCOL_VERSION;
+        frame.header_size = sizeof(frame);
+        frame.generation = 1;
+        frame.frame_seq = ++frame_seq_;
+        frame.capture_time_ns = monotonic_ns();
+        /* The validated baseline currently emits intra pictures. */
+        frame.flags = ASB_DISPLAY_VIDEO_FLAG_IDR;
+        frame.payload_size = static_cast<std::uint32_t>(count);
+        return send_message(&frame, sizeof(frame), data,
+                            static_cast<std::size_t>(count)) ? count : 0;
+    }
+
+    int overflow(int ch) override
+    {
+        if (ch == traits_type::eof()) return traits_type::not_eof(ch);
+        const char c = static_cast<char>(ch);
+        return xsputn(&c, 1) == 1 ? ch : traits_type::eof();
+    }
+
+private:
+    bool send_message(const void *header, std::size_t header_size,
+                      const void *payload, std::size_t payload_size)
+    {
+        struct iovec iov[2] = {
+            {const_cast<void *>(header), header_size},
+            {const_cast<void *>(payload), payload_size}
+        };
+        struct msghdr message = {};
+        message.msg_iov = iov;
+        message.msg_iovlen = 2;
+        const std::size_t total = header_size + payload_size;
+        return sendmsg(fd_, &message, MSG_NOSIGNAL) ==
+               static_cast<ssize_t>(total);
+    }
+
+    int fd_;
+    bool configured_ = false;
+    std::uint64_t frame_seq_ = 0;
+};
 
 static bool encode_consumer_main(int control_fd)
 {
@@ -944,15 +1018,33 @@ static bool encode_consumer_main(int control_fd)
                 "d3d12_encode=GPU-only cpu_framebuffer_copy=0\n",
                 bundle.format == kDxgiFormatR8G8B8A8Unorm ? "rgba" : "bgra");
 
+    const char *packet_fd_text = std::getenv("ASB_D3D12_ENCODED_FD");
     const char *path = std::getenv("D3D12_VIDEO_BITSTREAM_PATH");
     const char *stream_path = path != nullptr ? path
-                                                : "/tmp/d3d12-video-probe.hevc";
-    std::ofstream stream(stream_path, std::ios::binary | std::ios::trunc);
-    if (!stream)
+                                               : "/tmp/d3d12-video-probe.hevc";
+    std::unique_ptr<EncodedPacketStreamBuf> packet_buffer;
+    std::unique_ptr<std::ostream> packet_stream;
+    std::unique_ptr<std::ofstream> file_stream;
+    std::ostream *stream = nullptr;
+    if (packet_fd_text && *packet_fd_text) {
+        char *end = nullptr;
+        long parsed = std::strtol(packet_fd_text, &end, 10);
+        if (!end || *end || parsed < 0 || parsed > std::numeric_limits<int>::max())
+            return false;
+        packet_buffer = std::make_unique<EncodedPacketStreamBuf>(static_cast<int>(parsed));
+        packet_stream = std::make_unique<std::ostream>(packet_buffer.get());
+        stream = packet_stream.get();
+        stream_path = "seqpacket";
+    } else {
+        file_stream = std::make_unique<std::ofstream>(
+            stream_path, std::ios::binary | std::ios::trunc);
+        stream = file_stream.get();
+    }
+    if (!*stream)
         return false;
-    stream.write(reinterpret_cast<const char *>(kHevcSequenceHeaders),
-                 sizeof(kHevcSequenceHeaders));
-    if (!stream)
+    stream->write(reinterpret_cast<const char *>(kHevcSequenceHeaders),
+                  sizeof(kHevcSequenceHeaders));
+    if (!*stream)
         return false;
     std::printf("PASS stage=hevc-sequence-headers vps=1 sps=1 pps=1 bytes=%zu "
                 "host_generated=1 framebuffer_bytes=0\n",
@@ -971,8 +1063,12 @@ static bool encode_consumer_main(int control_fd)
     std::uint64_t encode_failures = 0;
     bool reuse_logged = false;
     const std::uint64_t consumer_start_ns = monotonic_ns();
+    const bool production_session = packet_fd_text && *packet_fd_text;
+    const std::uint64_t frame_limit = production_session
+        ? std::numeric_limits<std::uint64_t>::max()
+        : static_cast<std::uint64_t>(kFrameCount);
 
-    for (std::uint64_t frame = 0; frame < kFrameCount; ++frame) {
+    for (std::uint64_t frame = 0; frame < frame_limit; ++frame) {
         FrameInfoMessage info = {};
         std::vector<int> unexpected_fds;
         std::size_t info_size = 0;
@@ -987,7 +1083,7 @@ static bool encode_consumer_main(int control_fd)
         close_fd_vector(&unexpected_fds);
         EncodeSlot &slot = slots[info.slot];
         if (frame >= kSlotCount) {
-            if (!collect_encoded_slot(&slot, &stream, bitstream_size,
+            if (!collect_encoded_slot(&slot, stream, bitstream_size,
                                       metadata_size, &encoded_frames,
                                       &encoded_bytes, &encode_failures,
                                       &timeouts, &mismatches,
@@ -1059,7 +1155,9 @@ static bool encode_consumer_main(int control_fd)
         if (!hr_ok(process_queue->Signal(process_fence.Get(), process_value),
                    "d3d12-video-process-signal") ||
             !register_event(process_fence.Get(), process_value, process_eventfd,
-                            "d3d12-video-process-eventfd"))
+                            "d3d12-video-process-eventfd") ||
+            !register_event(process_fence.Get(), process_value, slot.done_fd,
+                            "consumer-done-eventfd"))
             return false;
         const std::uint64_t process_submitted_ns = monotonic_ns();
         std::uint64_t process_done_ns = 0;
@@ -1217,8 +1315,6 @@ static bool encode_consumer_main(int control_fd)
         slot.copy_value = frame + 1;
         if (!hr_ok(copy_queue->Signal(copy_fence.Get(), slot.copy_value),
                    "d3d12-video-copy-signal") ||
-            !register_event(copy_fence.Get(), slot.copy_value, slot.done_fd,
-                            "consumer-done-eventfd") ||
             !register_event(copy_fence.Get(), slot.copy_value, slot.copy_fd,
                             "d3d12-video-copy-eventfd"))
             return false;
@@ -1245,7 +1341,7 @@ static bool encode_consumer_main(int control_fd)
         slot.nv12_first_use = false;
     }
     for (EncodeSlot &slot : slots) {
-        if (!collect_encoded_slot(&slot, &stream, bitstream_size, metadata_size,
+        if (!collect_encoded_slot(&slot, stream, bitstream_size, metadata_size,
                                   &encoded_frames, &encoded_bytes,
                                   &encode_failures, &timeouts, &mismatches,
                                   &diagnostic_checks,
@@ -1254,7 +1350,8 @@ static bool encode_consumer_main(int control_fd)
                                   &slot_recycle_times))
             return false;
     }
-    stream.close();
+    if (file_stream)
+        file_stream->close();
     const std::uint64_t consumer_end_ns = monotonic_ns();
     const double consumer_elapsed_seconds =
         static_cast<double>(consumer_end_ns - consumer_start_ns) / 1000000000.0;

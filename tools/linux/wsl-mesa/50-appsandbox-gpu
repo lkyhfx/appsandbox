@@ -33,6 +33,7 @@ if [ -e /dev/dxg ] && [ -d "$WSL_MESA_LIB" ]; then
     echo "GALLIUM_DRIVER=d3d12"
     echo "MESA_LOADER_DRIVER_OVERRIDE=d3d12"
     echo "__GLX_VENDOR_LIBRARY_NAME=mesa"
+    echo "ASB_MUTTER_D3D12_SHARE_SOCKET=/run/appsandbox/display-d3d12.sock"
     [ -e "$WSL_MESA/share/vulkan/icd.d/dzn_icd.x86_64.json" ] && \
         echo "VK_DRIVER_FILES=$WSL_MESA/share/vulkan/icd.d/dzn_icd.x86_64.json"
 fi

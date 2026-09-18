@@ -25,6 +25,7 @@
 #include <d3d11.h>
 #include <dxgi.h>
 #include <d3dcompiler.h>
+#include <d3d11_1.h>
 #pragma warning(pop)
 
 #include <stdio.h>
@@ -37,6 +38,8 @@
 #include "hcs_vm.h"
 #include "ui.h"
 #include "resource.h"
+#include "vm_video_decode.h"
+#include "../core/display_protocol.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "d3d11.lib")
@@ -104,7 +107,7 @@ typedef struct AudioFrameHeader {
 #define DEFAULT_WIDTH       1920
 #define DEFAULT_HEIGHT      1080
 #define MAX_DIRTY_RECTS     64
-#define MAX_FRAME_DATA_SIZE (DEFAULT_WIDTH * DEFAULT_HEIGHT * 4)
+#define MAX_FRAME_DATA_SIZE (7680u * 4320u * 4u)
 
 /* ---- Window messages ---- */
 
@@ -199,6 +202,22 @@ struct VmDisplayIdd {
     ID3D11VertexShader      *vs;
     ID3D11PixelShader       *ps;
     ID3D11SamplerState      *sampler;
+
+    /* Hardware HEVC path. Decoded NV12 stays GPU-resident. */
+    VmVideoDecoder          *video_decoder;
+    ID3D11Texture2D         *decoded_tex;
+    UINT                     decoded_subresource;
+    UINT64                   video_generation;
+    BOOL                     video_wait_idr;
+    BOOL                     video_active;
+    BOOL                     hevc_disabled;
+    UINT                     fallback_count;
+    ID3D11VideoDevice       *video_device;
+    ID3D11VideoContext      *video_context;
+    ID3D11VideoProcessorEnumerator *video_enum;
+    ID3D11VideoProcessor    *video_processor;
+    UINT                     video_processor_width;
+    UINT                     video_processor_height;
 
     /* Frame buffer (CPU-side, updated by recv thread) */
     BYTE          *frame_buf;
@@ -1016,6 +1035,18 @@ static BOOL recv_exact(SOCKET s, void *buf, int len)
     return TRUE;
 }
 
+static BOOL send_exact_socket(SOCKET s, const void *buf, int len)
+{
+    const char *p = (const char *)buf;
+    while (len > 0) {
+        int n = send(s, p, len, 0);
+        if (n <= 0) return FALSE;
+        p += n;
+        len -= n;
+    }
+    return TRUE;
+}
+
 /* ---- Non-blocking connect with timeout ---- */
 
 static SOCKET connect_to_hv_service(const GUID *vm_runtime_id, const GUID *service_guid, int timeout_ms)
@@ -1539,6 +1570,145 @@ static void d3d_resize_swap_chain(VmDisplayIdd *d)
     }
 }
 
+static BOOL d3d_ensure_raw_frame_texture(VmDisplayIdd *d)
+{
+    D3D11_TEXTURE2D_DESC current, desc;
+    D3D11_SHADER_RESOURCE_VIEW_DESC view;
+    HRESULT hr;
+    if (d->frame_tex) {
+        ID3D11Texture2D_GetDesc(d->frame_tex, &current);
+        if (current.Width == d->frame_width && current.Height == d->frame_height)
+            return TRUE;
+    }
+    if (d->frame_srv) { ID3D11ShaderResourceView_Release(d->frame_srv); d->frame_srv = NULL; }
+    if (d->frame_tex) { ID3D11Texture2D_Release(d->frame_tex); d->frame_tex = NULL; }
+    ZeroMemory(&desc, sizeof(desc));
+    desc.Width = d->frame_width;
+    desc.Height = d->frame_height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DYNAMIC;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    hr = ID3D11Device_CreateTexture2D(d->device, &desc, NULL, &d->frame_tex);
+    if (FAILED(hr)) return FALSE;
+    ZeroMemory(&view, sizeof(view));
+    view.Format = desc.Format;
+    view.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    view.Texture2D.MipLevels = 1;
+    hr = ID3D11Device_CreateShaderResourceView(d->device,
+        (ID3D11Resource *)d->frame_tex, &view, &d->frame_srv);
+    return SUCCEEDED(hr);
+}
+
+static BOOL d3d_render_video_frame(VmDisplayIdd *d)
+{
+    ID3D11Texture2D *texture = NULL, *back_buffer = NULL;
+    ID3D11VideoProcessorInputView *input_view = NULL;
+    ID3D11VideoProcessorOutputView *output_view = NULL;
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC content;
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC input_desc;
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC output_desc;
+    RECT client, source, destination;
+    UINT subresource = 0;
+    HRESULT hr;
+    float clear[4] = {0, 0, 0, 1};
+
+    EnterCriticalSection(&d->frame_cs);
+    if (d->video_active && d->decoded_tex) {
+        texture = d->decoded_tex;
+        ID3D11Texture2D_AddRef(texture);
+        subresource = d->decoded_subresource;
+        d->frame_dirty = FALSE;
+    }
+    LeaveCriticalSection(&d->frame_cs);
+    if (!texture) return FALSE;
+
+    if (!d->video_device)
+        ID3D11Device_QueryInterface(d->device, &IID_ID3D11VideoDevice,
+                                    (void **)&d->video_device);
+    if (!d->video_context)
+        ID3D11DeviceContext_QueryInterface(d->ctx, &IID_ID3D11VideoContext,
+                                           (void **)&d->video_context);
+    if (!d->video_device || !d->video_context) goto fail;
+    if (!d->video_enum || d->video_processor_width != d->frame_width ||
+        d->video_processor_height != d->frame_height) {
+        if (d->video_processor) { ID3D11VideoProcessor_Release(d->video_processor); d->video_processor = NULL; }
+        if (d->video_enum) { ID3D11VideoProcessorEnumerator_Release(d->video_enum); d->video_enum = NULL; }
+        ZeroMemory(&content, sizeof(content));
+        content.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+        content.InputWidth = d->frame_width;
+        content.InputHeight = d->frame_height;
+        content.OutputWidth = d->frame_width;
+        content.OutputHeight = d->frame_height;
+        content.InputFrameRate.Numerator = content.OutputFrameRate.Numerator = 60;
+        content.InputFrameRate.Denominator = content.OutputFrameRate.Denominator = 1;
+        content.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+        hr = ID3D11VideoDevice_CreateVideoProcessorEnumerator(
+            d->video_device, &content, &d->video_enum);
+        if (FAILED(hr)) goto fail;
+        hr = ID3D11VideoDevice_CreateVideoProcessor(d->video_device,
+                                                     d->video_enum, 0,
+                                                     &d->video_processor);
+        if (FAILED(hr)) goto fail;
+        d->video_processor_width = d->frame_width;
+        d->video_processor_height = d->frame_height;
+    }
+
+    hr = IDXGISwapChain_GetBuffer(d->swap_chain, 0, &IID_ID3D11Texture2D,
+                                  (void **)&back_buffer);
+    if (FAILED(hr)) goto fail;
+    ZeroMemory(&input_desc, sizeof(input_desc));
+    input_desc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+    input_desc.Texture2D.ArraySlice = subresource;
+    hr = ID3D11VideoDevice_CreateVideoProcessorInputView(d->video_device,
+        (ID3D11Resource *)texture, d->video_enum, &input_desc, &input_view);
+    if (FAILED(hr)) goto fail;
+    ZeroMemory(&output_desc, sizeof(output_desc));
+    output_desc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+    hr = ID3D11VideoDevice_CreateVideoProcessorOutputView(d->video_device,
+        (ID3D11Resource *)back_buffer, d->video_enum, &output_desc, &output_view);
+    if (FAILED(hr)) goto fail;
+
+    GetClientRect(d->render_hwnd, &client);
+    SetRect(&source, 0, 0, (int)d->frame_width, (int)d->frame_height);
+    {
+        float x, y, width, height;
+        compute_letterbox((UINT)client.right, (UINT)client.bottom,
+                          d->frame_width, d->frame_height,
+                          &x, &y, &width, &height);
+        SetRect(&destination, (int)x, (int)y, (int)(x + width), (int)(y + height));
+    }
+    ID3D11DeviceContext_ClearRenderTargetView(d->ctx, d->rtv, clear);
+    ID3D11VideoContext_VideoProcessorSetStreamSourceRect(
+        d->video_context, d->video_processor, 0, TRUE, &source);
+    ID3D11VideoContext_VideoProcessorSetStreamDestRect(
+        d->video_context, d->video_processor, 0, TRUE, &destination);
+    {
+        D3D11_VIDEO_PROCESSOR_STREAM stream;
+        ZeroMemory(&stream, sizeof(stream));
+        stream.Enable = TRUE;
+        stream.pInputSurface = input_view;
+        hr = ID3D11VideoContext_VideoProcessorBlt(d->video_context,
+            d->video_processor, output_view, d->recv_count, 1, &stream);
+    }
+    if (SUCCEEDED(hr)) IDXGISwapChain_Present(d->swap_chain, 0, 0);
+    if (output_view) ID3D11VideoProcessorOutputView_Release(output_view);
+    if (input_view) ID3D11VideoProcessorInputView_Release(input_view);
+    if (back_buffer) ID3D11Texture2D_Release(back_buffer);
+    ID3D11Texture2D_Release(texture);
+    return SUCCEEDED(hr);
+
+fail:
+    if (output_view) ID3D11VideoProcessorOutputView_Release(output_view);
+    if (input_view) ID3D11VideoProcessorInputView_Release(input_view);
+    if (back_buffer) ID3D11Texture2D_Release(back_buffer);
+    ID3D11Texture2D_Release(texture);
+    return FALSE;
+}
+
 static void d3d_render_frame(VmDisplayIdd *d)
 {
     D3D11_MAPPED_SUBRESOURCE mapped;
@@ -1551,9 +1721,16 @@ static void d3d_render_frame(VmDisplayIdd *d)
     if (!d->device || !d->ctx || !d->swap_chain || !d->rtv)
         return;
 
+    if (d->video_active && d3d_render_video_frame(d))
+        return;
+
     /* Upload frame data to GPU texture if dirty */
     if (d->frame_dirty) {
         EnterCriticalSection(&d->frame_cs);
+        if (!d3d_ensure_raw_frame_texture(d)) {
+            LeaveCriticalSection(&d->frame_cs);
+            return;
+        }
         hr = d->ctx->lpVtbl->Map(d->ctx,
                 (ID3D11Resource *)d->frame_tex, 0,
                 D3D11_MAP_WRITE_DISCARD, 0, &mapped);
@@ -1565,7 +1742,7 @@ static void d3d_render_frame(VmDisplayIdd *d)
             if (copy_stride > d->frame_stride)
                 copy_stride = d->frame_stride;
 
-            for (row = 0; row < d->frame_height && row < DEFAULT_HEIGHT; row++) {
+            for (row = 0; row < d->frame_height; row++) {
                 memcpy((BYTE *)mapped.pData + row * mapped.RowPitch,
                        d->frame_buf + row * d->frame_stride,
                        copy_stride);
@@ -1624,6 +1801,12 @@ static void d3d_render_frame(VmDisplayIdd *d)
 
 static void d3d_cleanup(VmDisplayIdd *d)
 {
+    if (d->video_decoder) { vm_video_decoder_destroy(d->video_decoder); d->video_decoder = NULL; }
+    if (d->decoded_tex) { ID3D11Texture2D_Release(d->decoded_tex); d->decoded_tex = NULL; }
+    if (d->video_processor) { ID3D11VideoProcessor_Release(d->video_processor); d->video_processor = NULL; }
+    if (d->video_enum) { ID3D11VideoProcessorEnumerator_Release(d->video_enum); d->video_enum = NULL; }
+    if (d->video_context) { ID3D11VideoContext_Release(d->video_context); d->video_context = NULL; }
+    if (d->video_device) { ID3D11VideoDevice_Release(d->video_device); d->video_device = NULL; }
     if (d->sampler)    { d->sampler->lpVtbl->Release(d->sampler);       d->sampler = NULL; }
     if (d->ps)         { d->ps->lpVtbl->Release(d->ps);                 d->ps = NULL; }
     if (d->vs)         { d->vs->lpVtbl->Release(d->vs);                 d->vs = NULL; }
@@ -1849,13 +2032,16 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
     VmDisplayIdd *d = (VmDisplayIdd *)param;
     WSADATA wsa;
     BYTE *recv_buf = NULL;
+    UINT recv_capacity = DEFAULT_WIDTH * DEFAULT_HEIGHT * 4;
+    HRESULT com_hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
 
     WSAStartup(MAKEWORD(2, 2), &wsa);
 
     /* Allocate receive buffer for frame pixel data */
-    recv_buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, MAX_FRAME_DATA_SIZE);
+    recv_buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, recv_capacity);
     if (!recv_buf) {
         ui_log(L"IDD recv: failed to allocate receive buffer");
+        if (SUCCEEDED(com_hr)) CoUninitialize();
         return 1;
     }
 
@@ -1874,6 +2060,9 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
     while (!d->stop) {
         SOCKET s;
         FrameHeader hdr;
+        BOOL advertised_hevc = FALSE;
+        BOOL session_saw_hevc = FALSE;
+        BOOL session_logged_raw = FALSE;
 
         /* Ensure input channel is connected (independent of frame channel) */
         if (input_s == INVALID_SOCKET)
@@ -1909,6 +2098,27 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         }
 
         idd_log(d, L"Frame channel connected.");
+        {
+            AsbDisplayHostHello hello;
+            ZeroMemory(&hello, sizeof(hello));
+            hello.magic = ASB_DISPLAY_HOST_HELLO_MAGIC;
+            hello.version = ASB_DISPLAY_PROTOCOL_VERSION;
+            hello.header_size = sizeof(hello);
+            hello.capabilities = ASB_DISPLAY_CAP_RAW_ASFR;
+            if (!d->hevc_disabled && vm_video_decode_supported(d->device))
+                hello.capabilities |= ASB_DISPLAY_CAP_HEVC_D3D11_HW_DECODE;
+            advertised_hevc =
+                (hello.capabilities & ASB_DISPLAY_CAP_HEVC_D3D11_HW_DECODE) != 0;
+            hello.max_width = 7680;
+            hello.max_height = 4320;
+            if (!send_exact_socket(s, &hello, sizeof(hello))) {
+                closesocket(s);
+                continue;
+            }
+            idd_log(d, L"display_protocol=v2 hello_sent=1 host_caps=0x%x hevc_hw_decode=%u max=%ux%u",
+                    hello.capabilities, advertised_hevc ? 1 : 0,
+                    hello.max_width, hello.max_height);
+        }
         d->cursor_visible = TRUE;
         PostMessageW(d->hwnd, WM_IDD_CURSOR_CHANGED, 0, 0);
 
@@ -1973,6 +2183,117 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 continue;  /* back to message loop */
             }
 
+            if (magic == ASB_DISPLAY_VIDEO_CONFIG_MAGIC) {
+                AsbEncodedVideoConfig config;
+                BYTE *extradata = NULL;
+                config.magic = magic;
+                if (!recv_exact(s, (BYTE *)&config + sizeof(UINT32),
+                                sizeof(config) - sizeof(UINT32))) break;
+                if (config.version != ASB_DISPLAY_PROTOCOL_VERSION ||
+                    config.header_size != sizeof(config) ||
+                    config.codec != ASB_DISPLAY_CODEC_HEVC ||
+                    !config.width || !config.height ||
+                    config.width > 7680 || config.height > 4320 ||
+                    !config.fps_num || !config.fps_den ||
+                    config.extradata_size > ASB_DISPLAY_MAX_EXTRADATA) {
+                    d->fallback_count++;
+                    idd_log(d, L"display_protocol=v2 display_backend=raw-asfr fallback=1 fallback_count=%u fallback_reason=invalid-asvc reconnecting=1",
+                            d->fallback_count);
+                    break;
+                }
+                if (config.extradata_size) {
+                    extradata = (BYTE *)HeapAlloc(GetProcessHeap(), 0,
+                                                  config.extradata_size);
+                    if (!extradata || !recv_exact(s, extradata,
+                                                  (int)config.extradata_size)) {
+                        if (extradata) HeapFree(GetProcessHeap(), 0, extradata);
+                        break;
+                    }
+                }
+                EnterCriticalSection(&d->frame_cs);
+                if (d->video_decoder) vm_video_decoder_destroy(d->video_decoder);
+                d->video_decoder = vm_video_decoder_create(d->device,
+                    config.width, config.height, config.fps_num, config.fps_den,
+                    extradata, config.extradata_size);
+                if (d->decoded_tex) {
+                    ID3D11Texture2D_Release(d->decoded_tex);
+                    d->decoded_tex = NULL;
+                }
+                d->video_generation = config.generation;
+                d->video_wait_idr = TRUE;
+                d->video_active = d->video_decoder != NULL;
+                d->frame_width = config.width;
+                d->frame_height = config.height;
+                LeaveCriticalSection(&d->frame_cs);
+                if (extradata) HeapFree(GetProcessHeap(), 0, extradata);
+                if (!d->video_decoder) {
+                    d->hevc_disabled = TRUE;
+                    d->fallback_count++;
+                    idd_log(d, L"display_protocol=v2 display_backend=raw-asfr fallback=1 fallback_count=%u fallback_reason=hevc-decoder-create-failed reconnecting=1",
+                            d->fallback_count);
+                    break;
+                }
+                session_saw_hevc = TRUE;
+                idd_log(d, L"display_protocol=v2 display_backend=hevc-d3d11 fallback=0 generation=%llu mode=%ux%u fps=%u/%u",
+                        config.generation, config.width, config.height,
+                        config.fps_num, config.fps_den);
+                continue;
+            }
+
+            if (magic == ASB_DISPLAY_VIDEO_FRAME_MAGIC) {
+                AsbEncodedVideoFrame frame;
+                ID3D11Texture2D *texture = NULL;
+                UINT subresource = 0;
+                HRESULT decode_hr;
+                frame.magic = magic;
+                if (!recv_exact(s, (BYTE *)&frame + sizeof(UINT32),
+                                sizeof(frame) - sizeof(UINT32))) break;
+                if (frame.version != ASB_DISPLAY_PROTOCOL_VERSION ||
+                    frame.header_size != sizeof(frame) ||
+                    frame.generation != d->video_generation ||
+                    !frame.payload_size ||
+                    frame.payload_size > ASB_DISPLAY_MAX_VIDEO_FRAME ||
+                    !d->video_decoder) break;
+                if (frame.payload_size > recv_capacity) {
+                    BYTE *larger = (BYTE *)HeapReAlloc(GetProcessHeap(), 0,
+                                                       recv_buf, frame.payload_size);
+                    if (!larger) break;
+                    recv_buf = larger;
+                    recv_capacity = frame.payload_size;
+                }
+                if (!recv_exact(s, recv_buf, (int)frame.payload_size)) break;
+                if (d->video_wait_idr && !(frame.flags & ASB_DISPLAY_VIDEO_FLAG_IDR))
+                    continue;
+                decode_hr = vm_video_decoder_decode(d->video_decoder,
+                    recv_buf, frame.payload_size,
+                    (LONGLONG)(frame.capture_time_ns / 100),
+                    &texture, &subresource);
+                if (FAILED(decode_hr)) {
+                    d->hevc_disabled = TRUE;
+                    d->fallback_count++;
+                    idd_log(d, L"display_protocol=v2 display_backend=raw-asfr fallback=1 fallback_count=%u fallback_reason=hevc-decode-failed hresult=0x%08X reconnecting=1",
+                            d->fallback_count, decode_hr);
+                    break;
+                }
+                if (decode_hr == S_OK && texture) {
+                    EnterCriticalSection(&d->frame_cs);
+                    if (d->decoded_tex) ID3D11Texture2D_Release(d->decoded_tex);
+                    d->decoded_tex = texture;
+                    d->decoded_subresource = subresource;
+                    d->video_wait_idr = FALSE;
+                    d->frame_dirty = TRUE;
+                    d->recv_count++;
+                    LeaveCriticalSection(&d->frame_cs);
+                    if (!d->frame_connected) {
+                        d->frame_connected = TRUE;
+                        PostMessageW(d->hwnd, WM_IDD_CURSOR_CHANGED, 0, 0);
+                    }
+                    if (d->hwnd && IsWindow(d->hwnd))
+                        PostMessageW(d->hwnd, WM_IDD_FRAME_READY, 0, 0);
+                }
+                continue;
+            }
+
             if (magic != FRAME_MAGIC) {
                 idd_log(d, L"Bad magic 0x%08X, reconnecting.", magic);
                 break;
@@ -2014,6 +2335,24 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 break;
             }
 
+            if (!session_logged_raw) {
+                d->fallback_count++;
+                session_logged_raw = TRUE;
+                idd_log(d, L"display_protocol=%s display_backend=raw-asfr fallback=1 fallback_count=%u fallback_reason=%s",
+                        advertised_hevc ? L"v2" : L"legacy-compatible",
+                        d->fallback_count,
+                        advertised_hevc ? L"guest-selected-raw" :
+                                          L"host-hevc-unavailable");
+            }
+
+            if (data_size > recv_capacity) {
+                BYTE *larger = (BYTE *)HeapReAlloc(GetProcessHeap(), 0,
+                                                   recv_buf, data_size);
+                if (!larger) break;
+                recv_buf = larger;
+                recv_capacity = data_size;
+            }
+
             /* Read pixel data */
             if (data_size > 0) {
                 if (!recv_exact(s, recv_buf, (int)data_size))
@@ -2022,6 +2361,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
 
             /* Update CPU-side frame buffer */
             EnterCriticalSection(&d->frame_cs);
+            d->video_active = FALSE;
 
             /* Reallocate frame_buf if resolution changed */
             if (hdr.width != d->frame_width || hdr.height != d->frame_height) {
@@ -2123,11 +2463,26 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         }
 
         /* Frame channel lost — close it but keep input alive */
+        EnterCriticalSection(&d->frame_cs);
+        d->video_active = FALSE;
+        if (d->decoded_tex) {
+            ID3D11Texture2D_Release(d->decoded_tex);
+            d->decoded_tex = NULL;
+        }
+        LeaveCriticalSection(&d->frame_cs);
+        if (d->video_decoder) {
+            vm_video_decoder_destroy(d->video_decoder);
+            d->video_decoder = NULL;
+        }
         d->frame_connected = FALSE;
         d->cursor_visible = TRUE;
         PostMessageW(d->hwnd, WM_IDD_CURSOR_CHANGED, 0, 0);
         closesocket(s);
-        idd_log(d, L"Frame channel disconnected, reconnecting...");
+        idd_log(d, L"display_protocol=%s display_backend=%s session_ended=1 reconnecting=1",
+                session_saw_hevc ? L"v2" :
+                session_logged_raw ? L"asfr" : L"unknown",
+                session_saw_hevc ? L"hevc-d3d11" :
+                session_logged_raw ? L"raw-asfr" : L"unknown");
 
         /* Check if input is still alive (send_input may have flagged it dead) */
         if (d->input_socket == INVALID_SOCKET && input_s != INVALID_SOCKET) {
@@ -2161,6 +2516,8 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
 
     if (recv_buf)
         HeapFree(GetProcessHeap(), 0, recv_buf);
+
+    if (SUCCEEDED(com_hr)) CoUninitialize();
 
     WSACleanup();
     return 0;

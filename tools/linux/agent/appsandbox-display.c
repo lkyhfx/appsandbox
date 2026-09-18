@@ -31,17 +31,23 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
+#include <sys/un.h>
+#include <poll.h>
 #include <linux/vm_sockets.h>
 
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 #include <drm_fourcc.h>
 
+#include "../../../src/core/display_protocol.h"
+
 #define VSOCK_PORT      2
 #define FRAME_MAGIC     0x52465341u   /* 'ASFR' little-endian */
 #define CURSOR_MAGIC    0x52435341u   /* 'ASCR' little-endian */
 #define TARGET_FPS      60
 #define FRAME_INTERVAL_NS (1000000000L / TARGET_FPS)
+#define HOST_HELLO_TIMEOUT_MS 150
+#define ENCODER_OUTPUT_SOCKET "/run/appsandbox/display-d3d12-output.sock"
 
 #define CURSOR_TYPE_MASKED_COLOR  1
 #define CURSOR_TYPE_ALPHA         2
@@ -70,6 +76,7 @@ struct cursor_header {
 #pragma pack(pop)
 
 static volatile sig_atomic_t g_stop = 0;
+static uint64_t g_fallback_count = 0;
 
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
 
@@ -120,6 +127,141 @@ static ssize_t send_all(int fd, const void *buf, size_t len)
         p += n; left -= (size_t)n;
     }
     return (ssize_t)len;
+}
+
+static int receive_host_hello(int fd, AsbDisplayHostHello *hello)
+{
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    int ready;
+    do { ready = poll(&pfd, 1, HOST_HELLO_TIMEOUT_MS); }
+    while (ready < 0 && errno == EINTR && !g_stop);
+    if (ready <= 0 || !(pfd.revents & POLLIN)) return 0;
+
+    uint32_t magic = 0;
+    ssize_t n = recv(fd, &magic, sizeof(magic), MSG_PEEK | MSG_DONTWAIT);
+    if (n != (ssize_t)sizeof(magic) || magic != ASB_DISPLAY_HOST_HELLO_MAGIC)
+        return 0;
+
+    uint8_t *out = (uint8_t *)hello;
+    size_t left = sizeof(*hello);
+    while (left) {
+        n = recv(fd, out, left, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return -1;
+        out += n;
+        left -= (size_t)n;
+    }
+    if (hello->version < ASB_DISPLAY_PROTOCOL_VERSION ||
+        hello->header_size != sizeof(*hello) ||
+        !(hello->capabilities & ASB_DISPLAY_CAP_RAW_ASFR) ||
+        !hello->max_width || !hello->max_height ||
+        hello->max_width > ASB_DISPLAY_MAX_WIDTH ||
+        hello->max_height > ASB_DISPLAY_MAX_HEIGHT) {
+        agent_log("invalid host hello version=%u size=%u caps=0x%x max=%ux%u",
+                  hello->version, hello->header_size, hello->capabilities,
+                  hello->max_width, hello->max_height);
+        return -1;
+    }
+    return 1;
+}
+
+static int connect_encoder_output(void)
+{
+    const char *path = getenv("APPSANDBOX_D3D12_OUTPUT_SOCKET");
+    if (!path || !*path) path = ENCODER_OUTPUT_SOCKET;
+    if (strlen(path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        close(fd);
+        return -1;
+    }
+    struct ucred peer;
+    socklen_t peer_len = sizeof(peer);
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &peer, &peer_len) != 0 ||
+        (peer.uid != 0 && peer.uid != geteuid())) {
+        close(fd);
+        errno = EPERM;
+        return -1;
+    }
+    return fd;
+}
+
+static int encoded_cursor_tick(int client_fd, int reset);
+
+/* The helper emits one complete ASVC/ASVE message per seqpacket. This loop is
+ * the only vsock writer in encoded mode, so configuration and access units
+ * cannot interleave with cursor messages. */
+static int encoded_loop(int client_fd, int helper_fd,
+                        const AsbDisplayHostHello *hello)
+{
+    size_t capacity = sizeof(AsbEncodedVideoFrame) + ASB_DISPLAY_MAX_VIDEO_FRAME;
+    uint8_t *packet = (uint8_t *)malloc(capacity);
+    if (!packet) return -1;
+    int saw_config = 0;
+    (void)encoded_cursor_tick(client_fd, 1);
+    for (;;) {
+        struct pollfd pfd = { .fd = helper_fd, .events = POLLIN };
+        int ready;
+        do { ready = poll(&pfd, 1, 16); }
+        while (ready < 0 && errno == EINTR && !g_stop);
+        if (g_stop) break;
+        if (ready == 0) {
+            if (encoded_cursor_tick(client_fd, 0) < 0) {
+                free(packet);
+                return -1;
+            }
+            continue;
+        }
+        if (ready < 0 || (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))) break;
+        ssize_t n = recv(helper_fd, packet, capacity, 0);
+        if (n <= 0) break;
+
+        uint32_t magic;
+        if ((size_t)n < sizeof(magic)) break;
+        memcpy(&magic, packet, sizeof(magic));
+        if (magic == ASB_DISPLAY_VIDEO_CONFIG_MAGIC) {
+            AsbEncodedVideoConfig config;
+            if ((size_t)n < sizeof(config)) break;
+            memcpy(&config, packet, sizeof(config));
+            if (config.version != ASB_DISPLAY_PROTOCOL_VERSION ||
+                config.header_size != sizeof(config) ||
+                config.codec != ASB_DISPLAY_CODEC_HEVC ||
+                !config.width || !config.height ||
+                config.width > hello->max_width ||
+                config.height > hello->max_height ||
+                config.extradata_size > ASB_DISPLAY_MAX_EXTRADATA ||
+                (size_t)n != sizeof(config) + config.extradata_size)
+                break;
+            saw_config = 1;
+        } else if (magic == ASB_DISPLAY_VIDEO_FRAME_MAGIC) {
+            AsbEncodedVideoFrame frame;
+            if (!saw_config || (size_t)n < sizeof(frame)) break;
+            memcpy(&frame, packet, sizeof(frame));
+            if (frame.version != ASB_DISPLAY_PROTOCOL_VERSION ||
+                frame.header_size != sizeof(frame) ||
+                frame.payload_size > ASB_DISPLAY_MAX_VIDEO_FRAME ||
+                (size_t)n != sizeof(frame) + frame.payload_size)
+                break;
+        } else {
+            break;
+        }
+        if (send_all(client_fd, packet, (size_t)n) < 0) {
+            free(packet);
+            return -1;
+        }
+        if (encoded_cursor_tick(client_fd, 0) < 0) {
+            free(packet);
+            return -1;
+        }
+    }
+    free(packet);
+    return 0;
 }
 
 /* ---- DRM capture ---- */
@@ -481,6 +623,39 @@ static int cursor_tick(int client_fd, int drm_fd, struct cursor_state *cur)
     return rc;
 }
 
+static int encoded_cursor_tick(int client_fd, int reset)
+{
+    static int drm_fd = -1;
+    static struct cursor_state cursor;
+    if (reset && drm_fd >= 0) {
+        close(drm_fd);
+        drm_fd = -1;
+    }
+    if (drm_fd < 0) {
+        int i;
+        for (i = 0; i < 8; i++) {
+            char path[64];
+            snprintf(path, sizeof(path), "/dev/dri/card%d", i);
+            drm_fd = open(path, O_RDWR | O_CLOEXEC);
+            if (drm_fd >= 0) {
+                drmDropMaster(drm_fd);
+                drmSetClientCap(drm_fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
+                drmSetClientCap(drm_fd, DRM_CLIENT_CAP_ATOMIC, 1);
+#ifdef DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT
+                drmSetClientCap(drm_fd, DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT, 1);
+#else
+                drmSetClientCap(drm_fd, 6, 1);
+#endif
+                cursor_init(drm_fd, &cursor);
+                if (cursor.discovered) break;
+                close(drm_fd);
+                drm_fd = -1;
+            }
+        }
+    }
+    return drm_fd >= 0 ? cursor_tick(client_fd, drm_fd, &cursor) : 0;
+}
+
 /* ---- Main capture loop ---- */
 
 static int send_frame(int client_fd, struct capture_ctx *c, uint64_t seq)
@@ -720,7 +895,50 @@ int main(void)
             break;
         }
         agent_log("client connected (cid=%u)", peer.svm_cid);
-        capture_loop(c);
+        AsbDisplayHostHello hello;
+        memset(&hello, 0, sizeof(hello));
+        int hello_status = receive_host_hello(c, &hello);
+        int used_hevc = 0;
+        const char *force_raw = getenv("APPSANDBOX_DISPLAY_FORCE_RAW");
+        if (hello_status > 0) {
+            agent_log("display_protocol=v2 negotiated=1 host_caps=0x%x host_max=%ux%u",
+                      hello.capabilities, hello.max_width, hello.max_height);
+        } else if (hello_status == 0) {
+            agent_log("display_protocol=legacy-asfr negotiated=0 reason=no-host-hello");
+        } else {
+            agent_log("display_protocol=invalid negotiated=0 reason=invalid-host-hello");
+        }
+        if (hello_status > 0 &&
+            (hello.capabilities & ASB_DISPLAY_CAP_HEVC_D3D11_HW_DECODE) &&
+            !(force_raw && strcmp(force_raw, "0") != 0)) {
+            int helper = connect_encoder_output();
+            if (helper >= 0) {
+                agent_log("display_protocol=v2 display_backend=hevc-d3d12 fallback=0");
+                used_hevc = 1;
+                (void)encoded_loop(c, helper, &hello);
+                close(helper);
+                agent_log("display_protocol=v2 display_backend=hevc-d3d12 session_ended=1 reconnect_required=1");
+            } else {
+                ++g_fallback_count;
+                agent_log("display_protocol=v2 display_backend=raw-asfr fallback=1 fallback_count=%llu fallback_reason=encoder-helper-unavailable error=%s",
+                          (unsigned long long)g_fallback_count, strerror(errno));
+            }
+        } else if (force_raw && strcmp(force_raw, "0") != 0) {
+            ++g_fallback_count;
+            agent_log("display_protocol=%s display_backend=raw-asfr fallback=1 fallback_count=%llu fallback_reason=forced",
+                      hello_status > 0 ? "v2" : "legacy-asfr",
+                      (unsigned long long)g_fallback_count);
+        } else if (hello_status <= 0 ||
+                   !(hello.capabilities & ASB_DISPLAY_CAP_HEVC_D3D11_HW_DECODE)) {
+            ++g_fallback_count;
+            agent_log("display_protocol=%s display_backend=raw-asfr fallback=1 fallback_count=%llu fallback_reason=%s",
+                      hello_status > 0 ? "v2" : "legacy-asfr",
+                      (unsigned long long)g_fallback_count,
+                      hello_status > 0 ? "host-no-hevc" :
+                      hello_status == 0 ? "no-host-hello" : "invalid-host-hello");
+        }
+        if (!used_hevc)
+            capture_loop(c);
         close(c);
     }
 

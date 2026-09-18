@@ -1,7 +1,8 @@
 [Unit]
 Description=App Sandbox display daemon (KMS framebuffer capture → vsock :2)
 Documentation=https://github.com/jamesstringer90/appsandbox
-After=appsandbox-agent.service
+After=appsandbox-agent.service appsandbox-display-d3d12.service
+Wants=appsandbox-display-d3d12.service
 # No After=graphical.target — that introduces an ordering cycle with
 # multi-user.target on Desktop installs (multi-user→ppd→graphical→us).
 # The daemon polls /dev/dri/cardN itself and retries until the active

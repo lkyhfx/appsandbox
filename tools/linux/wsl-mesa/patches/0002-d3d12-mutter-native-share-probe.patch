@@ -157,7 +157,7 @@ index 0000000..0000000
 +constexpr uint32_t kWidth = 3840;
 +constexpr uint32_t kHeight = 2160;
 +constexpr uint32_t kFrames = 3600;
-+constexpr int kPollTimeoutMs = 10000;
++constexpr int kPollTimeoutMs = 0;
 +
 +struct ResourceBundle {
 +   uint32_t magic, type, width, height, slots, frames;
@@ -274,7 +274,7 @@ index 0000000..0000000
 +   return true;
 +}
 +
-+static bool wait_done(int fd, uint64_t *wait_us)
++static bool try_done(int fd, uint64_t *wait_us)
 +{
 +   const uint64_t start_ns = now_ns();
 +   struct pollfd pfd = {fd, POLLIN, 0};
@@ -430,8 +430,8 @@ index 0000000..0000000
 +   const uint32_t slot_index = static_cast<uint32_t>(probe->frame % kSlotCount);
 +   uint64_t recycle_us = 0;
 +   if (probe->frame >= kSlotCount &&
-+       !wait_done(probe->slots[slot_index].done_fd, &recycle_us)) {
-+      debug_printf("MUTTER_D3D12 blocker=producer-eventfd-sync slot=%u\n", slot_index);
++       !try_done(probe->slots[slot_index].done_fd, &recycle_us)) {
++      debug_printf("MUTTER_D3D12 capture_drop=ring-full slot=%u\n", slot_index);
 +      return false;
 +   }
 +   if (probe->frame >= kSlotCount)

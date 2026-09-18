@@ -9,6 +9,7 @@ LDFLAGS ?=
 PREFIX        ?= /usr/local
 DESTDIR       ?=
 BINDIR        := $(PREFIX)/bin
+LIBEXECDIR    := $(PREFIX)/libexec
 D3D12_LIBDIR  ?= /opt/appsandbox/wsl-deps
 SYSTEMDDIR    := /etc/systemd/system
 USERUNITDIR   := /etc/systemd/user
@@ -20,6 +21,7 @@ WAYLAND_XDG_SHELL_XML ?= /usr/share/wayland-protocols/stable/xdg-shell/xdg-shell
 BINS := appsandbox-agent appsandbox-display appsandbox-input appsandbox-audio appsandbox-clipboard
 
 SYSTEM_UNITS := systemd/appsandbox-agent.service \
+                systemd/appsandbox-display-d3d12.service \
                 systemd/appsandbox-display.service \
                 systemd/appsandbox-input.service \
                 systemd/appsandbox-audio.service
@@ -31,13 +33,26 @@ USER_UNITS   :=
 
 all: $(BINS)
 
+# The D3D12 helper is built when DirectX-Headers and the WSL D3D12 runtime are
+# present. Distribution image builds should invoke `make d3d12-helper` after
+# staging those dependencies; unrelated agents retain no D3D12 dependency.
+d3d12-helper: appsandbox-display-d3d12
+
 appsandbox-agent: appsandbox-agent.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
 # Display daemon needs libdrm for drmModeGetFB2 + drmPrimeHandleToFD.
 appsandbox-display: appsandbox-display.c
-	$(CC) $(CFLAGS) $(shell pkg-config --cflags libdrm) -o $@ $< \
+	$(CC) $(CFLAGS) -I../../../src/core $(shell pkg-config --cflags libdrm) -o $@ $< \
 	       $(LDFLAGS) $(shell pkg-config --libs libdrm)
+
+appsandbox-display-d3d12: display_d3d12_encoder.cpp \
+		display_d3d12_encoder.h display_d3d12_protocol.h \
+		d3d12-video-encode-probe.cpp d3d12-cross-process-share-probe.cpp
+	$(CXX) -std=c++17 $(CXXFLAGS) -D_GNU_SOURCE -D_WIN32_WINNT=0x0A00 \
+	       -I../../../src/core -O2 -Wall -Wextra -Werror -Wno-unknown-pragmas -o $@ $< \
+	       $(LDFLAGS) -L$(D3D12_LIBDIR) \
+	       $$(pkg-config --cflags --libs DirectX-Headers) -ld3d12 -ldxcore
 
 appsandbox-input: appsandbox-input.c $(wildcard protocol.h ../../../src/core/protocol.h)
 	$(CC) $(CFLAGS) -I../../../src/core -o $@ $< $(LDFLAGS) -lsystemd
@@ -59,6 +74,10 @@ install-pointer:
 install: $(BINS) install-pointer
 	install -d $(DESTDIR)$(BINDIR)
 	install -m 0755 $(BINS) $(DESTDIR)$(BINDIR)/
+	@if [ -x appsandbox-display-d3d12 ]; then \
+		install -d $(DESTDIR)$(LIBEXECDIR); \
+		install -m 0755 appsandbox-display-d3d12 $(DESTDIR)$(LIBEXECDIR)/; \
+	fi
 	install -d $(DESTDIR)$(SYSTEMDDIR)
 	for u in $(SYSTEM_UNITS); do \
 	    install -m 0644 $$u $(DESTDIR)$(SYSTEMDDIR)/; \
@@ -74,16 +93,18 @@ install: $(BINS) install-pointer
 enable: install
 	systemctl daemon-reload
 	systemctl enable --now appsandbox-agent.service
+	-if [ -x $(DESTDIR)$(LIBEXECDIR)/appsandbox-display-d3d12 ]; then systemctl enable --now appsandbox-display-d3d12.service; fi
 	systemctl enable --now appsandbox-display.service
 	systemctl enable --now appsandbox-input.service
 
 disable:
 	-systemctl disable --now appsandbox-input.service
 	-systemctl disable --now appsandbox-display.service
+	-systemctl disable --now appsandbox-display-d3d12.service
 	-systemctl disable --now appsandbox-agent.service
 
 clean:
-	rm -f $(BINS) d3d12-native-share-probe d3d12-cross-process-share-probe \
+	rm -f $(BINS) appsandbox-display-d3d12 d3d12-native-share-probe d3d12-cross-process-share-probe \
 		d3d12-video-encode-probe d3d12-mutter-consumer \
 		mutter-wayland-pattern-client gbm-egl-d3d12-probe \
 		xdg-shell-client-protocol.h \
@@ -103,7 +124,7 @@ d3d12-native-share-probe: d3d12-native-share-probe.cpp
 # above, plus a 4K render/copy workload.
 d3d12-cross-process-share-probe: d3d12-cross-process-share-probe.cpp
 	$(CXX) -std=c++17 $(CXXFLAGS) -D_GNU_SOURCE -D_WIN32_WINNT=0x0A00 \
-	       -O2 -Wall -Wextra -Werror -Wno-unknown-pragmas -o $@ $< \
+	       -I../../../src/core -O2 -Wall -Wextra -Werror -Wno-unknown-pragmas -o $@ $< \
 	       $(LDFLAGS) -L$(D3D12_LIBDIR) \
 	       $$(pkg-config --cflags --libs DirectX-Headers) -ld3d12 -ldxcore
 
@@ -111,7 +132,7 @@ d3d12-cross-process-share-probe: d3d12-cross-process-share-probe.cpp
 # the default invocation runs the cross-process 4K60 shared-texture workload.
 d3d12-video-encode-probe: d3d12-video-encode-probe.cpp
 	$(CXX) -std=c++17 $(CXXFLAGS) -D_GNU_SOURCE -D_WIN32_WINNT=0x0A00 \
-	       -O2 -Wall -Wextra -Werror -Wno-unknown-pragmas -o $@ $< \
+	       -I../../../src/core -O2 -Wall -Wextra -Werror -Wno-unknown-pragmas -o $@ $< \
 	       $(LDFLAGS) -L$(D3D12_LIBDIR) \
 	       $$(pkg-config --cflags --libs DirectX-Headers) -ld3d12 -ldxcore
 
@@ -122,7 +143,7 @@ d3d12-mutter-consumer: d3d12-mutter-consumer.cpp \
 		d3d12-video-encode-probe.cpp d3d12-cross-process-share-probe.cpp \
 		d3d12-share-probe-protocol.h
 	$(CXX) -std=c++17 $(CXXFLAGS) -D_GNU_SOURCE -D_WIN32_WINNT=0x0A00 \
-	       -O2 -Wall -Wextra -Werror -Wno-unknown-pragmas -o $@ $< \
+	       -I../../../src/core -O2 -Wall -Wextra -Werror -Wno-unknown-pragmas -o $@ $< \
 	       $(LDFLAGS) -L$(D3D12_LIBDIR) \
 	       $$(pkg-config --cflags --libs DirectX-Headers) -ld3d12 -ldxcore
 
@@ -146,6 +167,7 @@ xdg-shell-protocol.c: $(WAYLAND_XDG_SHELL_XML)
 	wayland-scanner private-code $< $@
 
 .PHONY: all install install-pointer enable disable clean \
+	d3d12-helper \
 	d3d12-native-share-probe d3d12-cross-process-share-probe \
 	d3d12-video-encode-probe d3d12-mutter-consumer \
 	mutter-wayland-pattern-client gbm-egl-d3d12-probe

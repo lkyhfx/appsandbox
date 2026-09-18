@@ -272,7 +272,11 @@ int do_prefetch_repo(const wchar_t *branch, const wchar_t *out_dir)
         const wchar_t *files[] = {
             L"appsandbox-agent.c", L"appsandbox-audio.c",
             L"appsandbox-clipboard.c", L"appsandbox-display.c",
-            L"appsandbox-input.c", L"Makefile"
+            L"appsandbox-input.c", L"display_d3d12_encoder.cpp",
+            L"display_d3d12_encoder.h", L"display_d3d12_protocol.h",
+            L"d3d12-video-encode-probe.cpp",
+            L"d3d12-cross-process-share-probe.cpp",
+            L"d3d12-share-probe-protocol.h", L"Makefile"
         };
         wchar_t out_agent[MAX_PATH];
         swprintf_s(out_agent, MAX_PATH, L"%s\\agent-src", out_dir);
@@ -287,6 +291,12 @@ int do_prefetch_repo(const wchar_t *branch, const wchar_t *out_dir)
         swprintf_s(protocol_src, MAX_PATH, L"%s\\src\\core\\protocol.h", extracted_root);
         if (GetFileAttributesW(protocol_src) != INVALID_FILE_ATTRIBUTES) {
             swprintf_s(dst, MAX_PATH, L"%s\\protocol.h", out_agent);
+            if (u_cp_file(protocol_src, dst) != 0) return -1;
+        }
+        swprintf_s(protocol_src, MAX_PATH,
+                   L"%s\\src\\core\\display_protocol.h", extracted_root);
+        if (GetFileAttributesW(protocol_src) != INVALID_FILE_ATTRIBUTES) {
+            swprintf_s(dst, MAX_PATH, L"%s\\display_protocol.h", out_agent);
             if (u_cp_file(protocol_src, dst) != 0) return -1;
         }
         wchar_t gnome_src[MAX_PATH];
@@ -332,7 +342,8 @@ int do_prefetch_repo(const wchar_t *branch, const wchar_t *out_dir)
         const wchar_t *units[] = {
             L"appsandbox-agent.service", L"appsandbox-audio.service",
             L"appsandbox-clipboard.service", L"appsandbox-display.service",
-            L"appsandbox-input.service", L"appsandbox-firstboot.service"
+            L"appsandbox-display-d3d12.service", L"appsandbox-input.service",
+            L"appsandbox-firstboot.service"
         };
         for (int i = 0; i < (int)(sizeof(units) / sizeof(units[0])); i++) {
             swprintf_s(s, MAX_PATH,
