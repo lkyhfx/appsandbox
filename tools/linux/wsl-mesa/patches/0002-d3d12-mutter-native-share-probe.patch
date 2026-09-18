@@ -1,0 +1,540 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AppSandbox contributors <appsandbox@example.invalid>
+Date: Fri, 18 Sep 2026 00:00:00 +0800
+Subject: [PATCH] d3d12: opt-in native shared ring for the Mutter probe
+
+This patch is for the isolated experiment only.  It is deliberately gated by
+ASB_MUTTER_D3D12_SHARE_SOCKET and is not used by appsandbox-display.
+
+Hook points:
+
+  * d3d12_context::fb.cbufs[0] is the currently bound Gallium color target;
+  * d3d12_flush() is called by the opt-in Mutter post-paint hook after the
+    stage view has been painted and before the native backend presents it;
+  * the producer records a GPU-only CopyResource from that actual target into
+    three D3D12_HEAP_FLAG_SHARED BGRA8 resources, then signals a producer
+    fence through SetEventOnCompletion(eventfd).
+
+No mmap, glReadPixels, PRIME, DMA-BUF, CPU pixel copy, or shared fence is used.
+The consumer receives the resource and ready event descriptors with SCM_RIGHTS
+and opens the resources on an independent D3D12 device.
+
+The probe currently uses `gpu_copy=1` because the D3D12 driver owns the shared
+ring while Mutter owns the render target.  This is the explicitly allowed
+second-priority path; the direct shared render-target path remains a separate
+optimization after this evidence is collected.
+
+---
+ src/gallium/drivers/d3d12/d3d12_context.h            |   1 +
+ src/gallium/drivers/d3d12/d3d12_context_common.cpp   |   6 +
+ src/gallium/drivers/d3d12/d3d12_mutter_share_probe.cpp | 391 +++++++++++++++++++
+ src/gallium/drivers/d3d12/d3d12_mutter_share_probe.h |  15 +
+ src/gallium/drivers/d3d12/meson.build                |   1 +
+ 5 files changed, 414 insertions(+)
+
+diff --git a/src/gallium/drivers/d3d12/d3d12_mutter_share_probe.h b/src/gallium/drivers/d3d12/d3d12_mutter_share_probe.h
+new file mode 100644
+index 0000000..0000000
+--- /dev/null
++++ b/src/gallium/drivers/d3d12/d3d12_mutter_share_probe.h
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier: MIT */
++#ifndef D3D12_MUTTER_SHARE_PROBE_H
++#define D3D12_MUTTER_SHARE_PROBE_H
++
++struct d3d12_context;
++
++/* Returns true when a copy was recorded in the current command list. */
++bool d3d12_mutter_share_probe_record(struct d3d12_context *ctx);
++
++/* Called after d3d12_flush_cmdlist() submits the list containing the copy. */
++void d3d12_mutter_share_probe_publish(struct d3d12_context *ctx);
++
++void d3d12_mutter_share_probe_destroy(struct d3d12_context *ctx);
++
++#endif
+diff --git a/src/gallium/drivers/d3d12/d3d12_context.h b/src/gallium/drivers/d3d12/d3d12_context.h
+index 0000000..0000000 100644
+--- a/src/gallium/drivers/d3d12/d3d12_context.h
++++ b/src/gallium/drivers/d3d12/d3d12_context.h
+@@ -192,7 +192,8 @@ struct d3d12_context {
+ #ifdef __cplusplus
+    ResourceStateManager *resource_state_manager;
+ #else
+    void *resource_state_manager; /* opaque pointer; we don't know about classes in C */
+ #endif
++   void *mutter_share_probe;
+ 
+ #ifdef HAVE_GALLIUM_D3D12_GRAPHICS
+diff --git a/src/gallium/drivers/d3d12/d3d12_context_common.cpp b/src/gallium/drivers/d3d12/d3d12_context_common.cpp
+index 0000000..0000000 100644
+--- a/src/gallium/drivers/d3d12/d3d12_context_common.cpp
++++ b/src/gallium/drivers/d3d12/d3d12_context_common.cpp
+@@ -24,4 +24,5 @@
+ #include "d3d12_blit.h"
+ #include "d3d12_cmd_signature.h"
+ #include "d3d12_context.h"
++#include "d3d12_mutter_share_probe.h"
+ #ifdef HAVE_GALLIUM_D3D12_GRAPHICS
+@@ -71,4 +71,5 @@ static void
+ d3d12_context_destroy(struct pipe_context *pctx)
+ {
+    struct d3d12_context *ctx = d3d12_context(pctx);
++   d3d12_mutter_share_probe_destroy(ctx);
+ 
+@@ -100,11 +101,15 @@ static void
+ static void
+ d3d12_flush(struct pipe_context *pipe,
+             struct pipe_fence_handle **fence,
+             unsigned flags)
+ {
+    struct d3d12_context *ctx = d3d12_context(pipe);
+    struct d3d12_batch *batch = d3d12_current_batch(ctx);
+ 
++   const bool mutter_probe_copy =
++      d3d12_mutter_share_probe_record(ctx);
+    bool flushed = d3d12_flush_cmdlist(ctx);
++   if (flushed && mutter_probe_copy)
++      d3d12_mutter_share_probe_publish(ctx);
+ 
+    if (fence) {
+diff --git a/src/gallium/drivers/d3d12/meson.build b/src/gallium/drivers/d3d12/meson.build
+index 0000000..0000000 100644
+--- a/src/gallium/drivers/d3d12/meson.build
++++ b/src/gallium/drivers/d3d12/meson.build
+@@ -100,2 +100,3 @@
+   'd3d12_resource.cpp',
++  'd3d12_mutter_share_probe.cpp',
+   'd3d12_resource_state.cpp',
+diff --git a/src/gallium/drivers/d3d12/d3d12_mutter_share_probe.cpp b/src/gallium/drivers/d3d12/d3d12_mutter_share_probe.cpp
+new file mode 100644
+index 0000000..0000000
+--- /dev/null
++++ b/src/gallium/drivers/d3d12/d3d12_mutter_share_probe.cpp
+@@ -0,0 +1,402 @@
++/* SPDX-License-Identifier: MIT */
++
++#include "d3d12_mutter_share_probe.h"
++
++#include "d3d12_context.h"
++#include "d3d12_resource.h"
++#include "d3d12_screen.h"
++
++#include <directx/d3d12.h>
++#include <dxguids/dxguids.h>
++#include <wrl/client.h>
++
++#include <algorithm>
++#include <array>
++#include <cerrno>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fcntl.h>
++#include <poll.h>
++#include <sys/eventfd.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <time.h>
++#include <unistd.h>
++#include <vector>
++
++using Microsoft::WRL::ComPtr;
++
++#ifndef GENERIC_ALL
++#define GENERIC_ALL 0x10000000L
++#endif
++
++namespace {
++
++constexpr uint32_t kMagic = 0x41534433;
++constexpr uint32_t kResourceBundle = 1;
++constexpr uint32_t kConsumerReady = 2;
++constexpr uint32_t kFrameInfo = 3;
++constexpr uint32_t kSlotCount = 3;
++constexpr uint32_t kWidth = 3840;
++constexpr uint32_t kHeight = 2160;
++constexpr uint32_t kFrames = 3600;
++constexpr uint32_t kFormatBgra8 = 87; /* DXGI_FORMAT_B8G8R8A8_UNORM */
++constexpr int kPollTimeoutMs = 10000;
++
++struct ResourceBundle {
++   uint32_t magic, type, width, height, slots, frames;
++   uint32_t format, synthetic_source, gpu_copy, buffer_count;
++};
++struct ConsumerReady {
++   uint32_t magic, type, status, opened_resources, done_eventfds;
++};
++struct FrameInfo {
++   uint32_t magic, type;
++   uint64_t frame;
++   uint32_t slot, diagnostic;
++   uint64_t producer_signal_ns;
++   uint8_t expected_bgra[4];
++   uint32_t expected_valid;
++};
++static_assert(sizeof(ResourceBundle) == 40, "probe ABI");
++static_assert(sizeof(ConsumerReady) == 20, "probe ABI");
++static_assert(sizeof(FrameInfo) == 40, "probe ABI");
++
++struct Slot {
++   ComPtr<ID3D12Resource> resource;
++   int resource_fd = -1;
++   int ready_fd = -1;
++   int done_fd = -1;
++};
++
++struct Probe {
++   int socket_fd = -1;
++   std::array<Slot, kSlotCount> slots;
++   ComPtr<ID3D12Fence> fence;
++   uint64_t frame = 0;
++   uint32_t pending_slot = 0;
++   ID3D12Resource *last_source = nullptr;
++   uint64_t source_resource_changes = 0;
++   uint64_t copy_start_ns = 0;
++   std::vector<uint64_t> gpu_copy_us;
++   std::vector<uint64_t> slot_recycle_us;
++   bool initialized = false;
++   bool pending = false;
++};
++
++static bool hook_logged = false;
++static bool empty_hook_logged = false;
++static bool ensure_logged = false;
++
++static uint64_t now_ns()
++{
++   struct timespec ts = {};
++   clock_gettime(CLOCK_MONOTONIC, &ts);
++   return static_cast<uint64_t>(ts.tv_sec) * 1000000000ULL + ts.tv_nsec;
++}
++
++static double percentile_us(const std::vector<uint64_t> &values, double q)
++{
++   if (values.empty())
++      return 0.0;
++   std::vector<uint64_t> sorted = values;
++   std::sort(sorted.begin(), sorted.end());
++   const size_t index = static_cast<size_t>(q * (sorted.size() - 1));
++   return static_cast<double>(sorted[index]) / 1000.0;
++}
++
++static void close_fd(int &fd)
++{
++   if (fd >= 0)
++      close(fd);
++   fd = -1;
++}
++
++static bool send_fds(int fd, const void *data, size_t size,
++                     const std::vector<int> &fds)
++{
++   struct msghdr msg = {};
++   struct iovec iov = {const_cast<void *>(data), size};
++   msg.msg_iov = &iov;
++   msg.msg_iovlen = 1;
++   std::array<unsigned char, CMSG_SPACE(sizeof(int) * 6)> control = {};
++   if (!fds.empty()) {
++      msg.msg_control = control.data();
++      msg.msg_controllen = CMSG_SPACE(sizeof(int) * fds.size());
++      struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
++      cmsg->cmsg_level = SOL_SOCKET;
++      cmsg->cmsg_type = SCM_RIGHTS;
++      cmsg->cmsg_len = CMSG_LEN(sizeof(int) * fds.size());
++      memcpy(CMSG_DATA(cmsg), fds.data(), sizeof(int) * fds.size());
++   }
++   return sendmsg(fd, &msg, MSG_NOSIGNAL) == static_cast<ssize_t>(size);
++}
++
++static bool recv_fds(int fd, void *data, size_t size, std::vector<int> &fds)
++{
++   struct msghdr msg = {};
++   struct iovec iov = {data, size};
++   msg.msg_iov = &iov;
++   msg.msg_iovlen = 1;
++   std::array<unsigned char, CMSG_SPACE(sizeof(int) * 6)> control = {};
++   msg.msg_control = control.data();
++   msg.msg_controllen = control.size();
++   const ssize_t got = recvmsg(fd, &msg, 0);
++   if (got != static_cast<ssize_t>(size) || (msg.msg_flags & MSG_CTRUNC))
++      return false;
++   for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg;
++        cmsg = CMSG_NXTHDR(&msg, cmsg)) {
++      if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS)
++         continue;
++      const size_t bytes = cmsg->cmsg_len - CMSG_LEN(0);
++      if (bytes % sizeof(int) != 0)
++         return false;
++      const int *received = reinterpret_cast<const int *>(CMSG_DATA(cmsg));
++      for (size_t i = 0; i < bytes / sizeof(int); ++i)
++         fds.push_back(received[i]);
++   }
++   return true;
++}
++
++static bool wait_done(int fd, uint64_t *wait_us)
++{
++   const uint64_t start_ns = now_ns();
++   struct pollfd pfd = {fd, POLLIN, 0};
++   int result;
++   do
++      result = poll(&pfd, 1, kPollTimeoutMs);
++   while (result < 0 && errno == EINTR);
++   if (result <= 0 || !(pfd.revents & POLLIN))
++      return false;
++   eventfd_t value = 0;
++   const bool ok = eventfd_read(fd, &value) == 0 && value != 0;
++   if (ok && wait_us)
++      *wait_us = (now_ns() - start_ns) / 1000;
++   return ok;
++}
++
++static bool set_completion(ID3D12Fence *fence, uint64_t value, int fd)
++{
++   return SUCCEEDED(fence->SetEventOnCompletion(
++      value, reinterpret_cast<HANDLE>(static_cast<intptr_t>(fd))));
++}
++
++static bool connect_probe(Probe *probe)
++{
++   const char *path = getenv("ASB_MUTTER_D3D12_SHARE_SOCKET");
++   if (!path || !*path)
++      return false;
++   if (strlen(path) >= sizeof(((struct sockaddr_un *)nullptr)->sun_path))
++      return false;
++   probe->socket_fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
++   if (probe->socket_fd < 0)
++      return false;
++   sockaddr_un address = {};
++   address.sun_family = AF_UNIX;
++   strncpy(address.sun_path, path, sizeof(address.sun_path) - 1);
++   if (connect(probe->socket_fd, reinterpret_cast<sockaddr *>(&address),
++               sizeof(address)) != 0)
++      return false;
++   return true;
++}
++
++static bool ensure_ring(struct d3d12_context *ctx,
++                        struct d3d12_resource *source,
++                        Probe *probe)
++{
++   if (probe->initialized)
++      return true;
++   struct d3d12_screen *screen = d3d12_screen(ctx->base.screen);
++   ID3D12Resource *source_resource = d3d12_resource_resource(source);
++   const D3D12_RESOURCE_DESC desc = source_resource->GetDesc();
++   if (!ensure_logged) {
++      fprintf(stderr, "MUTTER_D3D12 ensure-ring source width=%llu height=%u format=%u flags=0x%08x\\n",
++              static_cast<unsigned long long>(desc.Width), desc.Height,
++              static_cast<unsigned>(desc.Format), static_cast<unsigned>(desc.Flags));
++      fflush(stderr);
++      ensure_logged = true;
++   }
++   if (desc.Width != kWidth || desc.Height != kHeight ||
++       desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM || desc.SampleDesc.Count != 1) {
++      fprintf(stderr, "MUTTER_D3D12 blocker=real-render-target width=%llu height=%u format=%u\n",
++              static_cast<unsigned long long>(desc.Width), desc.Height,
++              static_cast<unsigned>(desc.Format));
++      fflush(stderr);
++      return false;
++   }
++   debug_printf("MUTTER_D3D12 target_resource=%p width=%llu height=%u "
++                "format=BGRA8 source_state=RENDER_TARGET "
++                "source_desc_flags=0x%08x ring_heap_flag=D3D12_HEAP_FLAG_SHARED "
++                "ring_slots=%u modifier=not-applicable\n",
++                source_resource, static_cast<unsigned long long>(desc.Width),
++                desc.Height, static_cast<unsigned>(desc.Flags), kSlotCount);
++   if (!connect_probe(probe)) {
++      fprintf(stderr, "MUTTER_D3D12 blocker=consumer-connect errno=%d\n", errno);
++      fflush(stderr);
++      return false;
++   }
++
++   D3D12_HEAP_PROPERTIES heap = {};
++   heap.Type = D3D12_HEAP_TYPE_DEFAULT;
++   heap.CreationNodeMask = 1;
++   heap.VisibleNodeMask = 1;
++   for (uint32_t i = 0; i < kSlotCount; ++i) {
++      if (FAILED(screen->dev->CreateCommittedResource(
++             &heap, D3D12_HEAP_FLAG_SHARED, &desc,
++             D3D12_RESOURCE_STATE_COMMON, nullptr,
++             IID_PPV_ARGS(&probe->slots[i].resource))))
++         return false;
++      HANDLE raw = nullptr;
++      if (FAILED(screen->dev->CreateSharedHandle(
++             probe->slots[i].resource.Get(), nullptr, GENERIC_ALL, nullptr,
++             &raw)))
++         return false;
++      probe->slots[i].resource_fd = static_cast<int>(reinterpret_cast<intptr_t>(raw));
++      probe->slots[i].ready_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
++      if (probe->slots[i].resource_fd < 0 || probe->slots[i].ready_fd < 0)
++         return false;
++   }
++   if (FAILED(screen->dev->CreateFence(0, D3D12_FENCE_FLAG_NONE,
++                                       IID_PPV_ARGS(&probe->fence))))
++      return false;
++
++   ResourceBundle bundle = {kMagic, kResourceBundle, kWidth, kHeight,
++                            kSlotCount, kFrames, kFormatBgra8, 0, 1,
++                            kSlotCount};
++   std::vector<int> fds;
++   for (Slot &slot : probe->slots) {
++      fds.push_back(slot.resource_fd);
++      fds.push_back(slot.ready_fd);
++   }
++   if (!send_fds(probe->socket_fd, &bundle, sizeof(bundle), fds))
++      return false;
++   for (Slot &slot : probe->slots)
++      close_fd(slot.resource_fd); /* Mesa keeps the ID3D12Resource alive. */
++   ConsumerReady ready = {};
++   std::vector<int> received;
++   if (!recv_fds(probe->socket_fd, &ready, sizeof(ready), received) ||
++       ready.magic != kMagic || ready.type != kConsumerReady ||
++       ready.opened_resources != kSlotCount ||
++       ready.done_eventfds != kSlotCount || received.size() != kSlotCount)
++      return false;
++   for (uint32_t i = 0; i < kSlotCount; ++i)
++      probe->slots[i].done_fd = received[i];
++   probe->initialized = true;
++   debug_printf("PASS stage=mutter-d3d12-renderer renderer=D3D12\n");
++   debug_printf("PASS stage=mutter-real-render-target synthetic_source=0 width=%u height=%u format=BGRA8\n",
++                kWidth, kHeight);
++   debug_printf("PASS stage=mutter-shared-resource native_d3d12_shared=1 gpu_copy=1 resource_count=3\n");
++   return true;
++}
++
++static bool record_copy(struct d3d12_context *ctx,
++                        struct d3d12_resource *source,
++                        Probe *probe)
++{
++   if (!ctx->has_commands || !ensure_ring(ctx, source, probe))
++      return false;
++   ID3D12Resource *source_resource = d3d12_resource_resource(source);
++   if (probe->last_source != nullptr && probe->last_source != source_resource)
++      ++probe->source_resource_changes;
++   probe->last_source = source_resource;
++   const uint32_t slot_index = static_cast<uint32_t>(probe->frame % kSlotCount);
++   uint64_t recycle_us = 0;
++   if (probe->frame >= kSlotCount &&
++       !wait_done(probe->slots[slot_index].done_fd, &recycle_us)) {
++      debug_printf("MUTTER_D3D12 blocker=producer-eventfd-sync slot=%u\n", slot_index);
++      return false;
++   }
++   if (probe->frame >= kSlotCount)
++      probe->slot_recycle_us.push_back(recycle_us);
++
++   probe->copy_start_ns = now_ns();
++   d3d12_transition_resource_state(ctx, source, D3D12_RESOURCE_STATE_COPY_SOURCE,
++                                   D3D12_TRANSITION_FLAG_INVALIDATE_BINDINGS);
++   d3d12_apply_resource_states(ctx, false);
++   D3D12_RESOURCE_BARRIER barrier = {};
++   barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++   barrier.Transition.pResource = probe->slots[slot_index].resource.Get();
++   barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++   barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
++   barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
++   ctx->cmdlist->ResourceBarrier(1, &barrier);
++   ctx->cmdlist->CopyResource(probe->slots[slot_index].resource.Get(),
++                              d3d12_resource_resource(source));
++   barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
++   barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
++   ctx->cmdlist->ResourceBarrier(1, &barrier);
++   d3d12_transition_resource_state(ctx, source,
++                                   D3D12_RESOURCE_STATE_RENDER_TARGET,
++                                   D3D12_TRANSITION_FLAG_INVALIDATE_BINDINGS);
++   d3d12_apply_resource_states(ctx, false);
++   ctx->has_commands = true;
++   probe->pending_slot = slot_index;
++   probe->pending = true;
++   return true;
++}
++
++} // namespace
++
++bool d3d12_mutter_share_probe_record(struct d3d12_context *ctx)
++{
++   if (getenv("ASB_MUTTER_D3D12_SHARE_SOCKET")) {
++      void *cbuf_texture = (void *)ctx->fb.cbufs[0].texture;
++      if (cbuf_texture && !hook_logged) {
++         fprintf(stderr, "MUTTER_D3D12 hook-target has_commands=%d cbuf_texture=%p\\n",
++                 ctx->has_commands, cbuf_texture);
++         fflush(stderr);
++         hook_logged = true;
++      } else if (!cbuf_texture && !empty_hook_logged) {
++         fprintf(stderr, "MUTTER_D3D12 hook-empty has_commands=%d\\n",
++                 ctx->has_commands);
++         fflush(stderr);
++         empty_hook_logged = true;
++      }
++   }
++   if (!getenv("ASB_MUTTER_D3D12_SHARE_SOCKET") ||
++       !ctx->fb.cbufs[0].texture)
++      return false;
++   auto **state = reinterpret_cast<Probe **>(&ctx->mutter_share_probe);
++   if (!*state)
++      *state = new Probe();
++   struct d3d12_resource *source = d3d12_resource(ctx->fb.cbufs[0].texture);
++   return record_copy(ctx, source, *state);
++}
++
++void d3d12_mutter_share_probe_publish(struct d3d12_context *ctx)
++{
++   auto *probe = reinterpret_cast<Probe *>(ctx->mutter_share_probe);
++   if (!probe || !probe->pending)
++      return;
++   struct d3d12_screen *screen = d3d12_screen(ctx->base.screen);
++   if (probe->copy_start_ns != 0)
++      probe->gpu_copy_us.push_back((now_ns() - probe->copy_start_ns) / 1000);
++   const uint64_t value = probe->frame + 1;
++   if (FAILED(screen->cmdqueue->Signal(probe->fence.Get(), value)) ||
++       !set_completion(probe->fence.Get(), value,
++                       probe->slots[probe->pending_slot].ready_fd)) {
++      debug_printf("MUTTER_D3D12 blocker=producer-eventfd-sync\n");
++      probe->pending = false;
++      return;
++   }
++   const uint32_t value32 = static_cast<uint32_t>(probe->frame);
++   FrameInfo info = {kMagic, kFrameInfo, probe->frame, probe->pending_slot,
++                     ((probe->frame + 1) % 120) == 0 ? 1U : 0U,
++                     now_ns(),
++                     {static_cast<uint8_t>(value32 & 0xff),
++                      static_cast<uint8_t>((value32 >> 8) & 0xff),
++                      static_cast<uint8_t>((value32 >> 16) & 0xff), 255},
++                     1};
++   if (!send_fds(probe->socket_fd, &info, sizeof(info), {}))
++      debug_printf("MUTTER_D3D12 blocker=consumer-control-socket\n");
++   ++probe->frame;
++   probe->pending = false;
++}
++
++void d3d12_mutter_share_probe_destroy(struct d3d12_context *ctx)
++{
++   auto *probe = reinterpret_cast<Probe *>(ctx->mutter_share_probe);
++   if (!probe)
++      return;
++   debug_printf("gpu_copy_us p50=%.3f p95=%.3f p99=%.3f samples=%zu\n",
++                percentile_us(probe->gpu_copy_us, 0.50),
++                percentile_us(probe->gpu_copy_us, 0.95),
++                percentile_us(probe->gpu_copy_us, 0.99),
++                probe->gpu_copy_us.size());
++   debug_printf("slot_recycle_us p50=%.3f p95=%.3f p99=%.3f samples=%zu\n",
++                percentile_us(probe->slot_recycle_us, 0.50),
++                percentile_us(probe->slot_recycle_us, 0.95),
++                percentile_us(probe->slot_recycle_us, 0.99),
++                probe->slot_recycle_us.size());
++   debug_printf("MUTTER_D3D12 source_resource_changes=%llu frames=%llu\n",
++                static_cast<unsigned long long>(probe->source_resource_changes),
++                static_cast<unsigned long long>(probe->frame));
++   for (Slot &slot : probe->slots) {
++      close_fd(slot.resource_fd);
++      close_fd(slot.ready_fd);
++      close_fd(slot.done_fd);
++   }
++   close_fd(probe->socket_fd);
++   delete probe;
++   ctx->mutter_share_probe = nullptr;
++}
+-- 
+2.51.0

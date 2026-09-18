@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: AppSandbox contributors <appsandbox@example.invalid>
+Date: Fri, 18 Sep 2026 00:00:00 +0800
+Subject: [PATCH] clutter: flush the isolated D3D12 output probe after paint
+
+This is an opt-in experiment hook for Mutter 50.x.  The hook is placed after
+the default `paint-view` handler, while the stage view framebuffer is still
+the compositor's output and before the native backend submits/presents it.
+Mesa's d3d12 probe hook consumes the current Gallium framebuffer at the
+following flush and performs the GPU-only copy into its shared ring.
+
+The environment guard is essential: normal Mutter sessions do not acquire the
+extra flush or open a probe socket.  The patch does not change
+appsandbox-display, KMS, GBM modifiers, PRIME, DMA-BUF, or scanout behavior.
+
+Hook point: `clutter/clutter/clutter-stage.c`, `_clutter_stage_paint_view`,
+immediately after the `paint-view` signal/default handler returns.
+
+---
+ clutter/clutter/clutter-stage.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/clutter/clutter/clutter-stage.c b/clutter/clutter/clutter-stage.c
+index 0000000..0000000 100644
+--- a/clutter/clutter/clutter-stage.c
++++ b/clutter/clutter/clutter-stage.c
+@@ -200,7 +200,13 @@
+   if (g_signal_has_handler_pending (stage, stage_signals[PAINT_VIEW],
+                                     0, TRUE))
+     g_signal_emit (stage, stage_signals[PAINT_VIEW], 0, view, redraw_clip,
+                    frame);
+   else
+     CLUTTER_STAGE_GET_CLASS (stage)->paint_view (stage, view, redraw_clip,
+                                                   frame);
++
++  /* The Mesa d3d12 probe observes the current Gallium framebuffer from its
++   * pipe_context during this explicit flush.  It is intentionally opt-in and
++   * does not use glFinish or read pixels. */
++  if (g_getenv ("ASB_MUTTER_D3D12_SHARE_SOCKET"))
++    cogl_framebuffer_flush (clutter_stage_view_get_framebuffer (view));
+ }
+
+-- 
+2.51.0

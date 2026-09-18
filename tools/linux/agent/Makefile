@@ -14,6 +14,7 @@ SYSTEMDDIR    := /etc/systemd/system
 USERUNITDIR   := /etc/systemd/user
 POINTER_EXT   := appsandbox-pointer@appsandbox
 EXTENSIONDIR  := /usr/share/gnome-shell/extensions/$(POINTER_EXT)
+WAYLAND_XDG_SHELL_XML ?= /usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml
 
 # Daemons get added here as each phase lands.
 BINS := appsandbox-agent appsandbox-display appsandbox-input appsandbox-audio appsandbox-clipboard
@@ -83,7 +84,10 @@ disable:
 
 clean:
 	rm -f $(BINS) d3d12-native-share-probe d3d12-cross-process-share-probe \
-		d3d12-video-encode-probe
+		d3d12-video-encode-probe d3d12-mutter-consumer \
+		mutter-wayland-pattern-client gbm-egl-d3d12-probe \
+		xdg-shell-client-protocol.h \
+		xdg-shell-protocol.c
 
 # Diagnostic only: requires Microsoft's WSL libd3d12/libdxcore runtime and
 # the official DirectX-Headers development package.  Keep it out of `all` so
@@ -111,6 +115,37 @@ d3d12-video-encode-probe: d3d12-video-encode-probe.cpp
 	       $(LDFLAGS) -L$(D3D12_LIBDIR) \
 	       $$(pkg-config --cflags --libs DirectX-Headers) -ld3d12 -ldxcore
 
+# Socket-facing consumer for the isolated Mutter/Mesa producer.  It includes
+# the validated encode consumer implementation but has no producer or daemon
+# integration, so the production appsandbox-display target is unchanged.
+d3d12-mutter-consumer: d3d12-mutter-consumer.cpp \
+		d3d12-video-encode-probe.cpp d3d12-cross-process-share-probe.cpp \
+		d3d12-share-probe-protocol.h
+	$(CXX) -std=c++17 $(CXXFLAGS) -D_GNU_SOURCE -D_WIN32_WINNT=0x0A00 \
+	       -O2 -Wall -Wextra -Werror -Wno-unknown-pragmas -o $@ $< \
+	       $(LDFLAGS) -L$(D3D12_LIBDIR) \
+	       $$(pkg-config --cflags --libs DirectX-Headers) -ld3d12 -ldxcore
+
+# Opaque dynamic client for the isolated Mutter/Mesa probe.  The generated
+# xdg-shell protocol files stay in this diagnostic build directory.
+mutter-wayland-pattern-client: mutter-wayland-pattern-client.c \
+		xdg-shell-client-protocol.h xdg-shell-protocol.c
+	$(CC) $(CFLAGS) -o $@ mutter-wayland-pattern-client.c \
+			xdg-shell-protocol.c $$(pkg-config --cflags --libs wayland-client)
+
+# Direct renderer-selection diagnostic for the isolated guest only.  This
+# opens /dev/dri/renderD128, creates a GBM/EGL OpenGL context, and prints the
+# actual Mesa renderer before Mutter is involved.
+gbm-egl-d3d12-probe: gbm-egl-d3d12-probe.c
+	$(CC) $(CFLAGS) -o $@ $< $$(pkg-config --cflags --libs egl gbm gl)
+
+xdg-shell-client-protocol.h: $(WAYLAND_XDG_SHELL_XML)
+	wayland-scanner client-header $< $@
+
+xdg-shell-protocol.c: $(WAYLAND_XDG_SHELL_XML)
+	wayland-scanner private-code $< $@
+
 .PHONY: all install install-pointer enable disable clean \
 	d3d12-native-share-probe d3d12-cross-process-share-probe \
-	d3d12-video-encode-probe
+	d3d12-video-encode-probe d3d12-mutter-consumer \
+	mutter-wayland-pattern-client gbm-egl-d3d12-probe

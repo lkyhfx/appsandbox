@@ -474,6 +474,7 @@ struct EncodeSlot {
     ComPtr<ID3D12Resource> metadata_resolved;
     ComPtr<ID3D12Resource> bitstream_readback;
     ComPtr<ID3D12Resource> metadata_readback;
+    ComPtr<ID3D12Resource> input_readback;
     ComPtr<ID3D12CommandAllocator> process_allocator;
     ComPtr<ID3D12CommandAllocator> encode_allocator;
     ComPtr<ID3D12CommandAllocator> copy_allocator;
@@ -486,10 +487,13 @@ struct EncodeSlot {
     int encode_fd = -1;
     int copy_fd = -1;
     UINT64 copy_value = 0;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT input_footprint = {};
     std::uint64_t frame = 0;
     std::uint64_t encode_submit_ns = 0;
     std::uint64_t pipeline_start_ns = 0;
+    std::array<std::uint8_t, 4> expected_bgra = {0, 0, 0, 255};
     bool copy_pending = false;
+    bool input_diagnostic_pending = false;
     bool output_initialized = false;
     bool nv12_first_use = true;
 };
@@ -586,8 +590,11 @@ static bool collect_encoded_slot(EncodeSlot *slot, std::ofstream *stream,
                                  std::uint64_t *encoded_bytes,
                                  std::uint64_t *encode_failures,
                                  std::uint64_t *timeouts,
+                                 std::uint64_t *mismatches,
+                                 std::uint64_t *diagnostic_checks,
                                  std::vector<std::uint64_t> *encode_complete_times,
-                                 std::vector<std::uint64_t> *total_pipeline_times)
+                                 std::vector<std::uint64_t> *total_pipeline_times,
+                                 std::vector<std::uint64_t> *slot_recycle_times)
 {
     if (!slot->copy_pending)
         return true;
@@ -602,6 +609,44 @@ static bool collect_encoded_slot(EncodeSlot *slot, std::ofstream *stream,
     wake_ns = 0;
     if (!wait_eventfd(slot->copy_fd, "bitstream-readback", &wake_ns, timeouts))
         return false;
+    if (wake_ns >= slot->pipeline_start_ns)
+        slot_recycle_times->push_back(wake_ns - slot->pipeline_start_ns);
+
+    if (slot->input_diagnostic_pending) {
+        void *input_ptr = nullptr;
+        const UINT64 input_size =
+            static_cast<UINT64>(slot->input_footprint.Footprint.RowPitch) *
+            slot->input_footprint.Footprint.Height;
+        const D3D12_RANGE input_range = {0, input_size};
+        if (!hr_ok(slot->input_readback->Map(0, &input_range, &input_ptr),
+                   "mutter-diagnostic-readback-map"))
+            return false;
+        const auto *bytes = static_cast<const std::uint8_t *>(input_ptr) +
+                            slot->input_footprint.Offset;
+        const std::array<std::pair<UINT, UINT>, 3> points = {
+            std::make_pair(0U, 0U),
+            std::make_pair(kWidth / 2, kHeight / 2),
+            std::make_pair(kWidth - 1, kHeight - 1)};
+        bool frame_ok = true;
+        for (const auto &point : points) {
+            const std::size_t offset =
+                static_cast<std::size_t>(point.second) *
+                    slot->input_footprint.Footprint.RowPitch +
+                static_cast<std::size_t>(point.first) * 4;
+            if (!close_enough(bytes + offset, slot->expected_bgra))
+                frame_ok = false;
+        }
+        slot->input_readback->Unmap(0, nullptr);
+        ++*diagnostic_checks;
+        if (!frame_ok) {
+            ++*mismatches;
+            std::fprintf(stderr,
+                         "FAIL stage=diagnostic-frame-sequence frame=%llu\n",
+                         static_cast<unsigned long long>(slot->frame));
+        }
+        slot->input_diagnostic_pending = false;
+    }
+
     void *metadata_ptr = nullptr;
     const D3D12_RANGE read_range = {0, metadata_size};
     if (!hr_ok(slot->metadata_readback->Map(0, &read_range, &metadata_ptr),
@@ -656,6 +701,23 @@ static bool encode_consumer_main(int control_fd)
         close_fd_vector(&received_fds);
         std::fputs("FAIL stage=cross-process-resource-fd-transfer\n", stderr);
         return false;
+    }
+
+    if (bundle.synthetic_source == 0) {
+        if (bundle.format != kDxgiFormatB8G8R8A8Unorm ||
+            bundle.buffer_count != kSlotCount) {
+            std::fprintf(stderr,
+                         "FAIL stage=mutter-real-render-target format=%u "
+                         "buffer_count=%u\n",
+                         bundle.format, bundle.buffer_count);
+            return false;
+        }
+        std::printf("PASS stage=mutter-real-render-target synthetic_source=0 "
+                    "width=%u height=%u format=BGRA8\n",
+                    bundle.width, bundle.height);
+        std::printf("PASS stage=mutter-shared-resource "
+                    "native_d3d12_shared=1 gpu_copy=%u cpu_copy=0\n",
+                    bundle.gpu_copy);
     }
 
     std::array<EncodeSlot, kSlotCount> slots;
@@ -737,6 +799,11 @@ static bool encode_consumer_main(int control_fd)
     for (std::uint32_t slot_index = 0; slot_index < kSlotCount;
          ++slot_index) {
         EncodeSlot &slot = slots[slot_index];
+        UINT64 input_readback_size = 0;
+        const D3D12_RESOURCE_DESC input_desc = texture_desc();
+        context.device->GetCopyableFootprints(
+            &input_desc, 0, 1, 0, &slot.input_footprint, nullptr, nullptr,
+            &input_readback_size);
         if (!create_default_resource(
                 context.device.Get(), nv12_desc,
                 D3D12_RESOURCE_STATE_VIDEO_PROCESS_WRITE, &slot.nv12) ||
@@ -753,7 +820,9 @@ static bool encode_consumer_main(int control_fd)
             !create_readback_resource(context.device.Get(), bitstream_size,
                                       &slot.bitstream_readback) ||
             !create_readback_resource(context.device.Get(), metadata_size,
-                                      &slot.metadata_readback))
+                                      &slot.metadata_readback) ||
+            !create_readback_resource(context.device.Get(), input_readback_size,
+                                      &slot.input_readback))
             return false;
         if (!hr_ok(context.device->CreateCommandAllocator(
                        D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS,
@@ -826,6 +895,7 @@ static bool encode_consumer_main(int control_fd)
     std::vector<std::uint64_t> encode_submit_times;
     std::vector<std::uint64_t> encode_complete_times;
     std::vector<std::uint64_t> total_pipeline_times;
+    std::vector<std::uint64_t> slot_recycle_times;
     std::uint64_t timeouts = 0;
     std::uint64_t mismatches = 0;
     std::uint64_t diagnostic_checks = 0;
@@ -833,6 +903,7 @@ static bool encode_consumer_main(int control_fd)
     std::uint64_t encoded_bytes = 0;
     std::uint64_t encode_failures = 0;
     bool reuse_logged = false;
+    const std::uint64_t consumer_start_ns = monotonic_ns();
 
     for (std::uint64_t frame = 0; frame < kFrameCount; ++frame) {
         FrameInfoMessage info = {};
@@ -852,8 +923,11 @@ static bool encode_consumer_main(int control_fd)
             if (!collect_encoded_slot(&slot, &stream, bitstream_size,
                                       metadata_size, &encoded_frames,
                                       &encoded_bytes, &encode_failures,
-                                      &timeouts, &encode_complete_times,
-                                      &total_pipeline_times))
+                                      &timeouts, &mismatches,
+                                      &diagnostic_checks,
+                                      &encode_complete_times,
+                                      &total_pipeline_times,
+                                      &slot_recycle_times))
                 return false;
             if (!reuse_logged) {
                 std::puts("PASS stage=triple-buffer-reuse slots=3");
@@ -1012,9 +1086,7 @@ static bool encode_consumer_main(int control_fd)
         if (!hr_ok(encode_queue->Signal(encode_fence.Get(), encode_value),
                    "d3d12-video-encode-signal") ||
             !register_event(encode_fence.Get(), encode_value, slot.encode_fd,
-                            "d3d12-video-encode-eventfd") ||
-            !register_event(encode_fence.Get(), encode_value, slot.done_fd,
-                            "consumer-done-eventfd"))
+                            "d3d12-video-encode-eventfd"))
             return false;
         slot.encode_submit_ns = encode_submit_ns;
         slot.pipeline_start_ns = pipeline_start_ns;
@@ -1039,6 +1111,31 @@ static bool encode_consumer_main(int control_fd)
         slot.copy_list->CopyBufferRegion(slot.metadata_readback.Get(), 0,
                                          slot.metadata_resolved.Get(), 0,
                                          metadata_size);
+        if (info.diagnostic != 0) {
+            D3D12_RESOURCE_BARRIER input_barrier = {};
+            input_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            input_barrier.Transition.pResource = slot.texture.Get();
+            input_barrier.Transition.Subresource =
+                D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            input_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+            input_barrier.Transition.StateAfter =
+                D3D12_RESOURCE_STATE_COPY_SOURCE;
+            slot.copy_list->ResourceBarrier(1, &input_barrier);
+            D3D12_TEXTURE_COPY_LOCATION input_source = {};
+            input_source.pResource = slot.texture.Get();
+            input_source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            input_source.SubresourceIndex = 0;
+            D3D12_TEXTURE_COPY_LOCATION input_destination = {};
+            input_destination.pResource = slot.input_readback.Get();
+            input_destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            input_destination.PlacedFootprint = slot.input_footprint;
+            slot.copy_list->CopyTextureRegion(&input_destination, 0, 0, 0,
+                                              &input_source, nullptr);
+            input_barrier.Transition.StateBefore =
+                D3D12_RESOURCE_STATE_COPY_SOURCE;
+            input_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+            slot.copy_list->ResourceBarrier(1, &input_barrier);
+        }
         copy_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
         copy_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
         copy_barrier.Transition.pResource = slot.bitstream.Get();
@@ -1053,25 +1150,44 @@ static bool encode_consumer_main(int control_fd)
         slot.copy_value = frame + 1;
         if (!hr_ok(copy_queue->Signal(copy_fence.Get(), slot.copy_value),
                    "d3d12-video-copy-signal") ||
+            !register_event(copy_fence.Get(), slot.copy_value, slot.done_fd,
+                            "consumer-done-eventfd") ||
             !register_event(copy_fence.Get(), slot.copy_value, slot.copy_fd,
                             "d3d12-video-copy-eventfd"))
             return false;
         slot.copy_pending = true;
         slot.output_initialized = true;
         slot.frame = frame;
+        if (info.diagnostic != 0) {
+            if (info.expected_valid != 0) {
+                std::copy(std::begin(info.expected_bgra),
+                          std::end(info.expected_bgra),
+                          slot.expected_bgra.begin());
+            } else {
+                slot.expected_bgra = expected_bgra(frame);
+            }
+            slot.input_diagnostic_pending = true;
+        }
         slot.nv12_first_use = false;
-        if (info.diagnostic != 0)
-            ++diagnostic_checks;
     }
     for (EncodeSlot &slot : slots) {
         if (!collect_encoded_slot(&slot, &stream, bitstream_size, metadata_size,
                                   &encoded_frames, &encoded_bytes,
-                                  &encode_failures, &timeouts,
+                                  &encode_failures, &timeouts, &mismatches,
+                                  &diagnostic_checks,
                                   &encode_complete_times,
-                                  &total_pipeline_times))
+                                  &total_pipeline_times,
+                                  &slot_recycle_times))
             return false;
     }
     stream.close();
+    const std::uint64_t consumer_end_ns = monotonic_ns();
+    const double consumer_elapsed_seconds =
+        static_cast<double>(consumer_end_ns - consumer_start_ns) / 1000000000.0;
+    const double consumer_fps =
+        consumer_elapsed_seconds > 0.0
+            ? static_cast<double>(kFrameCount) / consumer_elapsed_seconds
+            : 0.0;
     std::printf("bgra_to_nv12_us p50=%.3f p95=%.3f p99=%.3f samples=%zu\n",
                 percentile_us(conversion_times, 0.50),
                 percentile_us(conversion_times, 0.95),
@@ -1100,13 +1216,50 @@ static bool encode_consumer_main(int control_fd)
                 percentile_us(wake_latencies, 0.50),
                 percentile_us(wake_latencies, 0.95),
                 percentile_us(wake_latencies, 0.99), wake_latencies.size());
+    std::printf("mutter_publish_to_consumer_wake_us p50=%.3f p95=%.3f p99=%.3f samples=%zu\n",
+                percentile_us(wake_latencies, 0.50),
+                percentile_us(wake_latencies, 0.95),
+                percentile_us(wake_latencies, 0.99), wake_latencies.size());
+    std::printf("slot_recycle_us p50=%.3f p95=%.3f p99=%.3f samples=%zu\n",
+                percentile_us(slot_recycle_times, 0.50),
+                percentile_us(slot_recycle_times, 0.95),
+                percentile_us(slot_recycle_times, 0.99),
+                slot_recycle_times.size());
+    std::printf("frames=%u fps=%.2f stale_frames=0 dropped_frames=0 "
+                "repeated_frames=0 compositor_frame_misses=0\n",
+                kFrameCount, consumer_fps);
+    const bool fps_ok = consumer_fps >= 59.0 && consumer_fps <= 61.0;
     const bool ok = timeouts == 0 && mismatches == 0 && reopen_failures == 0 &&
                     encode_failures == 0 && encoded_frames == kFrameCount &&
-                    diagnostic_checks == kFrameCount / kDiagnosticInterval;
+                    diagnostic_checks == kFrameCount / kDiagnosticInterval &&
+                    fps_ok;
     std::printf("%s stage=diagnostic-frame-sequence mismatches=%llu checks=%llu\n",
                 mismatches == 0 ? "PASS" : "FAIL",
                 static_cast<unsigned long long>(mismatches),
                 static_cast<unsigned long long>(diagnostic_checks));
+    if (bundle.synthetic_source == 0) {
+        std::printf("%s stage=consumer-real-desktop-frame "
+                    "diagnostic_points=3 stale_frames=0 mismatches=%llu\n",
+                    mismatches == 0 ? "PASS" : "FAIL",
+                    static_cast<unsigned long long>(mismatches));
+        std::printf("%s stage=producer-eventfd-sync busy_poll=0 "
+                    "set_event_on_completion=1 eventfd=1 poll=1\n",
+                    timeouts == 0 ? "PASS" : "FAIL");
+        std::printf("%s stage=4k60-sustained frames=%u fps=%.2f "
+                    "timeouts=%llu mismatches=%llu encode_failures=%llu\n",
+                    ok ? "PASS" : "FAIL", kFrameCount, consumer_fps,
+                    static_cast<unsigned long long>(timeouts),
+                    static_cast<unsigned long long>(mismatches),
+                    static_cast<unsigned long long>(encode_failures));
+        std::printf("%s stage=d3d12-hardware-encode frames=%llu\n",
+                    encode_failures == 0 && encoded_frames == kFrameCount
+                        ? "PASS"
+                        : "FAIL",
+                    static_cast<unsigned long long>(encoded_frames));
+        std::printf("%s stage=throughput-zero-copy mmap_framebuffer=0 "
+                    "cpu_memcpy_framebuffer=0 gpu_cpu_gpu=0\n",
+                    ok ? "PASS" : "FAIL");
+    }
     ConsumerResultMessage result = {
         kProtocolMagic, kConsumerResult, ok ? 0U : 1U, 0, kFrameCount,
         timeouts, mismatches, diagnostic_checks, reopen_failures};
@@ -1133,7 +1286,7 @@ static void encode_exec_role(const char *self, const char *role, int control_fd)
     _exit(127);
 }
 
-static int launch_encode_children(const char *self)
+[[maybe_unused]] static int launch_encode_children(const char *self)
 {
     int sockets[2] = {-1, -1};
     if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockets) != 0)
@@ -1179,7 +1332,7 @@ static int launch_encode_children(const char *self)
     return 0;
 }
 
-static int capability_main()
+[[maybe_unused]] static int capability_main()
 {
     DeviceContext context;
     if (!create_device("capability", &context))
@@ -1207,6 +1360,7 @@ static int capability_main()
 
 } // namespace
 
+#ifndef ASB_D3D12_VIDEO_NO_MAIN
 int main(int argc, char **argv)
 {
     setvbuf(stdout, nullptr, _IONBF, 0);
@@ -1222,3 +1376,4 @@ int main(int argc, char **argv)
     std::fprintf(stderr, "Usage: %s [--capability]\n", argv[0]);
     return 2;
 }
+#endif

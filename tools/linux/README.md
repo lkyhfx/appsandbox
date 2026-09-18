@@ -92,6 +92,45 @@ tar xzf C:\path\to\asb-linux.tar.gz -C release\resources\linux\
 `tar.exe` ships with Windows 10+; if it isn't on your PATH the Git for
 Windows / 7-Zip / WinRAR equivalents all handle `.tar.gz` fine.
 
+## Isolated Mutter compositor-output probe
+
+The Mutter experiment is opt-in and does not modify or stop the production
+`appsandbox-display` path. It uses the existing validated consumer stages,
+but replaces the synthetic producer with an isolated Mutter/Mesa producer:
+
+1. Apply `wsl-mesa/patches/0002-d3d12-mutter-native-share-probe.patch` to the
+   isolated Mesa d3d12 build. The hook observes the real Gallium D3D12
+   framebuffer and records a GPU-only copy into a three-slot native shared
+   BGRA8 ring.
+2. Apply `agent/mutter-d3d12-share-probe.patch` to the isolated Mutter build.
+   The hook is enabled only when
+   `ASB_MUTTER_D3D12_SHARE_SOCKET` is set.
+3. Build the socket-facing consumer:
+
+   ```bash
+   cd tools/linux/agent
+   make d3d12-mutter-consumer D3D12_LIBDIR=/opt/appsandbox/wsl-deps
+   ```
+
+4. Run the isolated session from the same directory:
+
+   ```bash
+   MUTTER_TEST_CLIENT_CMD='/path/to/opaque-wayland-test-client --fullscreen' \
+     GPU_RUNNER=appsandbox-gpu \
+     ./gpu-mutter-d3d12-share-probe.sh gpu-mutter-d3d12-share-probe-results
+   ```
+
+`MUTTER_TEST_CLIENT_CMD` is mandatory. It must keep a real opaque dynamic
+Wayland surface visible for the 3,600-frame capture and paint the advertised
+frame marker at the diagnostic points; screenshots, synthetic producer
+buffers, framebuffer mmap, and CPU pixel copies are not accepted as evidence.
+The runner writes `mutter-consumer.log`, `mutter-session.log`, `runner.log`,
+`decode.log`, and `mutter.hevc` under the output directory. It prints the
+final PASS only after real-render-target evidence, SCM_RIGHTS/eventfd
+handoff, GPU BGRA-to-NV12, GPU HEVC encode, and 4K60/3,600-frame decode all
+pass. If the isolated Linux/GPU-PV environment is unavailable it records a
+BLOCKED result instead of claiming success.
+
 ## How the staged files reach a running VM
 
 1. `release/resources/linux/` is a committed staging dir on the Windows

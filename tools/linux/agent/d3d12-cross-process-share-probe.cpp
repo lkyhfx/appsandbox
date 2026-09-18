@@ -58,69 +58,16 @@
 #include <utility>
 #include <vector>
 
+#include "d3d12-share-probe-protocol.h"
+
 using Microsoft::WRL::ComPtr;
 
 namespace {
 
-constexpr std::uint32_t kProtocolMagic = 0x41534433; /* "3DSA" */
-constexpr std::uint32_t kSlotCount = 3;
-constexpr std::uint32_t kWidth = 3840;
-constexpr std::uint32_t kHeight = 2160;
-constexpr std::uint32_t kFrameCount = 3600;
-constexpr std::uint32_t kDiagnosticInterval = 120;
+using namespace asb_d3d12_share_probe;
 constexpr int kPollTimeoutMs = 10000;
 constexpr int kSocketTimeoutMs = 30000;
 constexpr std::size_t kMaxTransferFds = kSlotCount * 2;
-
-enum MessageType : std::uint32_t {
-    kResourceBundle = 1,
-    kConsumerReady = 2,
-    kFrameInfo = 3,
-    kConsumerResult = 4,
-};
-
-struct ResourceBundleMessage {
-    std::uint32_t magic;
-    std::uint32_t type;
-    std::uint32_t width;
-    std::uint32_t height;
-    std::uint32_t slots;
-    std::uint32_t frames;
-};
-
-struct ConsumerReadyMessage {
-    std::uint32_t magic;
-    std::uint32_t type;
-    std::uint32_t status;
-    std::uint32_t opened_resources;
-    std::uint32_t done_eventfds;
-};
-
-struct FrameInfoMessage {
-    std::uint32_t magic;
-    std::uint32_t type;
-    std::uint64_t frame;
-    std::uint32_t slot;
-    std::uint32_t diagnostic;
-    std::uint64_t producer_signal_ns;
-};
-
-struct ConsumerResultMessage {
-    std::uint32_t magic;
-    std::uint32_t type;
-    std::uint32_t status;
-    std::uint32_t reserved;
-    std::uint64_t frames;
-    std::uint64_t timeouts;
-    std::uint64_t mismatches;
-    std::uint64_t diagnostic_checks;
-    std::uint64_t resource_reopen_failures;
-};
-
-static_assert(sizeof(ResourceBundleMessage) == 24, "protocol packing changed");
-static_assert(sizeof(ConsumerReadyMessage) == 20, "protocol packing changed");
-static_assert(sizeof(FrameInfoMessage) == 32, "protocol packing changed");
-static_assert(sizeof(ConsumerResultMessage) == 56, "protocol packing changed");
 
 static std::uint64_t monotonic_ns()
 {
@@ -600,7 +547,7 @@ static bool producer_main(int control_fd)
     }
     const ResourceBundleMessage bundle = {
         kProtocolMagic, kResourceBundle, kWidth, kHeight, kSlotCount,
-        kFrameCount};
+        kFrameCount, kDxgiFormatB8G8R8A8Unorm, 1, 0, kSlotCount};
     if (!send_packet(control_fd, &bundle, sizeof(bundle), transfer_fds))
         return false;
     std::printf("PASS stage=cross-process-resource-fd-transfer slots=%u "
@@ -688,9 +635,11 @@ static bool producer_main(int control_fd)
             ready_stage_logged = true;
         }
 
+        const auto expected = expected_bgra(frame);
         const FrameInfoMessage frame_info = {
             kProtocolMagic, kFrameInfo, frame, slot_index,
-            ((frame + 1) % kDiagnosticInterval) == 0 ? 1U : 0U, signal_ns};
+            ((frame + 1) % kDiagnosticInterval) == 0 ? 1U : 0U, signal_ns,
+            {expected[0], expected[1], expected[2], expected[3]}, 1};
         if (!send_packet(control_fd, &frame_info, sizeof(frame_info), {}))
             return false;
     }
