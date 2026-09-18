@@ -74,16 +74,42 @@ PASS stage=4k60-sustained
 PASS d3d12-cross-process-zero-copy
 ```
 
-## Execution status in this workspace
+## Execution result
 
-The source, Make target, runner script, and this report are complete. A real
-4K60 PASS cannot be claimed from the current Windows workspace: the Linux
-DirectX-Headers/libd3d12/libdxcore guest toolchain and `/dev/dxg` runtime are
-not present here, and the local WSL distro enumeration is unavailable with
-`E_ACCESSDENIED`. Therefore this report intentionally records the runtime
-gate as **NOT RUN in this workspace**, rather than fabricating PASS metrics.
+Status: **PASS**
 
-The first guest run should append the captured `cross-process-share.log` and
-fill in the measured `frames`, `fps`, timeout/mismatch counters, wake latency,
-and GPU-work statistics. Until that run passes, this remains a validation
-probe and is not evidence to change Mutter or the production display path.
+The probe was built and run on the target Guest:
+
+```text
+Guest: yunsen@192.168.42.2
+Adapter: NVIDIA GeForce RTX 4070
+Runtime: DirectX-Headers 1.619.1, /opt/appsandbox/wsl-deps/libd3d12.so,
+         /opt/appsandbox/wsl-deps/libdxcore.so
+Frames: 3600
+FPS: 60.01
+Timeouts: 0
+Mismatches: 0
+Resource reopen failures: 0
+Exit code: 0
+```
+
+Measured statistics:
+
+```text
+wake_latency_us p50=233.484 p95=311.391 p99=441.021 samples=3600
+gpu_work_us min=348.615 mean=429.007 max=2973.328 p50=406.666 p95=509.553 p99=783.827 samples=3600
+```
+
+The complete captured output is preserved at
+`build/d3d12-cross-process-share/cross-process-share.log`.
+
+The Guest image stores the Microsoft D3D12 runtime in
+`/opt/appsandbox/wsl-deps`, outside the default linker cache. The Make target
+now exposes `D3D12_LIBDIR` (defaulting to that path), and the runner adds the
+same directory to `LD_LIBRARY_PATH`; this was required for the real Guest
+build and is part of the committed implementation.
+
+This PASS validates the synthetic cross-process resource/synchronization gate
+only. It does not yet validate D3D12 Video Encode, Mutter integration, or the
+production `appsandbox-display` path. The next gate is therefore the planned
+D3D12 shared texture to hardware-encoder capability probe.

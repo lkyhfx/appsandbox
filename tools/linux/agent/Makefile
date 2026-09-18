@@ -9,6 +9,7 @@ LDFLAGS ?=
 PREFIX        ?= /usr/local
 DESTDIR       ?=
 BINDIR        := $(PREFIX)/bin
+D3D12_LIBDIR  ?= /opt/appsandbox/wsl-deps
 SYSTEMDDIR    := /etc/systemd/system
 USERUNITDIR   := /etc/systemd/user
 POINTER_EXT   := appsandbox-pointer@appsandbox
@@ -98,6 +99,7 @@ d3d12-native-share-probe: d3d12-native-share-probe.cpp
 d3d12-cross-process-share-probe: d3d12-cross-process-share-probe.cpp
 	$(CXX) -std=c++17 $(CXXFLAGS) -D_GNU_SOURCE -D_WIN32_WINNT=0x0A00 \
 	       -O2 -Wall -Wextra -Werror -Wno-unknown-pragmas -o $@ $< \
+	       $(LDFLAGS) -L$(D3D12_LIBDIR) \
 	       $$(pkg-config --cflags --libs DirectX-Headers) -ld3d12 -ldxcore
 
 .PHONY: all install install-pointer enable disable clean \
