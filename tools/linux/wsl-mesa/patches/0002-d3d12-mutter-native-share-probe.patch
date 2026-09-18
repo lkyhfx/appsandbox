@@ -12,7 +12,8 @@ Hook points:
   * d3d12_flush() is called by the opt-in Mutter post-paint hook after the
     stage view has been painted and before the native backend presents it;
   * the producer records a GPU-only CopyResource from that actual target into
-    three D3D12_HEAP_FLAG_SHARED BGRA8 resources, then signals a producer
+     three D3D12_HEAP_FLAG_SHARED resources retaining the source DXGI format,
+     then signals a producer
     fence through SetEventOnCompletion(eventfd).
 
 No mmap, glReadPixels, PRIME, DMA-BUF, CPU pixel copy, or shared fence is used.
@@ -27,10 +28,10 @@ optimization after this evidence is collected.
 ---
  src/gallium/drivers/d3d12/d3d12_context.h            |   1 +
  src/gallium/drivers/d3d12/d3d12_context_common.cpp   |   6 +
- src/gallium/drivers/d3d12/d3d12_mutter_share_probe.cpp | 391 +++++++++++++++++++
+ src/gallium/drivers/d3d12/d3d12_mutter_share_probe.cpp | 434 ++++++++++++++++++++++++
  src/gallium/drivers/d3d12/d3d12_mutter_share_probe.h |  15 +
  src/gallium/drivers/d3d12/meson.build                |   1 +
- 5 files changed, 414 insertions(+)
+ 5 files changed, 457 insertions(+)
 
 diff --git a/src/gallium/drivers/d3d12/d3d12_mutter_share_probe.h b/src/gallium/drivers/d3d12/d3d12_mutter_share_probe.h
 new file mode 100644
@@ -111,7 +112,7 @@ new file mode 100644
 index 0000000..0000000
 --- /dev/null
 +++ b/src/gallium/drivers/d3d12/d3d12_mutter_share_probe.cpp
-@@ -0,0 +1,402 @@
+@@ -0,0 +1,434 @@
 +/* SPDX-License-Identifier: MIT */
 +
 +#include "d3d12_mutter_share_probe.h"
@@ -156,7 +157,6 @@ index 0000000..0000000
 +constexpr uint32_t kWidth = 3840;
 +constexpr uint32_t kHeight = 2160;
 +constexpr uint32_t kFrames = 3600;
-+constexpr uint32_t kFormatBgra8 = 87; /* DXGI_FORMAT_B8G8R8A8_UNORM */
 +constexpr int kPollTimeoutMs = 10000;
 +
 +struct ResourceBundle {
@@ -171,7 +171,7 @@ index 0000000..0000000
 +   uint64_t frame;
 +   uint32_t slot, diagnostic;
 +   uint64_t producer_signal_ns;
-+   uint8_t expected_bgra[4];
++   uint8_t expected_r, expected_g, expected_b, expected_a;
 +   uint32_t expected_valid;
 +};
 +static_assert(sizeof(ResourceBundle) == 40, "probe ABI");
@@ -324,28 +324,33 @@ index 0000000..0000000
 +      return true;
 +   struct d3d12_screen *screen = d3d12_screen(ctx->base.screen);
 +   ID3D12Resource *source_resource = d3d12_resource_resource(source);
-+   const D3D12_RESOURCE_DESC desc = source_resource->GetDesc();
++   const D3D12_RESOURCE_DESC source_desc = source_resource->GetDesc();
 +   if (!ensure_logged) {
 +      fprintf(stderr, "MUTTER_D3D12 ensure-ring source width=%llu height=%u format=%u flags=0x%08x\\n",
-+              static_cast<unsigned long long>(desc.Width), desc.Height,
-+              static_cast<unsigned>(desc.Format), static_cast<unsigned>(desc.Flags));
++              static_cast<unsigned long long>(source_desc.Width), source_desc.Height,
++              static_cast<unsigned>(source_desc.Format), static_cast<unsigned>(source_desc.Flags));
 +      fflush(stderr);
 +      ensure_logged = true;
 +   }
-+   if (desc.Width != kWidth || desc.Height != kHeight ||
-+       desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM || desc.SampleDesc.Count != 1) {
++   if (source_desc.Width != kWidth || source_desc.Height != kHeight ||
++       source_desc.SampleDesc.Count != 1 ||
++       !(source_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
++         source_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM)) {
 +      fprintf(stderr, "MUTTER_D3D12 blocker=real-render-target width=%llu height=%u format=%u\n",
-+              static_cast<unsigned long long>(desc.Width), desc.Height,
-+              static_cast<unsigned>(desc.Format));
++              static_cast<unsigned long long>(source_desc.Width), source_desc.Height,
++              static_cast<unsigned>(source_desc.Format));
 +      fflush(stderr);
 +      return false;
 +   }
 +   debug_printf("MUTTER_D3D12 target_resource=%p width=%llu height=%u "
-+                "format=BGRA8 source_state=RENDER_TARGET "
++                "format=%s dxgi_format=%u source_state=RENDER_TARGET "
 +                "source_desc_flags=0x%08x ring_heap_flag=D3D12_HEAP_FLAG_SHARED "
 +                "ring_slots=%u modifier=not-applicable\n",
-+                source_resource, static_cast<unsigned long long>(desc.Width),
-+                desc.Height, static_cast<unsigned>(desc.Flags), kSlotCount);
++                source_resource, static_cast<unsigned long long>(source_desc.Width),
++                source_desc.Height,
++                source_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ? "RGBA8" : "BGRA8",
++                static_cast<unsigned>(source_desc.Format), static_cast<unsigned>(source_desc.Flags),
++                kSlotCount);
 +   if (!connect_probe(probe)) {
 +      fprintf(stderr, "MUTTER_D3D12 blocker=consumer-connect errno=%d\n", errno);
 +      fflush(stderr);
@@ -358,7 +363,7 @@ index 0000000..0000000
 +   heap.VisibleNodeMask = 1;
 +   for (uint32_t i = 0; i < kSlotCount; ++i) {
 +      if (FAILED(screen->dev->CreateCommittedResource(
-+             &heap, D3D12_HEAP_FLAG_SHARED, &desc,
++             &heap, D3D12_HEAP_FLAG_SHARED, &source_desc,
 +             D3D12_RESOURCE_STATE_COMMON, nullptr,
 +             IID_PPV_ARGS(&probe->slots[i].resource))))
 +         return false;
@@ -377,7 +382,8 @@ index 0000000..0000000
 +      return false;
 +
 +   ResourceBundle bundle = {kMagic, kResourceBundle, kWidth, kHeight,
-+                            kSlotCount, kFrames, kFormatBgra8, 0, 1,
++                            kSlotCount, kFrames,
++                            static_cast<uint32_t>(source_desc.Format), 0, 1,
 +                            kSlotCount};
 +   std::vector<int> fds;
 +   for (Slot &slot : probe->slots) {
@@ -398,10 +404,16 @@ index 0000000..0000000
 +   for (uint32_t i = 0; i < kSlotCount; ++i)
 +      probe->slots[i].done_fd = received[i];
 +   probe->initialized = true;
-+   debug_printf("PASS stage=mutter-d3d12-renderer renderer=D3D12\n");
-+   debug_printf("PASS stage=mutter-real-render-target synthetic_source=0 width=%u height=%u format=BGRA8\n",
-+                kWidth, kHeight);
-+   debug_printf("PASS stage=mutter-shared-resource native_d3d12_shared=1 gpu_copy=1 resource_count=3\n");
++   fprintf(stderr, "PASS stage=mutter-d3d12-renderer renderer=D3D12\n");
++   fflush(stderr);
++   debug_printf("PASS stage=mutter-real-render-target synthetic_source=0 "
++                "width=%u height=%u format=%s dxgi_format=%u\n",
++                kWidth, kHeight,
++                source_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ? "RGBA8" : "BGRA8",
++                static_cast<unsigned>(source_desc.Format));
++   debug_printf("PASS stage=mutter-shared-resource format=%s "
++                "native_d3d12_shared=1 gpu_copy=1 cpu_copy=0 resource_count=3\n",
++                source_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ? "RGBA8" : "BGRA8");
 +   return true;
 +}
 +
@@ -495,13 +507,13 @@ index 0000000..0000000
 +      probe->pending = false;
 +      return;
 +   }
-+   const uint32_t value32 = static_cast<uint32_t>(probe->frame);
++   const uint8_t expected_r = 31U;
++   const uint8_t expected_g = 127U;
++   const uint8_t expected_b = 223U;
 +   FrameInfo info = {kMagic, kFrameInfo, probe->frame, probe->pending_slot,
 +                     ((probe->frame + 1) % 120) == 0 ? 1U : 0U,
 +                     now_ns(),
-+                     {static_cast<uint8_t>(value32 & 0xff),
-+                      static_cast<uint8_t>((value32 >> 8) & 0xff),
-+                      static_cast<uint8_t>((value32 >> 16) & 0xff), 255},
++                     expected_r, expected_g, expected_b, 255,
 +                     1};
 +   if (!send_fds(probe->socket_fd, &info, sizeof(info), {}))
 +      debug_printf("MUTTER_D3D12 blocker=consumer-control-socket\n");

@@ -17,6 +17,7 @@ constexpr std::uint32_t kWidth = 3840;
 constexpr std::uint32_t kHeight = 2160;
 constexpr std::uint32_t kFrameCount = 3600;
 constexpr std::uint32_t kDiagnosticInterval = 120;
+constexpr std::uint32_t kDxgiFormatR8G8B8A8Unorm = 28;
 constexpr std::uint32_t kDxgiFormatB8G8R8A8Unorm = 87;
 
 enum MessageType : std::uint32_t {
@@ -54,7 +55,11 @@ struct FrameInfoMessage {
     std::uint32_t slot;
     std::uint32_t diagnostic;
     std::uint64_t producer_signal_ns;
-    std::uint8_t expected_bgra[4];
+    /* Semantic RGBA values; the consumer maps them to resource byte order. */
+    std::uint8_t expected_r;
+    std::uint8_t expected_g;
+    std::uint8_t expected_b;
+    std::uint8_t expected_a;
     std::uint32_t expected_valid;
 };
 

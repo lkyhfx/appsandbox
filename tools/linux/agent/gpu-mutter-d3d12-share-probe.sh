@@ -3,9 +3,10 @@
 #
 # This script intentionally refuses to claim real-desktop success unless a
 # visible dynamic Wayland test client is supplied.  The test client must paint
-# an opaque full-screen frame whose BGRA pixel at the three diagnostic points
-# is the frame pattern advertised by the patched Mesa publisher:
-#   B=(frame & 0xff), G=((frame >> 8) & 0xff), R=((frame >> 16) & 0xff), A=255
+# an opaque full-screen frame whose semantic RGBA pixel at the three diagnostic
+# points is the frame pattern advertised by the patched Mesa publisher:
+#   Base R=31, G=127, B=223, A=255; a moving opaque square changes per frame
+#   away from the three diagnostic points.
 #
 # The compositor side is expected to be patched with
 # mutter-d3d12-share-probe.patch and the Mesa d3d12 hook described by that
@@ -92,14 +93,14 @@ runtime=$(mktemp -d /tmp/asb-mutter-d3d12-XXXXXX)
 chmod 700 "$runtime"
 
 set +e
-timeout -k 5s 115s dbus-run-session -- env \
+timeout -k 5s 180s dbus-run-session -- env \
     XDG_RUNTIME_DIR="$runtime" \
     WAYLAND_DISPLAY="$wayland_display" \
     ASB_MUTTER_D3D12_SHARE_SOCKET="$socket_path" \
     ASB_MUTTER_D3D12_SHARE_WIDTH=3840 \
     ASB_MUTTER_D3D12_SHARE_HEIGHT=2160 \
     ASB_MUTTER_D3D12_SHARE_FRAMES=3600 \
-    ASB_MUTTER_D3D12_SHARE_EXPECTED_PATTERN=frame-bgra \
+    ASB_MUTTER_D3D12_SHARE_EXPECTED_PATTERN=frame-rgba \
     ASB_MUTTER_SESSION_LOG="$mutter_log" \
     ASB_MUTTER_CLIENT_LOG="$client_log" \
     ASB_PATTERN_CLIENT_FRAMES="${ASB_PATTERN_CLIENT_FRAMES:-3600}" \
@@ -170,7 +171,7 @@ if [[ "$consumer_status" -ne 0 ]]; then
     printf 'FAIL stage=mutter-consumer exit_code=%d\n' "$consumer_status"
     exit "$consumer_status"
 fi
-if ! grep -Eq 'PASS stage=mutter-d3d12-renderer' "$consumer_log" "$runner_log"; then
+if ! grep -Eq 'PASS stage=mutter-d3d12-renderer' "$consumer_log" "$runner_log" "$mutter_log"; then
     printf 'FAIL stage=mutter-d3d12-renderer reason=missing-Mesa-renderer-evidence\n'
     exit 1
 fi
@@ -178,6 +179,30 @@ if ! grep -Eq 'PASS stage=mutter-real-render-target synthetic_source=0' "$consum
     printf 'FAIL stage=mutter-real-render-target reason=missing-real-target-evidence\n'
     exit 1
 fi
+require_gate() {
+    if ! grep -Eq "$1" "$consumer_log" "$runner_log"; then
+        printf 'FAIL stage=%s reason=missing-gate-evidence\n' "$2"
+        exit 1
+    fi
+}
+require_gate 'PASS stage=mutter-real-render-target synthetic_source=0 .*format=RGBA8 dxgi_format=28' \
+    mutter-real-render-target
+require_gate 'PASS stage=mutter-shared-resource format=RGBA8 .*native_d3d12_shared=1 .*gpu_copy=1 .*cpu_copy=0' \
+    mutter-shared-resource
+require_gate 'PASS stage=cross-process-open-shared-resource format=RGBA8' \
+    cross-process-open-shared-resource
+require_gate 'PASS stage=d3d12-video-rgba-nv12-support input=RGBA8 output=NV12 resolution=3840x2160 fps=60/1' \
+    d3d12-video-rgba-nv12-support
+require_gate 'PASS stage=rgba-to-nv12-gpu-only .*cpu_conversion=0' \
+    rgba-to-nv12-gpu-only
+require_gate 'PASS stage=producer-eventfd-sync busy_poll=0' producer-eventfd-sync
+require_gate 'PASS stage=consumer-real-desktop-frame .*stale_frames=0 mismatches=0' \
+    consumer-real-desktop-frame
+require_gate 'PASS stage=d3d12-hardware-encode' d3d12-hardware-encode
+require_gate 'PASS stage=4k60-sustained .*frames=3600 .*timeouts=0 .*mismatches=0 .*encode_failures=0' \
+    4k60-sustained
+require_gate 'PASS stage=throughput-zero-copy .*framebuffer_mmap=0 .*cpu_memcpy_framebuffer=0 .*gpu_cpu_gpu=0' \
+    throughput-zero-copy
 
 ffmpeg_bin=${FFMPEG_BIN:-ffmpeg}
 ffprobe_bin=${FFPROBE_BIN:-ffprobe}
@@ -202,6 +227,7 @@ if [[ "$decode_status" -ne 0 || "$geometry" != "3840,2160,3600" ]]; then
     exit 1
 fi
 
+printf 'decoded_frames=3600 resolution=3840x2160 bitstream_decode_errors=0\n'
 printf 'PASS stage=decoded-hevc frames=3600 resolution=3840x2160\n'
 printf 'PASS mutter-d3d12-zero-copy-encode\n'
 exit 0

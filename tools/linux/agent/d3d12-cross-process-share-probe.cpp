@@ -370,19 +370,33 @@ static D3D12_RESOURCE_DESC buffer_desc(UINT64 size)
 
 static void frame_color(std::uint64_t frame, float color[4])
 {
-    const std::uint32_t value = static_cast<std::uint32_t>(frame);
-    color[0] = static_cast<float>(value & 0xffU) / 255.0f;
-    color[1] = static_cast<float>((value >> 8) & 0xffU) / 255.0f;
-    color[2] = static_cast<float>((value >> 16) & 0xffU) / 255.0f;
+    color[0] = static_cast<float>(31U + ((frame * 3U) % 96U)) / 255.0f;
+    color[1] = static_cast<float>(127U + ((frame * 5U) % 64U)) / 255.0f;
+    color[2] = static_cast<float>(223U - ((frame * 7U) % 64U)) / 255.0f;
     color[3] = 1.0f;
 }
 
-static std::array<std::uint8_t, 4> expected_bgra(std::uint64_t frame)
+static std::array<std::uint8_t, 4> expected_rgba(std::uint64_t frame)
 {
-    const std::uint32_t value = static_cast<std::uint32_t>(frame);
-    return {static_cast<std::uint8_t>((value >> 16) & 0xffU),
-            static_cast<std::uint8_t>((value >> 8) & 0xffU),
-            static_cast<std::uint8_t>(value & 0xffU), 255};
+    return {static_cast<std::uint8_t>(31U + ((frame * 3U) % 96U)),
+            static_cast<std::uint8_t>(127U + ((frame * 5U) % 64U)),
+            static_cast<std::uint8_t>(223U - ((frame * 7U) % 64U)), 255};
+}
+
+static bool expected_pixel_for_format(
+    std::uint32_t format, const std::array<std::uint8_t, 4> &semantic,
+    std::array<std::uint8_t, 4> *pixel)
+{
+    switch (format) {
+    case kDxgiFormatR8G8B8A8Unorm:
+        *pixel = semantic;
+        return true;
+    case kDxgiFormatB8G8R8A8Unorm:
+        *pixel = {semantic[2], semantic[1], semantic[0], semantic[3]};
+        return true;
+    default:
+        return false;
+    }
 }
 
 static bool close_enough(const std::uint8_t *actual,
@@ -635,11 +649,11 @@ static bool producer_main(int control_fd)
             ready_stage_logged = true;
         }
 
-        const auto expected = expected_bgra(frame);
+        const auto expected = expected_rgba(frame);
         const FrameInfoMessage frame_info = {
             kProtocolMagic, kFrameInfo, frame, slot_index,
             ((frame + 1) % kDiagnosticInterval) == 0 ? 1U : 0U, signal_ns,
-            {expected[0], expected[1], expected[2], expected[3]}, 1};
+            expected[0], expected[1], expected[2], expected[3], 1};
         if (!send_packet(control_fd, &frame_info, sizeof(frame_info), {}))
             return false;
     }
@@ -686,7 +700,7 @@ static bool producer_main(int control_fd)
         return false;
     }
     std::puts("PASS stage=4k60-sustained");
-    std::puts("PASS stage=throughput-zero-copy mmap_framebuffer=0 "
+    std::puts("PASS stage=throughput-zero-copy framebuffer_mmap=0 "
                "cpu_memcpy_framebuffer=0 gpu_cpu_gpu=0");
 
     for (std::uint32_t slot = 0; slot < kSlotCount; ++slot) {
@@ -713,6 +727,15 @@ static bool consumer_main(int control_fd)
         bundle.frames != kFrameCount || received_fds.size() != kMaxTransferFds) {
         close_fd_vector(&received_fds);
         std::fputs("FAIL stage=cross-process-resource-fd-transfer\n", stderr);
+        return false;
+    }
+    if (bundle.format != kDxgiFormatR8G8B8A8Unorm &&
+        bundle.format != kDxgiFormatB8G8R8A8Unorm) {
+        std::fprintf(stderr,
+                     "BLOCKED stage=resource-format format=%u "
+                     "reason=unsupported-dxgi-format\n",
+                     bundle.format);
+        close_fd_vector(&received_fds);
         return false;
     }
 
@@ -954,7 +977,16 @@ static bool consumer_main(int control_fd)
             }
             const auto *bytes = static_cast<const std::uint8_t *>(mapped) +
                                 footprint.Offset;
-            const auto expected = expected_bgra(expected_frame);
+            const auto semantic = expected_rgba(expected_frame);
+            std::array<std::uint8_t, 4> expected = {};
+            if (!expected_pixel_for_format(bundle.format, semantic, &expected)) {
+                std::fprintf(stderr,
+                             "BLOCKED stage=diagnostic-format format=%u\n",
+                             bundle.format);
+                readback->Unmap(0, nullptr);
+                close(profile_eventfd);
+                return false;
+            }
             const std::array<std::pair<UINT, UINT>, 3> points = {
                 std::make_pair(0U, 0U),
                 std::make_pair(kWidth / 2, kHeight / 2),

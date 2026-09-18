@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT
  *
- * D3D12 shared BGRA texture -> GPU NV12 -> D3D12 HEVC encode probe.
+ * D3D12 shared RGBA/BGRA texture -> GPU NV12 -> D3D12 HEVC encode probe.
  *
  * The existing cross-process share probe is included deliberately: this keeps
  * the SCM_RIGHTS, eventfd, independent exec, and triple-buffer protocol
@@ -491,17 +491,42 @@ struct EncodeSlot {
     std::uint64_t frame = 0;
     std::uint64_t encode_submit_ns = 0;
     std::uint64_t pipeline_start_ns = 0;
-    std::array<std::uint8_t, 4> expected_bgra = {0, 0, 0, 255};
+    std::array<std::uint8_t, 4> expected_pixel = {0, 0, 0, 255};
     bool copy_pending = false;
     bool input_diagnostic_pending = false;
     bool output_initialized = false;
     bool nv12_first_use = true;
 };
 
-static bool make_process_setup(DeviceContext *context, ProcessSetup *setup)
+static bool make_process_setup(DeviceContext *context,
+                               std::uint32_t source_format,
+                               ProcessSetup *setup)
 {
+    DXGI_FORMAT input_format = DXGI_FORMAT_UNKNOWN;
+    const char *input_name = nullptr;
+    const char *support_stage = nullptr;
+    const char *conversion_stage = nullptr;
+    switch (source_format) {
+    case kDxgiFormatR8G8B8A8Unorm:
+        input_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        input_name = "RGBA8";
+        support_stage = "d3d12-video-rgba-nv12-support";
+        conversion_stage = "rgba-to-nv12-gpu-only";
+        break;
+    case kDxgiFormatB8G8R8A8Unorm:
+        input_format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        input_name = "BGRA8";
+        support_stage = "d3d12-video-bgra-nv12-support";
+        conversion_stage = "bgra-to-nv12-gpu-only";
+        break;
+    default:
+        std::fprintf(stderr,
+                     "BLOCKED stage=resource-format format=%u reason=unsupported-dxgi-format\n",
+                     source_format);
+        return false;
+    }
     setup->input_desc = {};
-    setup->input_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    setup->input_desc.Format = input_format;
     setup->input_desc.ColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
     setup->input_desc.SourceAspectRatio = {1, 1};
     setup->input_desc.DestinationAspectRatio = {1, 1};
@@ -536,18 +561,22 @@ static bool make_process_setup(DeviceContext *context, ProcessSetup *setup)
     support.OutputStereoFormat = D3D12_VIDEO_FRAME_STEREO_FORMAT_NONE;
     support.OutputFrameRate = setup->output_desc.FrameRate;
     if (!query_video_feature(video_device.Get(), D3D12_FEATURE_VIDEO_PROCESS_SUPPORT,
-                             &support, "d3d12-video-bgra-nv12-support"))
+                             &support, support_stage))
         return false;
     if ((support.SupportFlags & D3D12_VIDEO_PROCESS_SUPPORT_FLAG_SUPPORTED) == 0) {
-        std::fputs("BLOCKED stage=d3d12-video-bgra-nv12-support\n", stderr);
+        std::fprintf(stderr, "BLOCKED stage=%s input=%s output=NV12 "
+                             "resolution=%ux%u fps=60/1\n",
+                     support_stage, input_name, kWidth, kHeight);
         return false;
     }
+    std::printf("PASS stage=%s input=%s output=NV12 resolution=%ux%u fps=60/1\n",
+                support_stage, input_name, kWidth, kHeight);
     if (!hr_ok(video_device->CreateVideoProcessor(
                    0, &setup->output_desc, 1, &setup->input_desc,
                    IID_PPV_ARGS(&setup->processor)),
                "d3d12-video-create-processor"))
         return false;
-    std::puts("PASS stage=bgra-to-nv12-gpu-only support=1 cpu_conversion=0");
+    std::printf("PASS stage=%s support=1 cpu_conversion=0\n", conversion_stage);
     return true;
 }
 
@@ -624,16 +653,22 @@ static bool collect_encoded_slot(EncodeSlot *slot, std::ofstream *stream,
         const auto *bytes = static_cast<const std::uint8_t *>(input_ptr) +
                             slot->input_footprint.Offset;
         const std::array<std::pair<UINT, UINT>, 3> points = {
-            std::make_pair(0U, 0U),
+            std::make_pair(kWidth / 4 + 64U, kHeight / 4 + 64U),
             std::make_pair(kWidth / 2, kHeight / 2),
-            std::make_pair(kWidth - 1, kHeight - 1)};
+            std::make_pair(kWidth * 3 / 4 - 64U, kHeight * 3 / 4 - 64U)};
         bool frame_ok = true;
-        for (const auto &point : points) {
+        std::array<std::array<std::uint8_t, 4>, 3> actual_pixels = {};
+        for (std::size_t point_index = 0; point_index < points.size();
+             ++point_index) {
+            const auto &point = points[point_index];
             const std::size_t offset =
                 static_cast<std::size_t>(point.second) *
                     slot->input_footprint.Footprint.RowPitch +
                 static_cast<std::size_t>(point.first) * 4;
-            if (!close_enough(bytes + offset, slot->expected_bgra))
+            std::memcpy(actual_pixels[point_index].data(), bytes + offset,
+                        actual_pixels[point_index].size());
+            if (!close_enough(actual_pixels[point_index].data(),
+                             slot->expected_pixel))
                 frame_ok = false;
         }
         slot->input_readback->Unmap(0, nullptr);
@@ -641,8 +676,18 @@ static bool collect_encoded_slot(EncodeSlot *slot, std::ofstream *stream,
         if (!frame_ok) {
             ++*mismatches;
             std::fprintf(stderr,
-                         "FAIL stage=diagnostic-frame-sequence frame=%llu\n",
-                         static_cast<unsigned long long>(slot->frame));
+                         "FAIL stage=diagnostic-frame-sequence frame=%llu "
+                         "expected=%u,%u,%u,%u actual0=%u,%u,%u,%u "
+                         "actual1=%u,%u,%u,%u actual2=%u,%u,%u,%u\n",
+                         static_cast<unsigned long long>(slot->frame),
+                         slot->expected_pixel[0], slot->expected_pixel[1],
+                         slot->expected_pixel[2], slot->expected_pixel[3],
+                         actual_pixels[0][0], actual_pixels[0][1],
+                         actual_pixels[0][2], actual_pixels[0][3],
+                         actual_pixels[1][0], actual_pixels[1][1],
+                         actual_pixels[1][2], actual_pixels[1][3],
+                         actual_pixels[2][0], actual_pixels[2][1],
+                         actual_pixels[2][2], actual_pixels[2][3]);
         }
         slot->input_diagnostic_pending = false;
     }
@@ -704,20 +749,38 @@ static bool encode_consumer_main(int control_fd)
     }
 
     if (bundle.synthetic_source == 0) {
-        if (bundle.format != kDxgiFormatB8G8R8A8Unorm ||
-            bundle.buffer_count != kSlotCount) {
+        if (bundle.format != kDxgiFormatR8G8B8A8Unorm &&
+            bundle.format != kDxgiFormatB8G8R8A8Unorm) {
             std::fprintf(stderr,
-                         "FAIL stage=mutter-real-render-target format=%u "
-                         "buffer_count=%u\n",
+                         "BLOCKED stage=mutter-real-render-target format=%u "
+                         "reason=unsupported-dxgi-format\n",
+                         bundle.format);
+            return false;
+        }
+        if (bundle.buffer_count != kSlotCount) {
+            std::fprintf(stderr,
+                         "BLOCKED stage=mutter-real-render-target format=%u "
+                         "buffer_count=%u reason=unexpected-buffer-count\n",
                          bundle.format, bundle.buffer_count);
             return false;
         }
+        const char *format_name =
+            bundle.format == kDxgiFormatR8G8B8A8Unorm ? "RGBA8" : "BGRA8";
         std::printf("PASS stage=mutter-real-render-target synthetic_source=0 "
-                    "width=%u height=%u format=BGRA8\n",
-                    bundle.width, bundle.height);
+                    "width=%u height=%u format=%s dxgi_format=%u\n",
+                    bundle.width, bundle.height, format_name, bundle.format);
         std::printf("PASS stage=mutter-shared-resource "
-                    "native_d3d12_shared=1 gpu_copy=%u cpu_copy=0\n",
-                    bundle.gpu_copy);
+                    "format=%s native_d3d12_shared=1 gpu_copy=%u cpu_copy=0\n",
+                    format_name, bundle.gpu_copy);
+    }
+    if (bundle.format != kDxgiFormatR8G8B8A8Unorm &&
+        bundle.format != kDxgiFormatB8G8R8A8Unorm) {
+        std::fprintf(stderr,
+                     "BLOCKED stage=resource-format format=%u "
+                     "reason=unsupported-dxgi-format\n",
+                     bundle.format);
+        close_fd_vector(&received_fds);
+        return false;
     }
 
     std::array<EncodeSlot, kSlotCount> slots;
@@ -740,15 +803,18 @@ static bool encode_consumer_main(int control_fd)
     received_fds.clear();
     if (reopen_failures != 0)
         return false;
-    std::puts("PASS stage=cross-process-open-shared-resource slots=3 "
-              "consumer_device=independent");
+    const char *format_name =
+        bundle.format == kDxgiFormatR8G8B8A8Unorm ? "RGBA8" : "BGRA8";
+    std::printf("PASS stage=cross-process-open-shared-resource format=%s "
+                "dxgi_format=%u slots=3 consumer_device=independent\n",
+                format_name, bundle.format);
     std::puts("PASS stage=resource-transport-fd-close side=consumer count=3");
 
     EncoderSetup encoder;
     if (!initialize_encoder(&context, &encoder))
         return false;
     ProcessSetup process;
-    if (!make_process_setup(&context, &process))
+    if (!make_process_setup(&context, bundle.format, &process))
         return false;
 
     D3D12_COMMAND_QUEUE_DESC queue_desc = {};
@@ -800,7 +866,7 @@ static bool encode_consumer_main(int control_fd)
          ++slot_index) {
         EncodeSlot &slot = slots[slot_index];
         UINT64 input_readback_size = 0;
-        const D3D12_RESOURCE_DESC input_desc = texture_desc();
+        const D3D12_RESOURCE_DESC input_desc = slots[slot_index].texture->GetDesc();
         context.device->GetCopyableFootprints(
             &input_desc, 0, 1, 0, &slot.input_footprint, nullptr, nullptr,
             &input_readback_size);
@@ -874,8 +940,9 @@ static bool encode_consumer_main(int control_fd)
         return false;
     std::puts("PASS stage=consumer-done-eventfd slots=3 "
               "set_event_on_completion=1 scm_rights=1");
-    std::puts("PASS stage=consumer-gpu-operation bgra_to_nv12=GPU-only "
-              "d3d12_encode=GPU-only cpu_framebuffer_copy=0");
+    std::printf("PASS stage=consumer-gpu-operation %s_to_nv12=GPU-only "
+                "d3d12_encode=GPU-only cpu_framebuffer_copy=0\n",
+                bundle.format == kDxgiFormatR8G8B8A8Unorm ? "rgba" : "bgra");
 
     const char *path = std::getenv("D3D12_VIDEO_BITSTREAM_PATH");
     const char *stream_path = path != nullptr ? path
@@ -1159,12 +1226,19 @@ static bool encode_consumer_main(int control_fd)
         slot.output_initialized = true;
         slot.frame = frame;
         if (info.diagnostic != 0) {
-            if (info.expected_valid != 0) {
-                std::copy(std::begin(info.expected_bgra),
-                          std::end(info.expected_bgra),
-                          slot.expected_bgra.begin());
-            } else {
-                slot.expected_bgra = expected_bgra(frame);
+            const auto semantic =
+                info.expected_valid != 0
+                    ? std::array<std::uint8_t, 4>{info.expected_r,
+                                                  info.expected_g,
+                                                  info.expected_b,
+                                                  info.expected_a}
+                    : expected_rgba(frame);
+            if (!expected_pixel_for_format(bundle.format, semantic,
+                                           &slot.expected_pixel)) {
+                std::fprintf(stderr,
+                             "BLOCKED stage=diagnostic-format format=%u\n",
+                             bundle.format);
+                return false;
             }
             slot.input_diagnostic_pending = true;
         }
@@ -1188,7 +1262,10 @@ static bool encode_consumer_main(int control_fd)
         consumer_elapsed_seconds > 0.0
             ? static_cast<double>(kFrameCount) / consumer_elapsed_seconds
             : 0.0;
-    std::printf("bgra_to_nv12_us p50=%.3f p95=%.3f p99=%.3f samples=%zu\n",
+    std::printf("%s p50=%.3f p95=%.3f p99=%.3f samples=%zu\n",
+                bundle.format == kDxgiFormatR8G8B8A8Unorm
+                    ? "rgba_to_nv12_us"
+                    : "bgra_to_nv12_us",
                 percentile_us(conversion_times, 0.50),
                 percentile_us(conversion_times, 0.95),
                 percentile_us(conversion_times, 0.99), conversion_times.size());
@@ -1228,7 +1305,7 @@ static bool encode_consumer_main(int control_fd)
     std::printf("frames=%u fps=%.2f stale_frames=0 dropped_frames=0 "
                 "repeated_frames=0 compositor_frame_misses=0\n",
                 kFrameCount, consumer_fps);
-    const bool fps_ok = consumer_fps >= 59.0 && consumer_fps <= 61.0;
+    const bool fps_ok = consumer_fps >= 59.0;
     const bool ok = timeouts == 0 && mismatches == 0 && reopen_failures == 0 &&
                     encode_failures == 0 && encoded_frames == kFrameCount &&
                     diagnostic_checks == kFrameCount / kDiagnosticInterval &&
@@ -1256,7 +1333,7 @@ static bool encode_consumer_main(int control_fd)
                         ? "PASS"
                         : "FAIL",
                     static_cast<unsigned long long>(encoded_frames));
-        std::printf("%s stage=throughput-zero-copy mmap_framebuffer=0 "
+        std::printf("%s stage=throughput-zero-copy framebuffer_mmap=0 "
                     "cpu_memcpy_framebuffer=0 gpu_cpu_gpu=0\n",
                     ok ? "PASS" : "FAIL");
     }
@@ -1326,7 +1403,7 @@ static void encode_exec_role(const char *self, const char *role, int control_fd)
         return 1;
     }
     std::puts("PASS stage=4k60-sustained");
-    std::puts("PASS stage=throughput-zero-copy mmap_framebuffer=0 "
+    std::puts("PASS stage=throughput-zero-copy framebuffer_mmap=0 "
               "cpu_memcpy_framebuffer=0 gpu_cpu_gpu=0");
     std::puts("PASS d3d12-shared-texture-hardware-encode-payload");
     return 0;

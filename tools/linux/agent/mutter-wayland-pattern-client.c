@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 /*
  * Isolated Mutter probe client.  It paints an opaque 3840x2160 Wayland
- * surface with a frame-dependent BGRA pattern and a moving square.  The
+ * surface with a frame-dependent RGBA semantic pattern and a moving square.  The
  * surface is client content; the compositor output is captured by the
  * opt-in Mesa D3D12 hook, never by this client.
  */
@@ -36,12 +36,16 @@ struct app {
     struct wl_registry *registry;
     struct wl_compositor *compositor;
     struct wl_shm *shm;
+    struct wl_output *output;
     struct xdg_wm_base *wm_base;
     struct wl_surface *surface;
     struct xdg_surface *xdg_surface;
     struct xdg_toplevel *toplevel;
     struct wl_buffer *buffers[BUFFER_COUNT];
     bool busy[BUFFER_COUNT];
+    bool buffer_initialized[BUFFER_COUNT];
+    unsigned previous_square_x[BUFFER_COUNT];
+    unsigned previous_square_y[BUFFER_COUNT];
     struct wl_callback *frame_callback;
     void *pixels;
     int shm_fd;
@@ -131,11 +135,18 @@ static void toplevel_configure(void *data, struct xdg_toplevel *toplevel,
                                int32_t width, int32_t height,
                                struct wl_array *states)
 {
-    (void)data;
     (void)toplevel;
-    (void)width;
-    (void)height;
-    (void)states;
+    struct app *app = data;
+    bool fullscreen = false;
+    uint32_t *state;
+    wl_array_for_each(state, states) {
+        if (*state == XDG_TOPLEVEL_STATE_FULLSCREEN)
+            fullscreen = true;
+    }
+    fprintf(stdout, "CLIENT_CONFIGURE width=%d height=%d fullscreen=%d\\n",
+            width, height, fullscreen ? 1 : 0);
+    fflush(stdout);
+    (void)app;
 }
 
 static void toplevel_close(void *data, struct xdg_toplevel *toplevel)
@@ -149,6 +160,8 @@ static const struct xdg_toplevel_listener toplevel_listener = {
     .configure = toplevel_configure,
     .close = toplevel_close,
 };
+
+static const struct wl_output_listener output_listener;
 
 static void registry_global(void *data, struct wl_registry *registry,
                             uint32_t name, const char *interface,
@@ -166,6 +179,11 @@ static void registry_global(void *data, struct wl_registry *registry,
         app->wm_base = wl_registry_bind(registry, name, &xdg_wm_base_interface,
                                         1);
         xdg_wm_base_add_listener(app->wm_base, &wm_base_listener, app);
+    } else if (strcmp(interface, wl_output_interface.name) == 0 &&
+               !app->output) {
+        app->output = wl_registry_bind(registry, name, &wl_output_interface,
+                                       version < 2 ? version : 2);
+        wl_output_add_listener(app->output, &output_listener, app);
     }
 }
 
@@ -180,6 +198,51 @@ static void registry_global_remove(void *data, struct wl_registry *registry,
 static const struct wl_registry_listener registry_listener = {
     .global = registry_global,
     .global_remove = registry_global_remove,
+};
+
+static void output_geometry(void *data, struct wl_output *output,
+                            int32_t x, int32_t y, int32_t physical_width,
+                            int32_t physical_height, int32_t subpixel,
+                            const char *make, const char *model, int32_t transform)
+{
+    (void)data;
+    (void)output;
+    (void)subpixel;
+    (void)transform;
+    fprintf(stdout, "CLIENT_OUTPUT geometry=%d,%d physical=%dx%d make=%s model=%s\\n",
+            x, y, physical_width, physical_height, make, model);
+    fflush(stdout);
+}
+
+static void output_mode(void *data, struct wl_output *output, uint32_t flags,
+                        int32_t width, int32_t height, int32_t refresh)
+{
+    (void)data;
+    (void)output;
+    fprintf(stdout, "CLIENT_OUTPUT mode flags=0x%x size=%dx%d refresh=%d\\n",
+            flags, width, height, refresh);
+    fflush(stdout);
+}
+
+static void output_done(void *data, struct wl_output *output)
+{
+    (void)data;
+    (void)output;
+}
+
+static void output_scale(void *data, struct wl_output *output, int32_t factor)
+{
+    (void)data;
+    (void)output;
+    fprintf(stdout, "CLIENT_OUTPUT scale=%d\\n", factor);
+    fflush(stdout);
+}
+
+static const struct wl_output_listener output_listener = {
+    .geometry = output_geometry,
+    .mode = output_mode,
+    .done = output_done,
+    .scale = output_scale,
 };
 
 static void create_buffers(struct app *app)
@@ -231,28 +294,41 @@ static void paint(struct app *app)
 
     uint32_t *pixels = (uint32_t *)((uint8_t *)app->pixels +
                                     index * BUFFER_BYTES);
-    const uint8_t red = (uint8_t)(app->frame & 0xffU);
-    const uint8_t green = (uint8_t)((app->frame >> 8) & 0xffU);
-    const uint8_t blue = (uint8_t)((app->frame >> 16) & 0xffU);
-    const unsigned square_x = (unsigned)((app->frame * 17U) % (WIDTH - 256));
-    const unsigned square_y = (unsigned)((app->frame * 11U) % (HEIGHT - 256));
-    for (unsigned y = 0; y < HEIGHT; ++y) {
-        for (unsigned x = 0; x < WIDTH; ++x) {
-            uint8_t r = red;
-            uint8_t g = green;
-            uint8_t b = blue;
-            if (x >= square_x && x < square_x + 256 &&
-                y >= square_y && y < square_y + 256) {
-                r ^= 0xffU;
-                g ^= 0x55U;
-                b ^= 0xa3U;
-            }
-            /* ARGB8888 is BGRA in memory on the little-endian guest. */
-            pixels[(size_t)y * WIDTH + x] = 0xff000000U |
-                                            ((uint32_t)r << 16) |
-                                            ((uint32_t)g << 8) | b;
-        }
+    /* Headless Mutter presents this 3840x2160 monitor at a 30 Hz frame
+     * clock while the D3D12 flush hook can publish four observations per
+     * client callback.  Keep the semantic pattern in the producer's frame
+     * domain so the consumer's 120-frame diagnostics remain deterministic. */
+    const uint64_t pattern_frame = app->frame * 4U + 3U;
+    const uint8_t red = 31U;
+    const uint8_t green = 127U;
+    const uint8_t blue = 223U;
+    const unsigned square_x = (unsigned)((pattern_frame * 17U) % 256U);
+    const unsigned square_y = (unsigned)((pattern_frame * 11U) % 256U);
+    const uint32_t base_pixel = 0xff000000U |
+                                ((uint32_t)red << 16) |
+                                ((uint32_t)green << 8) | blue;
+    const uint32_t square_pixel = 0xff000000U |
+                                  ((uint32_t)(red ^ 0xffU) << 16) |
+                                  ((uint32_t)(green ^ 0x55U) << 8) |
+                                  (blue ^ 0xa3U);
+    if (!app->buffer_initialized[index]) {
+        for (unsigned y = 0; y < HEIGHT; ++y)
+            for (unsigned x = 0; x < WIDTH; ++x)
+                pixels[(size_t)y * WIDTH + x] = base_pixel;
+        app->buffer_initialized[index] = true;
+    } else {
+        for (unsigned y = app->previous_square_y[index];
+             y < app->previous_square_y[index] + 256U; ++y)
+            for (unsigned x = app->previous_square_x[index];
+                 x < app->previous_square_x[index] + 256U; ++x)
+                pixels[(size_t)y * WIDTH + x] = base_pixel;
     }
+    for (unsigned y = square_y; y < square_y + 256U; ++y) {
+        for (unsigned x = square_x; x < square_x + 256U; ++x)
+            pixels[(size_t)y * WIDTH + x] = square_pixel;
+    }
+    app->previous_square_x[index] = square_x;
+    app->previous_square_y[index] = square_y;
     app->busy[index] = true;
     wl_surface_attach(app->surface, app->buffers[index], 0, 0);
     wl_surface_damage_buffer(app->surface, 0, 0, WIDTH, HEIGHT);
@@ -295,7 +371,15 @@ int main(void)
     xdg_surface_add_listener(app.xdg_surface, &xdg_surface_listener, &app);
     xdg_toplevel_add_listener(app.toplevel, &toplevel_listener, &app);
     xdg_toplevel_set_title(app.toplevel, "AppSandbox Mutter D3D12 probe");
-    xdg_toplevel_set_fullscreen(app.toplevel, NULL);
+    xdg_toplevel_set_app_id(app.toplevel, "asb-mutter-d3d12-pattern");
+    wl_surface_set_buffer_scale(app.surface, 1);
+    struct wl_region *opaque = wl_compositor_create_region(app.compositor);
+    if (!opaque)
+        fail("opaque-region-create");
+    wl_region_add(opaque, 0, 0, WIDTH, HEIGHT);
+    wl_surface_set_opaque_region(app.surface, opaque);
+    wl_region_destroy(opaque);
+    xdg_toplevel_set_fullscreen(app.toplevel, app.output);
     wl_surface_commit(app.surface);
     fprintf(stdout, "CLIENT_READY width=%d height=%d opaque=1 dynamic=1\n",
             WIDTH, HEIGHT);
