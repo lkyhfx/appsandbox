@@ -139,3 +139,97 @@ consumer 同时满足有效句柄、类型、像素 round-trip 和同步复用�
 
 本轮将阻塞从“可能不兼容”收敛到可重复的 GPU 纹理导出失败，
 并验证无头合成器可独立启动；尚不足以修改生产桌面的软件合成兜底。
+
+## 第四轮实测：D3D12 native consumer
+
+已选择原生 D3D12 shared-handle 消费端，并加入
+`d3d12-native-share-probe.cpp` 与 `gpu-d3d12-native-share-probe.sh`。探针的
+验收边界是：
+
+1. 在同一 DXCore adapter 上创建两个独立 `ID3D12Device`；
+2. 生产端创建带 `D3D12_HEAP_FLAG_SHARED` 的 BGRA8 纹理和带
+   `D3D12_FENCE_FLAG_SHARED` 的 fence；
+3. 消费端仅用 `OpenSharedHandle` 打开两个 dxg/NT shared-object FD；不调用
+   DRM PRIME、DMA-BUF 或 CUDA opaque-FD 导入；
+4. 消费端先排队等待共享 fence，生产端再 clear 纹理并 signal，以排除仅靠
+   CPU/提交顺序造成的假通过；
+5. 消费端复制到 readback heap，校验 BGRA 像素值，并用第二组颜色和递增
+   fence value 复用同一资源、命令对象与 fence，排除单帧假通过。
+
+构建入口是可选的 `make d3d12-native-share-probe`，未加入生产 daemon 的
+`all` 目标。运行：
+
+```sh
+make d3d12-native-share-probe
+bash gpu-d3d12-native-share-probe.sh results-d3d12-native-share
+```
+
+Guest 已安装 GCC 15.2、Make 4.4.1、DirectX-Headers 1.619.1；探针以
+`-Wall -Wextra -Werror` 编译通过。RTX 4070 上的原生纹理路径实测结果：
+
+```text
+PASS stage=two-devices adapter_luid=00000000:10a35fcb
+PASS stage=resource-shared-handle fd=53
+PASS stage=fence-shared-handle fd=54
+diagnostic_same_device_open_fence=0x80070057
+FAIL stage=open-shared-fence HRESULT=0x80070057
+```
+
+即共享纹理句柄能由第二个 `ID3D12Device` 打开；共享 fence 虽能导出有效
+dxg FD，但 `OpenSharedHandle` 返回 `E_INVALIDARG`。同一生产 device 重开该
+fence 也失败，排除了“仅跨 device 不支持”。改用
+`D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER` 时，`CreateFence` 本身即返回
+`E_INVALIDARG`。
+
+为继续隔离资源路径，`--cpu-sync-fallback` 在生产 fence 完成后由 CPU 排序，
+不把它计作 native fence 成功。该模式得到：
+
+```text
+pixel_bgra=191,127,64,255 expected=191,128,64,255
+PASS stage=native-shared-pixel-roundtrip
+reuse_pixel_bgra=102,51,204,255 expected=102,51,204,255
+PASS stage=native-shared-reuse
+```
+
+首帧绿色通道相差 1，位于 UNORM 舍入容差内。结论是 **D3D12 native shared
+resource 的打开、跨 device 像素 round-trip 和复用均已通过；native shared
+fence 打开仍被当前 libd3d12/dxg 组合阻塞**。诊断 fallback 固定返回 3，避免
+被误报为完整验收成功。
+
+## 第五轮实测：eventfd 完成通知
+
+探针的 CPU fallback 已不再轮询 `GetCompletedValue`。现在每次等待都创建带
+`EFD_CLOEXEC | EFD_NONBLOCK` 的 Linux `eventfd`，按 DirectX-Headers 的 WSL
+约定将 fd 转换为 `HANDLE` 传给 `ID3D12Fence::SetEventOnCompletion`，再通过
+10 秒有界 `poll` 和 `eventfd_read` 等待通知。收到通知后仍会检查
+`GetCompletedValue() >= expected`，防止过早唤醒被误报为成功。生产 fence 与
+consumer readback 完成 fence 都覆盖首帧和复用帧。
+
+运行入口为：
+
+```sh
+make d3d12-native-share-probe
+bash gpu-d3d12-native-share-probe.sh results-d3d12-eventfd --cpu-sync-fallback
+```
+
+本机 Ubuntu 24.04 WSL / RTX 4070 冒烟测试使用 DirectX-Headers 1.614.1 和
+系统 WSL `libd3d12.so` / `libdxcore.so`；源码以 `-Wall -Wextra -Werror`
+编译通过。关键结果为：
+
+```text
+BLOCKED stage=open-shared-fence HRESULT=0x80070057; continuing with diagnostic CPU wait
+PASS stage=producer-eventfd-notification eventfd_notifications=1 completed=1
+PASS stage=consumer-eventfd-notification eventfd_notifications=1 completed=1
+PASS stage=native-shared-pixel-roundtrip
+PASS stage=producer-eventfd-notification-reuse eventfd_notifications=1 completed=2
+PASS stage=consumer-eventfd-notification-reuse eventfd_notifications=1 completed=2
+PASS stage=native-shared-reuse
+BLOCKED d3d12-native-share shared-fence-open
+```
+
+因此 `SetEventOnCompletion(eventfd)` 已对生产、消费两侧的首帧和复用帧各完成
+一次真实通知，计数均为 1，完成值分别到达 1 和 2；没有退回轮询。该路径成功
+时仍固定返回 3；只有跨 device shared fence 打开、排队等待、像素 round-trip
+和复用全部通过才返回 0。此冒烟环境不是上述 `yunsen@192.168.42.2` 隔离
+Guest，后者仍应复跑同一命令以确认其 DirectX-Headers 1.619.1 / libd3d12
+组合；生产桌面、`appsandbox-display` 和 Mesa 运行时仍未更改。

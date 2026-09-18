@@ -81,6 +81,14 @@ disable:
 	-systemctl disable --now appsandbox-agent.service
 
 clean:
-	rm -f $(BINS)
+	rm -f $(BINS) d3d12-native-share-probe
+
+# Diagnostic only: requires Microsoft's WSL libd3d12/libdxcore runtime and
+# the official DirectX-Headers development package.  Keep it out of `all` so
+# normal agent builds do not gain a proprietary runtime dependency.
+d3d12-native-share-probe: d3d12-native-share-probe.cpp
+	$(CXX) -std=c++17 $(CXXFLAGS) -D_WIN32_WINNT=0x0A00 -O2 -Wall -Wextra \
+	       -Werror -Wno-unknown-pragmas -o $@ $< \
+	       $$(pkg-config --cflags --libs DirectX-Headers) -ld3d12 -ldxcore
 
 .PHONY: all install install-pointer enable disable clean
