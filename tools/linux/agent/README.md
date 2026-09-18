@@ -101,6 +101,30 @@ guest's `appsandbox-gpu` wrapper. The expected successful run ends with
 `PASS d3d12-cross-process-zero-copy`; the measured log is recorded in
 `gpu-d3d12-cross-process-share-probe-results.md`.
 
+## D3D12 shared texture to hardware encode probe
+
+`d3d12-video-encode-probe` has two gates. `--capability` queries
+`ID3D12VideoDevice3` for H.264/HEVC, NV12, 3840x2160, and a 60/1 encoder
+configuration, then constructs the native video encoder and heap. The default
+invocation reuses the validated independent-process `SCM_RIGHTS`/eventfd ring,
+performs GPU-only BGRA-to-NV12 conversion, submits D3D12 HEVC encode work, and
+runs 3600 frames through a three-slot ring.
+
+```sh
+make d3d12-video-encode-probe
+bash gpu-d3d12-video-encode-probe.sh results-d3d12-video-encode
+```
+
+The measured result belongs in
+`gpu-d3d12-video-encode-probe-results.md`. The Guest run passes capability,
+cross-process sharing, GPU-only conversion, hardware encode, 4K60 throughput,
+and the final `3840x2160`, 3600-frame FFmpeg decode check. The probe supplies
+the host-owned VPS/SPS/PPS headers required by D3D12's video-encode contract.
+The target Guest does not currently ship FFmpeg, so the runner reports the
+decode environment as blocked there; the final stream was decoded on the
+development host. Mutter integration can now proceed as a separate isolated
+gate, while `appsandbox-display`'s `mmap + send_all()` path remains unchanged.
+
 ## Uninstall
 
 ```sh

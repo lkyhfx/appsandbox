@@ -82,7 +82,8 @@ disable:
 	-systemctl disable --now appsandbox-agent.service
 
 clean:
-	rm -f $(BINS) d3d12-native-share-probe d3d12-cross-process-share-probe
+	rm -f $(BINS) d3d12-native-share-probe d3d12-cross-process-share-probe \
+		d3d12-video-encode-probe
 
 # Diagnostic only: requires Microsoft's WSL libd3d12/libdxcore runtime and
 # the official DirectX-Headers development package.  Keep it out of `all` so
@@ -102,5 +103,14 @@ d3d12-cross-process-share-probe: d3d12-cross-process-share-probe.cpp
 	       $(LDFLAGS) -L$(D3D12_LIBDIR) \
 	       $$(pkg-config --cflags --libs DirectX-Headers) -ld3d12 -ldxcore
 
+# D3D12 Video Encode gate. --capability performs the capability/object gate;
+# the default invocation runs the cross-process 4K60 shared-texture workload.
+d3d12-video-encode-probe: d3d12-video-encode-probe.cpp
+	$(CXX) -std=c++17 $(CXXFLAGS) -D_GNU_SOURCE -D_WIN32_WINNT=0x0A00 \
+	       -O2 -Wall -Wextra -Werror -Wno-unknown-pragmas -o $@ $< \
+	       $(LDFLAGS) -L$(D3D12_LIBDIR) \
+	       $$(pkg-config --cflags --libs DirectX-Headers) -ld3d12 -ldxcore
+
 .PHONY: all install install-pointer enable disable clean \
-	d3d12-native-share-probe d3d12-cross-process-share-probe
+	d3d12-native-share-probe d3d12-cross-process-share-probe \
+	d3d12-video-encode-probe
