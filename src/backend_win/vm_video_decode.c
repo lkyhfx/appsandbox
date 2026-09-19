@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: MIT
- * Media Foundation hardware HEVC decoder producing D3D11 NV12 surfaces.
+ * Media Foundation hardware HEVC decoder producing GPU D3D11 NV12 or AYUV
+ * surfaces. The profile is explicit so a 4:4:4 stream can never silently
+ * enter the 4:2:0 path.
  */
 #include <windows.h>
 #define COBJMACROS
@@ -21,17 +23,25 @@ struct VmVideoDecoder {
     IMFTransform *transform;
     UINT reset_token;
     UINT width, height, fps_num, fps_den;
+    VmVideoDecodeProfile profile;
     LONGLONG next_time;
     DWORD output_stream;
     BOOL provides_samples;
 };
 
-static HRESULT activate_hevc_decoder(IMFTransform **result)
+static const GUID *output_subtype(VmVideoDecodeProfile profile)
+{
+    return profile == VM_VIDEO_HEVC444 ? &MFVideoFormat_AYUV : &MFVideoFormat_NV12;
+}
+
+static HRESULT activate_hevc_decoder(VmVideoDecodeProfile profile,
+                                     IMFTransform **result)
 {
     MFT_REGISTER_TYPE_INFO input = { MFMediaType_Video, MFVideoFormat_HEVC };
     MFT_REGISTER_TYPE_INFO output = { MFMediaType_Video, MFVideoFormat_NV12 };
     IMFActivate **activates = NULL;
     UINT32 count = 0, i;
+    output.guidSubtype = *output_subtype(profile);
     HRESULT hr = MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER,
         MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
         &input, &output, &activates, &count);
@@ -39,14 +49,32 @@ static HRESULT activate_hevc_decoder(IMFTransform **result)
         if (activates) CoTaskMemFree(activates);
         return FAILED(hr) ? hr : MF_E_TOPO_CODEC_NOT_FOUND;
     }
-    hr = IMFActivate_ActivateObject(activates[0], &IID_IMFTransform,
-                                    (void **)result);
+    hr = MF_E_TOPO_CODEC_NOT_FOUND;
+    /* Some systems enumerate more than one hardware MFT. Try every one; a
+       registration hit is not proof that the transform exposes GPU-backed
+       output in the requested profile. */
+    for (i = 0; i < count; i++) {
+        IMFTransform *candidate = NULL;
+        HRESULT candidate_hr = IMFActivate_ActivateObject(
+            activates[i], &IID_IMFTransform, (void **)&candidate);
+        if (SUCCEEDED(candidate_hr)) {
+            *result = candidate;
+            hr = S_OK;
+            break;
+        }
+    }
     for (i = 0; i < count; i++) IMFActivate_Release(activates[i]);
     CoTaskMemFree(activates);
     return hr;
 }
 
 BOOL vm_video_decode_supported(ID3D11Device *device)
+{
+    return vm_video_decode_supported_profile(device, VM_VIDEO_HEVC420);
+}
+
+BOOL vm_video_decode_supported_profile(ID3D11Device *device,
+                                       VmVideoDecodeProfile profile)
 {
     IMFTransform *transform = NULL;
     IMFDXGIDeviceManager *manager = NULL;
@@ -57,7 +85,7 @@ BOOL vm_video_decode_supported(ID3D11Device *device)
     if (FAILED(hr)) return FALSE;
     hr = MFCreateDXGIDeviceManager(&token, &manager);
     if (SUCCEEDED(hr)) hr = IMFDXGIDeviceManager_ResetDevice(manager, (IUnknown *)device, token);
-    if (SUCCEEDED(hr)) hr = activate_hevc_decoder(&transform);
+    if (SUCCEEDED(hr)) hr = activate_hevc_decoder(profile, &transform);
     if (SUCCEEDED(hr))
         hr = IMFTransform_ProcessMessage(transform, MFT_MESSAGE_SET_D3D_MANAGER,
                                           (ULONG_PTR)manager);
@@ -71,7 +99,8 @@ VmVideoDecoder *vm_video_decoder_create(ID3D11Device *device,
                                         UINT width, UINT height,
                                         UINT fps_num, UINT fps_den,
                                         const BYTE *extradata,
-                                        UINT extradata_size)
+                                        UINT extradata_size,
+                                        VmVideoDecodeProfile profile)
 {
     VmVideoDecoder *d = NULL;
     IMFMediaType *input = NULL, *output = NULL, *candidate = NULL;
@@ -83,12 +112,13 @@ VmVideoDecoder *vm_video_decoder_create(ID3D11Device *device,
     if (!d) { MFShutdown(); return NULL; }
     d->width = width; d->height = height;
     d->fps_num = fps_num; d->fps_den = fps_den;
+    d->profile = profile;
     d->device = device; ID3D11Device_AddRef(device);
 
     hr = MFCreateDXGIDeviceManager(&d->reset_token, &d->manager);
     if (SUCCEEDED(hr))
         hr = IMFDXGIDeviceManager_ResetDevice(d->manager, (IUnknown *)device, d->reset_token);
-    if (SUCCEEDED(hr)) hr = activate_hevc_decoder(&d->transform);
+    if (SUCCEEDED(hr)) hr = activate_hevc_decoder(profile, &d->transform);
     if (SUCCEEDED(hr))
         hr = IMFTransform_ProcessMessage(d->transform, MFT_MESSAGE_SET_D3D_MANAGER,
                                          (ULONG_PTR)d->manager);
@@ -108,7 +138,7 @@ VmVideoDecoder *vm_video_decoder_create(ID3D11Device *device,
         hr = IMFTransform_GetOutputAvailableType(d->transform, 0, i, &candidate);
         if (FAILED(hr)) break;
         if (SUCCEEDED(IMFMediaType_GetGUID(candidate, &MF_MT_SUBTYPE, &subtype)) &&
-            IsEqualGUID(&subtype, &MFVideoFormat_NV12)) {
+            IsEqualGUID(&subtype, output_subtype(profile))) {
             output = candidate; candidate = NULL;
             hr = S_OK;
             break;
@@ -180,7 +210,7 @@ HRESULT vm_video_decoder_decode(VmVideoDecoder *d,
         desc.Height = d->height;
         desc.MipLevels = 1;
         desc.ArraySize = 1;
-        desc.Format = DXGI_FORMAT_NV12;
+        desc.Format = d->profile == VM_VIDEO_HEVC444 ? DXGI_FORMAT_AYUV : DXGI_FORMAT_NV12;
         desc.SampleDesc.Count = 1;
         desc.Usage = D3D11_USAGE_DEFAULT;
         desc.BindFlags = D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE;

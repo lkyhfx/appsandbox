@@ -19,6 +19,7 @@ StandardError=journal
 # Running as root keeps that simple and also gives us /dev/dri/cardN access
 # without juggling the render group.
 User=root
+EnvironmentFile=-/etc/appsandbox/display.env
 
 [Install]
 WantedBy=multi-user.target

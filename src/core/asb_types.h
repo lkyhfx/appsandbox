@@ -29,6 +29,12 @@ extern "C" {
 #define CORE_VM_OS_TYPE_MAX     32
 #define CORE_VM_STATUS_MAX     128
 
+typedef enum AsbDisplayProfile {
+    ASB_DISPLAY_PROFILE_STANDARD = 0,
+    ASB_DISPLAY_PROFILE_HIGH_PERFORMANCE = 1,
+    ASB_DISPLAY_PROFILE_UNKNOWN = -1
+} AsbDisplayProfile;
+
 /* ---- VM configuration (inputs to create_vm) ---- */
 
 typedef struct CoreVmConfig {
@@ -44,6 +50,7 @@ typedef struct CoreVmConfig {
     const char *net_adapter;    /* for bridged, or NULL */
     const char *username;
     const char *password;
+    int         display_profile;
     int         is_template;
 } CoreVmConfig;
 
@@ -58,6 +65,9 @@ typedef struct CoreVmInfo {
     int         hdd_gb;
     int         cpu_cores;
     int         gpu_mode;
+    int         display_profile;
+    int         active_display_profile;
+    int         display_profile_pending;
     char        gpu_name[64];
     int         network_mode;
     int         install_complete;

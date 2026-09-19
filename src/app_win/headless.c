@@ -253,8 +253,9 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
     pos += sprintf_s(out + pos, cap - pos,
         ",\"state\":\"%s\",\"running\":%s,\"agentOnline\":%s,\"installComplete\":%s,"
         "\"building\":%s,\"progress\":%d,\"sshState\":%d,\"sshPort\":%lu,"
-        "\"ramMb\":%lu,\"hddGb\":%lu,\"cpuCores\":%lu,\"gpuMode\":%d,\"networkMode\":%d,"
-        "\"displayOpen\":%s,\"gpuId\":",
+        "\"ramMb\":%lu,\"hddGb\":%lu,\"cpuCores\":%lu,\"gpuMode\":%d,"
+        "\"displayProfile\":%d,\"activeDisplayProfile\":%d,\"displayProfilePending\":%s,\"networkMode\":%d,"
+        "\"displayOpen\":%s",
         derive_state(v),
         v->running ? "true" : "false", v->agent_online ? "true" : "false",
         v->install_complete ? "true" : "false", v->building_vhdx ? "true" : "false",
@@ -262,8 +263,12 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
         (v->ssh_key_deployed && v->ssh_state == 2) ? 4 : v->ssh_state,   /* 4 = ready + key deployed */
         (unsigned long)v->ssh_port,
         (unsigned long)v->ram_mb, (unsigned long)v->hdd_gb, (unsigned long)v->cpu_cores,
-        v->gpu_mode, v->network_mode,
+        v->gpu_mode, v->display_profile, v->active_display_profile,
+        v->display_profile_pending ? "true" : "false", v->network_mode,
         display_is_open(v->unique_id) ? "true" : "false");
+    pos += sprintf_s(out + pos, cap - pos, ",\"displayProfileReason\":");
+    pos = append_json_str(out, cap, pos, v->display_profile_reason);
+    pos += sprintf_s(out + pos, cap - pos, ",\"gpuId\":");
     pos = append_wstr(out, cap, pos, v->gpu_id);
     pos += sprintf_s(out + pos, cap - pos, ",\"gpuName\":");
     pos = append_wstr(out, cap, pos, v->gpu_name);
@@ -704,6 +709,7 @@ static int handle_request(PHTTP_REQUEST req)
                 }
             }
             if (json_get_int(body, L"networkMode", &iv)) cfg.network_mode = iv;
+            if (json_get_int(body, L"displayProfile", &iv)) cfg.display_profile = iv;
             if (json_get_bool(body, L"testMode", &bv)) cfg.test_mode = bv;
             if (json_get_bool(body, L"sshEnabled", &bv)) cfg.ssh_enabled = bv;
             if (json_get_bool(body, L"sshDeployKey", &bv)) cfg.ssh_deploy_key = bv;
@@ -712,6 +718,19 @@ static int handle_request(PHTTP_REQUEST req)
                 send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
                          "sshDeployKey requires sshEnabled");
                 return 0;
+            }
+            {
+                const wchar_t *verr = asb_validate_display_profile(os,
+                                                                    cfg.gpu_mode,
+                                                                    cfg.display_profile);
+                if (verr) {
+                    char message[512];
+                    WideCharToMultiByte(CP_UTF8, 0, verr, -1, message,
+                                        sizeof(message), NULL, NULL);
+                    SecureZeroMemory(pass, sizeof(pass));
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg", message);
+                    return 0;
+                }
             }
             {
                 const wchar_t *password_os = os;
@@ -803,8 +822,18 @@ static int handle_request(PHTTP_REQUEST req)
             }
             if (verb == HttpVerbPUT) {   /* edit (PUT instead of PATCH: PATCH isn't in the http.sys verb enum) */
                 wchar_t body[8192], gpu_id[512] = {0};
-                int iv, gpu_mode = GPU_DEFAULT; BOOL has_gpu;
+                int iv, gpu_mode = GPU_DEFAULT, display_profile;
+                BOOL has_gpu, has_profile, has_resource_fields;
                 HRESULT hr = S_OK;
+                if (!body_to_wide(req, body, ARRAYSIZE(body))) {
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                             "Request body must contain valid UTF-8 JSON without NUL bytes.");
+                    return 0;
+                }
+                has_profile = json_has_key(body, L"displayProfile");
+                has_resource_fields = json_has_key(body, L"ramMb") ||
+                    json_has_key(body, L"cpuCores") || json_has_key(body, L"gpuMode") ||
+                    json_has_key(body, L"gpuId") || json_has_key(body, L"networkMode");
                 /* config is locked while building or running -- return a clean 409,
                    not the generic 500 that asb_vm_set_*'s E_ACCESSDENIED would
                    produce. The GUI likewise disables the edit control while a VM is
@@ -814,13 +843,8 @@ static int handle_request(PHTTP_REQUEST req)
                              "cannot edit a VM while it is building/staging; wait for the build to finish");
                     return 0;
                 }
-                if (inst->running) {
+                if (inst->running && (!has_profile || has_resource_fields)) {
                     send_err(req->RequestId, 409, "Conflict", "vm_running", "cannot edit a running VM; stop it first");
-                    return 0;
-                }
-                if (!body_to_wide(req, body, ARRAYSIZE(body))) {
-                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
-                             "Request body must contain valid UTF-8 JSON without NUL bytes.");
                     return 0;
                 }
                 has_gpu = json_has_key(body, L"gpuMode") || json_has_key(body, L"gpuId");
@@ -854,6 +878,8 @@ static int handle_request(PHTTP_REQUEST req)
                     if (iv < 0 || iv > 3) { send_err(req->RequestId, 400, "Bad Request", "invalid_arg", "networkMode must be 0 (None), 1 (NAT), 2 (External), or 3 (Internal)"); return 0; }
                     hr = asb_vm_set_network(vm, iv);
                 }
+                if (has_profile && json_get_int(body, L"displayProfile", &display_profile))
+                    hr = asb_vm_set_display_profile(vm, display_profile);
                 asb_save();
                 if (SUCCEEDED(hr)) {
                     append_vm_json(buf, sizeof(buf), 0, inst);

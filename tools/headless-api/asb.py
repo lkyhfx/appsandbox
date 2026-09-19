@@ -110,8 +110,9 @@ class Client:
 
     def create(self, **cfg):
         """Create a VM. Config keys: name, osType, imagePath|templateName, ramMb,
-        hddGb, cpuCores, gpuMode(0-2), networkMode(0-3), netAdapter, adminUser,
-        adminPass, testMode, sshEnabled, sshDeployKey, isTemplate. sshDeployKey
+        hddGb, cpuCores, gpuMode(0-2), displayProfile(0=standard, 1=high-performance),
+        networkMode(0-3), netAdapter, adminUser, adminPass, testMode, sshEnabled,
+        sshDeployKey, isTemplate. sshDeployKey
         (requires sshEnabled) deploys the AppSandbox public key so you can SSH in
         with key auth (see key_path()); sshInfo reports keyDeployed + sshState 4
         once it lands. The daemon validates these exactly like the GUI; ramMb is
@@ -122,12 +123,19 @@ class Client:
         return self._req("POST", "/vms", cfg)
 
     def edit(self, name, **fields):
-        """Change config on a STOPPED VM. Honors ramMb/cpuCores/gpuMode/networkMode
-        (same ranges as create); name is fixed at create and any other key is ignored.
-        Returns (status, body) -- 409 if the VM is running."""
+        """Change config on a STOPPED VM. displayProfile may also be changed on a
+        running VM; the response reports pending until the guest applies it. Honors
+        ramMb/cpuCores/gpuMode/networkMode (same ranges as create); name is fixed at
+        create and any other key is ignored. Returns (status, body)."""
         if isinstance(fields.get("ramMb"), int):
             fields["ramMb"] -= fields["ramMb"] % 2   # 2 MB-aligned, like the GUI
         return self._req("PUT", "/vms/%s" % name, fields)
+
+    def set_display_profile(self, name, profile):
+        """Request displayProfile 0 (standard) or 1 (high-performance).
+        High Performance remains pending until the guest's 4K60 production gate
+        and, when required, the next guest reboot have completed."""
+        return self.edit(name, displayProfile=profile)
 
     # ---- host / templates / ssh / snapshots ----
     def host(self):              return self._req("GET", "/host")[1]

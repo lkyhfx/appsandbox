@@ -124,7 +124,20 @@ function applyOsTypeUI() {
     revalidateVmName();
     revalidateUsername();
     revalidatePassword();
+    updateDisplayProfileUI();
     updateCreateButtons();
+}
+
+function updateDisplayProfileUI() {
+    var select = document.getElementById('display-profile');
+    if (!select) return;
+    var linuxGpu = !hostBridge.isMac &&
+        document.getElementById('os-type').value === 'Linux' &&
+        Number(document.getElementById('gpu-mode').value) !== 0;
+    var high = select.querySelector('option[value="1"]');
+    high.hidden = !linuxGpu;
+    high.disabled = !linuxGpu;
+    if (!linuxGpu && select.value === '1') select.value = '0';
 }
 
 /* Unified dispatch. Native code on either platform calls
@@ -546,6 +559,7 @@ function createValidationError(isTemplate) {
 }
 
 function updateCreateButtons() {
+    updateDisplayProfileUI();
     document.getElementById('btn-create').disabled = !!createValidationError(false);
     document.getElementById('btn-create-template').disabled = !!createValidationError(true);
 }
@@ -648,6 +662,7 @@ function gatherConfig() {
         cpuCores:    document.getElementById('cpu-cores').valueAsNumber,
         gpuMode:     gpu.gpuMode,
         gpuId:       gpu.gpuId,
+        displayProfile: parseInt(document.getElementById('display-profile').value),
         networkMode: hostBridge.isMac ? 1 : parseInt(document.getElementById('net-mode').value),
         netAdapter:  hostBridge.isMac ? '' : document.getElementById('net-adapter').value,
         adminUser:   document.getElementById('admin-user').value.trim(),
@@ -823,6 +838,7 @@ function openCreateModal() {
     document.getElementById('test-mode').checked = false;
     document.getElementById('ssh-enabled').checked = false;
     document.getElementById('ssh-deploy-key').checked = false;
+    document.getElementById('display-profile').value = '0';
     onSshToggle();   /* re-grey "Deploy SSH key" to match the cleared SSH checkbox */
     /* Reset OS type to Windows on each open. Valid on both hosts (a Mac host
        supports Windows via QEMU); the user can switch to macOS on a Mac. */
@@ -1051,6 +1067,14 @@ function buildRowCells(vm, i, statusTd) {
         else sshBtn.title = 'SSH: waiting for the in-VM agent to come online';
     }
 
+    var profileText = vm.displayProfile === 1
+        ? (vm.displayProfilePending ? '4K60 · pending' : '4K60 · 4:4:4')
+        : '1080p60';
+    if (vm.displayProfile === 1 && vm.activeDisplayProfile === -1 && !vm.agentOnline)
+        profileText = '4K60 · unavailable';
+    var profileTitle = 'Desired/active display profile; pending means the guest has not reconciled it yet';
+    if (vm.displayProfilePending && vm.displayProfileReason)
+        profileTitle += ' Reason: ' + vm.displayProfileReason;
     var cells = [
         makeCell(vm.name),
         makeCell(vm.osType),
@@ -1063,6 +1087,7 @@ function buildRowCells(vm, i, statusTd) {
             hostBridge.isMac && vm.osType === 'Windows'
                 ? 'Windows software rendering (WARP) on the CPU'
                 : 'GPU passed through to the VM via GPU-PV, or None'),
+        makeCell(profileText, profileTitle),
         makeCell(hostBridge.isMac ? 'NAT' : (netNames[vm.networkMode] || 'None'),
             hostBridge.isMac ? 'NAT (shared networking)'
                 : 'Networking mode: NAT (shared), External (bridged), Internal (host-only), or None'),
@@ -1076,7 +1101,7 @@ function buildRowCells(vm, i, statusTd) {
         makeIconCell('shutdown', '\u23FB', vm.running && !bld, function() { sendCmd('shutdownVm', {vmIndex: i}); }, '', 'Request a graceful shutdown from the guest OS'),
         makeIconCell('stop', '\u2715\uFE0F', vm.running && !bld, function() { onStopVm(i); }, '', 'Force power off the VM immediately (may lose unsaved guest data)'),
         makeIconCell('delete', '\uD83D\uDDD1\uFE0F', !bld, function() { onDeleteVm(i); }, vm.running ? 'running' : '', 'Delete this VM and its virtual disks'),
-        makeIconCell('edit', '\u270F\uFE0F', !vm.running && !bld, function() { openEditVmModal(i); }, '', 'Edit VM configuration — VM must be stopped'),
+        makeIconCell('edit', '\u270F\uFE0F', !bld, function() { openEditVmModal(i); }, '', 'Edit VM configuration; Display Mode may be changed while running'),
     );
     return cells;
 }
@@ -1146,6 +1171,8 @@ function renderVmTable() {
             vm.updateState, vm.updateProgress, vm.updateActive, vm.updateRebootRequired, vm.updateError,
             vm.osType, vm.ramMb, vm.hddGb, vm.cpuCores,
             vm.gpuMode, vm.gpuId, vm.gpuName, vm.networkMode,
+            vm.displayProfile, vm.activeDisplayProfile, vm.displayProfilePending,
+            vm.displayProfileReason || '',
             selectedSnap.get(vm.name) || 'current',
             /* Snapshot tree: take/delete/rename/branch must trigger a row rebuild
                so makeSnapCell re-runs. These fields only change on user snapshot
@@ -1232,7 +1259,7 @@ function vmIndexByName(name) {
 
 function openEditVmModal(idx) {
     var vm = vms[idx];
-    if (!vm || vm.running || vm.buildingVhdx) return;
+    if (!vm || vm.buildingVhdx) return;
     editVmState = { name: vm.name, initial: Object.assign({}, vm), previousFocus: rowCache[vm.name].querySelector('.edit') };
     document.getElementById('edit-vm-title').textContent = 'Edit ' + vm.name;
     document.getElementById('edit-ram-size').value = vm.ramMb;
@@ -1240,6 +1267,12 @@ function openEditVmModal(idx) {
     document.getElementById('edit-cpu-cores').value = vm.cpuCores;
     setGpuSelection('edit-gpu-mode', vm);
     document.getElementById('edit-net-mode').value = String(vm.networkMode);
+    document.getElementById('edit-display-profile').value = String(vm.displayProfile || 0);
+    var high = document.querySelector('#edit-display-profile option[value="1"]');
+    high.hidden = hostBridge.isMac || vm.osType !== 'Linux' || vm.gpuMode === 0;
+    high.disabled = high.hidden;
+    if (high.hidden && document.getElementById('edit-display-profile').value === '1')
+        document.getElementById('edit-display-profile').value = '0';
     updateEditVmModal();
     document.getElementById('edit-vm-overlay').classList.add('active');
     document.getElementById('edit-ram-size').focus();
@@ -1265,7 +1298,8 @@ function restoreVmModalFocus(state, selector) {
 function editVmValues() {
     var values = {
         ramMb: document.getElementById('edit-ram-size').valueAsNumber,
-        cpuCores: document.getElementById('edit-cpu-cores').valueAsNumber
+        cpuCores: document.getElementById('edit-cpu-cores').valueAsNumber,
+        displayProfile: Number(document.getElementById('edit-display-profile').value)
     };
     if (!hostBridge.isMac) {
         Object.assign(values, selectedGpu('edit-gpu-mode'));
@@ -1288,12 +1322,18 @@ function updateEditVmModal() {
     if (!editVmState) return;
     var vm = vms[vmIndexByName(editVmState.name)];
     if (!vm) { closeEditVmModal(); return; }
-    var disabled = vm.running || vm.buildingVhdx;
+    var disabled = vm.buildingVhdx;
     document.querySelectorAll('#edit-vm-overlay input, #edit-vm-overlay select').forEach(function(el) {
-        el.disabled = !!disabled;
+        el.disabled = !!disabled || (vm.running && el.id !== 'edit-display-profile');
     });
+    var high = document.querySelector('#edit-display-profile option[value="1"]');
+    high.hidden = hostBridge.isMac || vm.osType !== 'Linux' || vm.gpuMode === 0;
+    high.disabled = high.hidden;
     var values = editVmValues();
-    var error = disabled ? 'Stop the VM before editing its configuration.' : editVmValidationError(values);
+    var error = disabled ? 'Wait for the VM disk build to finish.' :
+        (vm.running && values.displayProfile === editVmState.initial.displayProfile
+            ? 'Choose a different Display Mode or stop the VM to edit other settings.'
+            : editVmValidationError(values));
     document.getElementById('edit-vm-warn').textContent = error;
     document.getElementById('btn-save-edit-vm').disabled = !!error;
 }

@@ -61,6 +61,7 @@ typedef struct {
     BOOL    test_mode;               /* TRUE = disable Secure Boot (for test-signed drivers) */
     BOOL    ssh_enabled;             /* TRUE = install OpenSSH Server in guest */
     BOOL    ssh_deploy_key;          /* TRUE = deploy the AppSandbox public key (needs ssh_enabled) */
+    int     display_profile;         /* ASB_DISPLAY_PROFILE_* */
 } VmConfig;
 
 /* Runtime state of a VM */
@@ -130,6 +131,12 @@ typedef struct {
     char        graphics_version[96];
     char        guest_caps[256];
     volatile BOOL guest_updater_supported;
+
+    /* Desired profile is persisted; active profile is guest-reported. */
+    int         display_profile;
+    volatile int active_display_profile;
+    volatile BOOL display_profile_pending;
+    char        display_profile_reason[96];
 
     /* Host update state; durable transaction state remains in the guest. */
     volatile int update_state;

@@ -17,11 +17,19 @@
 #define ASB_DISPLAY_VIDEO_FRAME_MAGIC  0x45565341u /* ASVE */
 
 #define ASB_DISPLAY_CAP_RAW_ASFR              (1u << 0)
-#define ASB_DISPLAY_CAP_HEVC_D3D11_HW_DECODE  (1u << 1)
+/* Bit 1 was the original generic HEVC capability. Preserve it as 420. */
+#define ASB_DISPLAY_CAP_HEVC420_D3D11_HW_DECODE (1u << 1)
+#define ASB_DISPLAY_CAP_HEVC_D3D11_HW_DECODE    ASB_DISPLAY_CAP_HEVC420_D3D11_HW_DECODE
+#define ASB_DISPLAY_CAP_HEVC444_D3D11_HW_DECODE (1u << 2)
 
 #define ASB_DISPLAY_CODEC_HEVC 1u
 #define ASB_DISPLAY_VIDEO_FLAG_IDR           (1u << 0)
 #define ASB_DISPLAY_VIDEO_FLAG_DISCONTINUITY (1u << 1)
+
+/* Explicit data-plane profile flags carried in AsbEncodedVideoConfig.flags.
+   Keeping these in the existing field preserves the v2 packed ABI. */
+#define ASB_DISPLAY_VIDEO_CONFIG_HEVC420     (1u << 8)
+#define ASB_DISPLAY_VIDEO_CONFIG_HEVC444     (1u << 9)
 
 #define ASB_DISPLAY_MAX_WIDTH       16384u
 #define ASB_DISPLAY_MAX_HEIGHT      16384u

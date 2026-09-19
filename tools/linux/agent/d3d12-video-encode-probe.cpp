@@ -1732,8 +1732,8 @@ static bool collect_encoded_slot(EncodeSlot *slot, std::ostream *stream,
 
 class EncodedPacketStreamBuf final : public std::streambuf {
 public:
-    EncodedPacketStreamBuf(int fd, EncodeDimensions dimensions)
-        : fd_(fd), dimensions_(dimensions) {}
+    EncodedPacketStreamBuf(int fd, EncodeDimensions dimensions, bool hevc444)
+        : fd_(fd), dimensions_(dimensions), hevc444_(hevc444) {}
 
 protected:
     std::streamsize xsputn(const char *data, std::streamsize count) override
@@ -1751,7 +1751,9 @@ protected:
             config.height = dimensions_.height;
             config.fps_num = kFrameRateNumerator;
             config.fps_den = kFrameRateDenominator;
-            config.flags = ASB_DISPLAY_VIDEO_FLAG_DISCONTINUITY;
+            config.flags = ASB_DISPLAY_VIDEO_FLAG_DISCONTINUITY |
+                (hevc444_ ? ASB_DISPLAY_VIDEO_CONFIG_HEVC444
+                          : ASB_DISPLAY_VIDEO_CONFIG_HEVC420);
             config.extradata_size = static_cast<std::uint32_t>(count);
             if (!send_message(&config, sizeof(config), data,
                               static_cast<std::size_t>(count)))
@@ -1798,6 +1800,7 @@ private:
 
     int fd_;
     EncodeDimensions dimensions_;
+    bool hevc444_;
     bool configured_ = false;
     std::uint64_t frame_seq_ = 0;
 };
@@ -1811,8 +1814,7 @@ static bool encode_consumer_main(
     int control_fd, EncodeProbeMode mode = EncodeProbeMode::Hevc420)
 {
     const bool production_session = std::getenv("ASB_D3D12_ENCODED_FD") != nullptr;
-    const bool hevc444_session =
-        !production_session && mode == EncodeProbeMode::Hevc444;
+    const bool hevc444_session = mode == EncodeProbeMode::Hevc444;
     if (production_session)
         ::unlink("/run/appsandbox/display-d3d12.health");
     DeviceContext context;
@@ -2063,7 +2065,8 @@ static bool encode_consumer_main(
         if (!end || *end || parsed < 0 || parsed > std::numeric_limits<int>::max())
             return false;
         packet_buffer = std::make_unique<EncodedPacketStreamBuf>(static_cast<int>(parsed),
-                                                                  dimensions);
+                                                                  dimensions,
+                                                                  hevc444_session);
         packet_stream = std::make_unique<std::ostream>(packet_buffer.get());
         stream = packet_stream.get();
         stream_path = "seqpacket";

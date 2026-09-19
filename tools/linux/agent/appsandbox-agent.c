@@ -55,6 +55,11 @@
 #define BOOTSTRAP_MAX_SIZE      (64ULL * 1024ULL * 1024ULL)
 #define BOOTSTRAP_SERVICE_PATH  "/etc/systemd/system/appsandbox-guest-updater.service"
 #define BOOTSTRAP_WATCH_PATH    "/etc/systemd/system/appsandbox-guest-update-watch.service"
+#define DISPLAY_PROFILE_PATH    "/etc/appsandbox/display-profile"
+#define DISPLAY_ENV_PATH        "/etc/appsandbox/display.env"
+#define DISPLAY_MODE_PATH       "/etc/modprobe.d/zz-appsandbox-display-profile.conf"
+
+static int read_active_display_profile(char *out, size_t cap);
 
 #pragma pack(push, 1)
 typedef struct BootstrapHeader {
@@ -237,7 +242,7 @@ static int bootstrap_run_systemd(void)
                                     (char *)"appsandbox-guest-updater.service",
                                     (char *)"appsandbox-guest-update-watch.service", NULL };
     pid_t pid;
-    int status;
+    int status = 0;
     char *const *commands[] = { reload, enable };
     size_t i;
     for (i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
@@ -769,14 +774,143 @@ static void send_guest_update_metadata(int fd)
             sscanf(line, "%95[0-9A-Za-z.+-]", graphics);
         fclose(f);
     }
-    send_line(fd, "guest_caps:update-v1,graphics-v1,health-v1");
+    {
+        char caps[256] = "guest_caps:update-v1,graphics-v1,health-v1,display-profile-v1,hevc444-v1";
+        FILE *gate = fopen("/opt/wsl-mesa/current/BUILDINFO", "r");
+        char gate_line[160];
+        if (gate) {
+            while (fgets(gate_line, sizeof(gate_line), gate))
+                if (!strncmp(gate_line, "production-4k60: true", 21)) {
+                    strcat(caps, ",production-4k60-v1");
+                    break;
+                }
+            fclose(gate);
+        }
+        send_line(fd, caps);
+    }
     {
         char line[128];
         snprintf(line, sizeof(line), "guest_version:%s", version);
         send_line(fd, line);
         snprintf(line, sizeof(line), "graphics_version:%s", graphics);
         send_line(fd, line);
+        {
+            char value[32];
+            read_active_display_profile(value, sizeof(value));
+            snprintf(line, sizeof(line), "display_profile:%s", value);
+            send_line(fd, line);
+        }
     }
+}
+
+static const char *display_profile_name(const char *value)
+{
+    if (!value) return NULL;
+    if (!strcmp(value, "standard")) return "standard";
+    if (!strcmp(value, "high_performance")) return "high_performance";
+    return NULL;
+}
+
+static int read_display_profile(char *out, size_t cap)
+{
+    FILE *f;
+    if (!out || cap < 32) return -1;
+    snprintf(out, cap, "standard");
+    f = fopen(DISPLAY_PROFILE_PATH, "r");
+    if (!f) return 0;
+    if (fscanf(f, "%31s", out) != 1 || !display_profile_name(out))
+        snprintf(out, cap, "standard");
+    fclose(f);
+    return 0;
+}
+
+static int read_active_display_profile(char *out, size_t cap)
+{
+    FILE *width_file, *height_file;
+    unsigned width = 0, height = 0;
+    if (!out || cap < 32) return -1;
+    snprintf(out, cap, "standard");
+    width_file = fopen("/sys/module/asb_drm/parameters/width", "r");
+    height_file = fopen("/sys/module/asb_drm/parameters/height", "r");
+    if (width_file) {
+        (void)fscanf(width_file, "%u", &width);
+        fclose(width_file);
+    }
+    if (height_file) {
+        (void)fscanf(height_file, "%u", &height);
+        fclose(height_file);
+    }
+    if (width >= 3840 && height >= 2160)
+        snprintf(out, cap, "high_performance");
+    return 0;
+}
+
+static int write_display_profile(const char *profile)
+{
+    int fd;
+    char env[96];
+    char mode_config[128];
+    const char *codec_mode = !strcmp(profile, "high_performance") ? "hevc444" : "hevc420";
+    if (!display_profile_name(profile) ||
+        (mkdir("/etc/appsandbox", 0755) < 0 && errno != EEXIST))
+        return -1;
+    fd = open(DISPLAY_PROFILE_PATH, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0644);
+    if (fd < 0) return -1;
+    if (dprintf(fd, "%s\n", profile) < 0 || close(fd) < 0) return -1;
+    fd = open(DISPLAY_ENV_PATH, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0644);
+    if (fd < 0) return -1;
+    snprintf(env, sizeof(env), "APPSANDBOX_DISPLAY_CODEC_MODE=%s\n", codec_mode);
+    if (write(fd, env, strlen(env)) != (ssize_t)strlen(env) || close(fd) < 0) return -1;
+    fd = open(DISPLAY_MODE_PATH, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0644);
+    if (fd < 0) return -1;
+    snprintf(mode_config, sizeof(mode_config),
+             "options asb_drm width=%s height=%s refresh=60\n",
+             !strcmp(profile, "high_performance") ? "3840" : "1920",
+             !strcmp(profile, "high_performance") ? "2160" : "1080");
+    if (write(fd, mode_config, strlen(mode_config)) != (ssize_t)strlen(mode_config) ||
+        close(fd) < 0) return -1;
+    return 0;
+}
+
+static void handle_display_profile(int fd, const char *tag, const char *cmd)
+{
+    char current[32], active[32];
+    const char *profile;
+    if (!strcmp(cmd, "display_profile_get")) {
+        char response[96];
+        read_display_profile(current, sizeof(current));
+        read_active_display_profile(active, sizeof(active));
+        snprintf(response, sizeof(response), "profile=%s;reboot_required=%d",
+                 active, strcmp(current, active) != 0 ? 1 : 0);
+        send_reply(fd, tag, response);
+        return;
+    }
+    if (strncmp(cmd, "display_profile_set ", 21) != 0 ||
+        strlen(cmd + 21) >= sizeof(current) || strchr(cmd + 21, ' ') ||
+        strchr(cmd + 21, '\t')) {
+        send_reply(fd, tag, "error:bad_display_profile_command");
+        return;
+    }
+    profile = display_profile_name(cmd + 21);
+    if (!profile) {
+        send_reply(fd, tag, "error:unsupported_display_profile");
+        return;
+    }
+    read_display_profile(current, sizeof(current));
+    read_active_display_profile(active, sizeof(active));
+    if (!strcmp(current, profile) && !strcmp(active, profile)) {
+        send_reply(fd, tag, !strcmp(profile, "high_performance")
+            ? "profile=high_performance;reboot_required=0"
+            : "profile=standard;reboot_required=0");
+        return;
+    }
+    if (write_display_profile(profile) < 0) {
+        send_reply(fd, tag, "error:display_profile_write_failed");
+        return;
+    }
+    send_reply(fd, tag, !strcmp(profile, "high_performance")
+        ? "profile=high_performance;reboot_required=1"
+        : "profile=standard;reboot_required=1");
 }
 
 static void handle_guest_update(int fd, const char *tag, const char *cmd)
@@ -1507,6 +1641,10 @@ static void handle_client(int fd)
              * it alive after that. */
             respawn_clipboard_helper();
             send_reply(fd, tag, "ok");
+        }
+        else if (!strcmp(cmd, "display_profile_get") ||
+                 !strncmp(cmd, "display_profile_set ", 21)) {
+            handle_display_profile(fd, tag, cmd);
         }
         else if (strncmp(cmd, "gpu_query_response:", 19) == 0) {
             int n_shares = atoi(cmd + 19);

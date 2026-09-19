@@ -198,7 +198,8 @@ static int encoded_cursor_tick(int client_fd, int reset);
  * the only vsock writer in encoded mode, so configuration and access units
  * cannot interleave with cursor messages. */
 static int encoded_loop(int client_fd, int helper_fd,
-                        const AsbDisplayHostHello *hello)
+                        const AsbDisplayHostHello *hello,
+                        int requested_hevc444, int requested_hevc420)
 {
     size_t capacity = sizeof(AsbEncodedVideoFrame) + ASB_DISPLAY_MAX_VIDEO_FRAME;
     uint8_t *packet = (uint8_t *)malloc(capacity);
@@ -229,6 +230,37 @@ static int encoded_loop(int client_fd, int helper_fd,
             AsbEncodedVideoConfig config;
             if ((size_t)n < sizeof(config)) break;
             memcpy(&config, packet, sizeof(config));
+            {
+                uint32_t profile_flags = config.flags &
+                    (ASB_DISPLAY_VIDEO_CONFIG_HEVC420 |
+                     ASB_DISPLAY_VIDEO_CONFIG_HEVC444);
+                int config_hevc444 =
+                    profile_flags == ASB_DISPLAY_VIDEO_CONFIG_HEVC444;
+                int config_hevc420 =
+                    profile_flags == ASB_DISPLAY_VIDEO_CONFIG_HEVC420;
+                int profile_shape_ok = config_hevc444
+                    ? (config.width == 3840 && config.height == 2160 &&
+                       config.fps_num == 60 && config.fps_den == 1)
+                    : (config_hevc420 && config.width && config.height &&
+                       config.fps_num == 60 && config.fps_den == 1);
+                if (!config_hevc444 && !config_hevc420) {
+                    agent_log("display_protocol=v2 encoded_config=reject "
+                              "reason=missing-profile-flag");
+                    break;
+                }
+                if ((requested_hevc444 && !config_hevc444) ||
+                    (requested_hevc420 && !config_hevc420) ||
+                    !profile_shape_ok) {
+                    agent_log("display_protocol=v2 encoded_config=reject "
+                              "reason=profile-mismatch requested=%s "
+                              "actual=%s dimensions=%ux%u fps=%u/%u",
+                              requested_hevc444 ? "hevc444" : "hevc420",
+                              config_hevc444 ? "hevc444" : "hevc420",
+                              config.width, config.height,
+                              config.fps_num, config.fps_den);
+                    break;
+                }
+            }
             if (config.version != ASB_DISPLAY_PROTOCOL_VERSION ||
                 config.header_size != sizeof(config) ||
                 config.codec != ASB_DISPLAY_CODEC_HEVC ||
@@ -899,6 +931,10 @@ int main(void)
         memset(&hello, 0, sizeof(hello));
         int hello_status = receive_host_hello(c, &hello);
         int used_hevc = 0;
+        const char *codec_mode = getenv("APPSANDBOX_DISPLAY_CODEC_MODE");
+        int requested_hevc444 = codec_mode && strcmp(codec_mode, "hevc444") == 0;
+        int requested_hevc420 = !codec_mode || strcmp(codec_mode, "hevc420") == 0;
+        int codec_mode_valid = !codec_mode || requested_hevc444 || requested_hevc420;
         const char *force_raw = getenv("APPSANDBOX_DISPLAY_FORCE_RAW");
         if (hello_status > 0) {
             agent_log("display_protocol=v2 negotiated=1 host_caps=0x%x host_max=%ux%u",
@@ -908,21 +944,36 @@ int main(void)
         } else {
             agent_log("display_protocol=invalid negotiated=0 reason=invalid-host-hello");
         }
-        if (hello_status > 0 &&
-            (hello.capabilities & ASB_DISPLAY_CAP_HEVC_D3D11_HW_DECODE) &&
+        if (hello_status > 0 && codec_mode_valid &&
+            ((requested_hevc444 &&
+              (hello.capabilities & ASB_DISPLAY_CAP_HEVC444_D3D11_HW_DECODE)) ||
+             (requested_hevc420 &&
+              (hello.capabilities & ASB_DISPLAY_CAP_HEVC420_D3D11_HW_DECODE))) &&
             !(force_raw && strcmp(force_raw, "0") != 0)) {
             int helper = connect_encoder_output();
             if (helper >= 0) {
                 agent_log("display_protocol=v2 display_backend=hevc-d3d12 fallback=0");
                 used_hevc = 1;
-                (void)encoded_loop(c, helper, &hello);
+                (void)encoded_loop(c, helper, &hello,
+                                    requested_hevc444, requested_hevc420);
                 close(helper);
                 agent_log("display_protocol=v2 display_backend=hevc-d3d12 session_ended=1 reconnect_required=1");
             } else {
                 ++g_fallback_count;
                 agent_log("display_protocol=v2 display_backend=raw-asfr fallback=1 fallback_count=%llu fallback_reason=encoder-helper-unavailable error=%s",
-                          (unsigned long long)g_fallback_count, strerror(errno));
+                      (unsigned long long)g_fallback_count, strerror(errno));
             }
+        } else if (hello_status > 0 && !codec_mode_valid) {
+            ++g_fallback_count;
+            agent_log("display_protocol=v2 display_backend=raw-asfr fallback=1 "
+                      "fallback_count=%llu fallback_reason=invalid-profile-env",
+                      (unsigned long long)g_fallback_count);
+        } else if (hello_status > 0 && requested_hevc444 &&
+                   !(hello.capabilities & ASB_DISPLAY_CAP_HEVC444_D3D11_HW_DECODE)) {
+            ++g_fallback_count;
+            agent_log("display_protocol=v2 display_backend=raw-asfr fallback=1 "
+                      "fallback_count=%llu fallback_reason=profile-mismatch",
+                      (unsigned long long)g_fallback_count);
         } else if (force_raw && strcmp(force_raw, "0") != 0) {
             ++g_fallback_count;
             agent_log("display_protocol=%s display_backend=raw-asfr fallback=1 fallback_count=%llu fallback_reason=forced",

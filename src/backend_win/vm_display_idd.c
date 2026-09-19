@@ -40,6 +40,7 @@
 #include "resource.h"
 #include "vm_video_decode.h"
 #include "../core/display_protocol.h"
+#include "../core/asb_types.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "d3d11.lib")
@@ -227,6 +228,7 @@ struct VmDisplayIdd {
     UINT64                   video_generation;
     BOOL                     video_wait_idr;
     BOOL                     video_active;
+    VmVideoDecodeProfile     video_profile;
     BOOL                     hevc_disabled;
     UINT                     fallback_count;
     ID3D11VideoDevice       *video_device;
@@ -1796,6 +1798,7 @@ static BOOL d3d_render_video_frame(VmDisplayIdd *d)
     RECT client, source, destination;
     UINT subresource = 0;
     HRESULT hr;
+    D3D11_TEXTURE2D_DESC texture_desc;
     float clear[4] = {0, 0, 0, 1};
 
     EnterCriticalSection(&d->frame_cs);
@@ -1807,6 +1810,18 @@ static BOOL d3d_render_video_frame(VmDisplayIdd *d)
     }
     LeaveCriticalSection(&d->frame_cs);
     if (!texture) return FALSE;
+
+    ZeroMemory(&texture_desc, sizeof(texture_desc));
+    ID3D11Texture2D_GetDesc(texture, &texture_desc);
+    if ((d->video_profile == VM_VIDEO_HEVC444 &&
+         texture_desc.Format != DXGI_FORMAT_AYUV) ||
+        (d->video_profile == VM_VIDEO_HEVC420 &&
+         texture_desc.Format != DXGI_FORMAT_NV12)) {
+        idd_log(d, L"display_protocol=v2 display_backend=raw-asfr fallback=1 "
+                L"fallback_reason=profile-surface-mismatch format=%u", texture_desc.Format);
+        ID3D11Texture2D_Release(texture);
+        return FALSE;
+    }
 
     if (!d->video_device)
         ID3D11Device_QueryInterface(d->device, &IID_ID3D11VideoDevice,
@@ -2243,6 +2258,8 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         SOCKET s;
         FrameHeader hdr;
         BOOL advertised_hevc = FALSE;
+        BOOL advertised_hevc444 = FALSE;
+        BOOL requested_hevc444 = FALSE;
         BOOL session_saw_hevc = FALSE;
         BOOL session_logged_raw = FALSE;
 
@@ -2287,18 +2304,36 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             hello.version = ASB_DISPLAY_PROTOCOL_VERSION;
             hello.header_size = sizeof(hello);
             hello.capabilities = ASB_DISPLAY_CAP_RAW_ASFR;
-            if (!d->hevc_disabled && vm_video_decode_supported(d->device))
-                hello.capabilities |= ASB_DISPLAY_CAP_HEVC_D3D11_HW_DECODE;
-            advertised_hevc =
-                (hello.capabilities & ASB_DISPLAY_CAP_HEVC_D3D11_HW_DECODE) != 0;
+            requested_hevc444 = d->vm &&
+                d->vm->display_profile == ASB_DISPLAY_PROFILE_HIGH_PERFORMANCE;
+            if (requested_hevc444) {
+                BOOL production_gate = d->vm &&
+                    _wcsicmp(d->os_type, L"Linux") == 0 &&
+                    d->vm->gpu_mode != GPU_NONE &&
+                    strstr(d->vm->guest_caps, "display-profile-v1") != NULL &&
+                    strstr(d->vm->guest_caps, "hevc444-v1") != NULL &&
+                    strstr(d->vm->guest_caps, "production-4k60-v1") != NULL;
+                if (!d->hevc_disabled && production_gate &&
+                    vm_video_decode_supported_profile(d->device, VM_VIDEO_HEVC444))
+                    hello.capabilities |= ASB_DISPLAY_CAP_HEVC444_D3D11_HW_DECODE;
+            } else if (!d->hevc_disabled &&
+                       vm_video_decode_supported_profile(d->device, VM_VIDEO_HEVC420)) {
+                hello.capabilities |= ASB_DISPLAY_CAP_HEVC420_D3D11_HW_DECODE;
+            }
+            advertised_hevc444 =
+                (hello.capabilities & ASB_DISPLAY_CAP_HEVC444_D3D11_HW_DECODE) != 0;
+            advertised_hevc = requested_hevc444 ? advertised_hevc444 :
+                (hello.capabilities & ASB_DISPLAY_CAP_HEVC420_D3D11_HW_DECODE) != 0;
             hello.max_width = 7680;
             hello.max_height = 4320;
             if (!send_exact_socket(s, &hello, sizeof(hello))) {
                 closesocket(s);
                 continue;
             }
-            idd_log(d, L"display_protocol=v2 hello_sent=1 host_caps=0x%x hevc_hw_decode=%u max=%ux%u",
+            idd_log(d, L"display_protocol=v2 hello_sent=1 host_caps=0x%x hevc_hw_decode=%u hevc444=%u profile=%s max=%ux%u",
                     hello.capabilities, advertised_hevc ? 1 : 0,
+                    advertised_hevc444 ? 1 : 0,
+                    requested_hevc444 ? L"high_performance" : L"standard",
                     hello.max_width, hello.max_height);
         }
         d->cursor_visible = TRUE;
@@ -2383,6 +2418,25 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                             d->fallback_count);
                     break;
                 }
+                {
+                    const BOOL config_444 =
+                        (config.flags & ASB_DISPLAY_VIDEO_CONFIG_HEVC444) != 0;
+                    const BOOL config_420 =
+                        (config.flags & ASB_DISPLAY_VIDEO_CONFIG_HEVC420) != 0;
+                    if (config_444 == config_420 ||
+                        config_444 != requested_hevc444 ||
+                        (config_444 && !advertised_hevc444) ||
+                        (!config_444 && !config_420) ||
+                        (config_444 && (config.width != 3840 || config.height != 2160 ||
+                                        config.fps_num != 60 || config.fps_den != 1))) {
+                        d->fallback_count++;
+                        idd_log(d, L"display_protocol=v2 display_backend=raw-asfr fallback=1 "
+                                L"fallback_count=%u fallback_reason=profile-mismatch reconnecting=1",
+                                d->fallback_count);
+                        break;
+                    }
+                    d->video_profile = config_444 ? VM_VIDEO_HEVC444 : VM_VIDEO_HEVC420;
+                }
                 if (config.extradata_size) {
                     extradata = (BYTE *)HeapAlloc(GetProcessHeap(), 0,
                                                   config.extradata_size);
@@ -2396,7 +2450,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 if (d->video_decoder) vm_video_decoder_destroy(d->video_decoder);
                 d->video_decoder = vm_video_decoder_create(d->device,
                     config.width, config.height, config.fps_num, config.fps_den,
-                    extradata, config.extradata_size);
+                    extradata, config.extradata_size, d->video_profile);
                 if (d->decoded_tex) {
                     ID3D11Texture2D_Release(d->decoded_tex);
                     d->decoded_tex = NULL;

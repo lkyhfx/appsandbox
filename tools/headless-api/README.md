@@ -191,13 +191,17 @@ methods return `(http_status, body)` so you can branch on the status code.
 
 A **status object** has: `name, osType, state, running, agentOnline,
 installComplete, building, progress, sshState, sshPort, ramMb, hddGb, cpuCores,
-gpuMode, networkMode, displayOpen`.
+gpuMode, displayProfile, activeDisplayProfile, displayProfilePending,
+displayProfileReason, networkMode, displayOpen`. `displayProfile` is `0` for
+Standard and `1` for High Performance (Linux + GPU-PV only). High Performance
+stays pending until the guest applies its 4K60 profile; any required reboot is
+reported explicitly by the guest command response.
 
 ### Lifecycle  *(return `(status, body)`)*
 | Method | Effect |
 |---|---|
 | `create(**cfg)` | create + auto-start (validated; see below) |
-| `edit(name, **fields)` | change config — **VM must be stopped** (else 409) |
+| `edit(name, **fields)` | change config; `displayProfile` may change while running, other fields require a stopped VM |
 | `start(name, snap_index=-1, branch_index=-1, branch_name=None)` | power on; optionally boot a snapshot/branch |
 | `shutdown(name)` | graceful ACPI power-off |
 | `stop(name)` | force power-off (pull the plug) |

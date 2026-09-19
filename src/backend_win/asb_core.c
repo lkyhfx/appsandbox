@@ -103,6 +103,21 @@ ASB_API const wchar_t *asb_validate_gpu_selection(int gpu_mode, const wchar_t *g
     return NULL;
 }
 
+ASB_API const wchar_t *asb_validate_display_profile(const wchar_t *os_type,
+                                                    int gpu_mode, int profile)
+{
+    if (profile != ASB_DISPLAY_PROFILE_STANDARD &&
+        profile != ASB_DISPLAY_PROFILE_HIGH_PERFORMANCE)
+        return L"Invalid display profile.";
+    if (profile == ASB_DISPLAY_PROFILE_HIGH_PERFORMANCE) {
+        if (!os_type || _wcsicmp(os_type, L"Linux") != 0)
+            return L"High Performance display mode requires a Linux guest.";
+        if (gpu_mode == GPU_NONE)
+            return L"High Performance display mode requires GPU-PV.";
+    }
+    return NULL;
+}
+
 /* Prepare the GL mapping-layer Plan9 share for a Windows GPU guest: ensure the
  * D3D mapping layers (OpenCL/Vulkan/dxil) are fetched/cached on the host, stage
  * Mesa's standalone OpenGL trio (opengl32/gallium_wgl/z-1) alongside them, then
@@ -551,6 +566,7 @@ static void save_vm_list(void)
         fwprintf(f, L"CpuCores=%lu\n", g_vms[i].cpu_cores);
         fwprintf(f, L"GpuMode=%d\n", g_vms[i].gpu_mode);
         fwprintf(f, L"GpuName=%s\n", g_vms[i].gpu_name);
+        fwprintf(f, L"DisplayProfile=%d\n", g_vms[i].display_profile);
         if (g_vms[i].gpu_id[0])
             fwprintf(f, L"GpuId=%s\n", g_vms[i].gpu_id);
         fwprintf(f, L"NetworkMode=%d\n", g_vms[i].network_mode);
@@ -646,6 +662,8 @@ static void load_vm_list(void)
             vm = &g_vms[g_vm_count];
             ZeroMemory(vm, sizeof(VmInstance));
             vm->unique_id = g_next_vm_id++;
+            vm->active_display_profile = ASB_DISPLAY_PROFILE_UNKNOWN;
+            vm->display_profile_pending = TRUE;
             g_vm_count++;
             continue;
         }
@@ -701,6 +719,8 @@ static void load_vm_list(void)
             vm->gpu_mode = _wtoi(line + 8);
         else if (wcsncmp(line, L"GpuName=", 8) == 0)
             wcscpy_s(vm->gpu_name, 256, line + 8);
+        else if (wcsncmp(line, L"DisplayProfile=", 15) == 0)
+            vm->display_profile = _wtoi(line + 15);
         else if (wcsncmp(line, L"GpuId=", 6) == 0)
             wcsncpy_s(vm->gpu_id, ARRAYSIZE(vm->gpu_id), line + 6, _TRUNCATE);
         else if (wcsncmp(line, L"GpuDevicePath=", 14) == 0)
@@ -745,6 +765,11 @@ static void load_vm_list(void)
             wchar_t snap_dir[MAX_PATH];
             g_vms[i].handle = NULL;
             g_vms[i].running = FALSE;
+            if (g_vms[i].display_profile != ASB_DISPLAY_PROFILE_STANDARD &&
+                g_vms[i].display_profile != ASB_DISPLAY_PROFILE_HIGH_PERFORMANCE)
+                g_vms[i].display_profile = ASB_DISPLAY_PROFILE_STANDARD;
+            g_vms[i].active_display_profile = ASB_DISPLAY_PROFILE_UNKNOWN;
+            g_vms[i].display_profile_pending = TRUE;
             if (resolve_vm_gpu_selection(&g_vms[i])) gpu_changed = TRUE;
             if (vm_load_state_json(g_vms[i].vhdx_path))
                 g_vms[i].install_complete = TRUE;
@@ -3149,6 +3174,9 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
                                                     config->name, config->is_template);
         if (!error) error = asb_validate_password(effective_os, config->password);
         if (!error) error = asb_validate_gpu_selection(config->gpu_mode, config->gpu_id);
+        if (!error) error = asb_validate_display_profile(effective_os,
+                                                         config->gpu_mode,
+                                                         config->display_profile);
         if (error) {
             asb_log(L"Error: %s", error);
             asb_alert(error);
@@ -3172,6 +3200,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     cfg.hdd_gb = config->hdd_gb;
     cfg.cpu_cores = config->cpu_cores;
     cfg.gpu_mode = config->gpu_mode;
+    cfg.display_profile = config->display_profile;
     if (config->gpu_id && config->gpu_id[0])
         wcscpy_s(cfg.gpu_id, ARRAYSIZE(cfg.gpu_id), find_gpu(config->gpu_id)->interface_path);
     cfg.network_mode = config->network_mode;
@@ -3274,6 +3303,9 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     inst = &g_vms[g_vm_count];
     ZeroMemory(inst, sizeof(VmInstance));
     inst->unique_id = g_next_vm_id++;
+    inst->display_profile = cfg.display_profile;
+    inst->active_display_profile = ASB_DISPLAY_PROFILE_UNKNOWN;
+    inst->display_profile_pending = TRUE;
 
     /* Net adapter */
     if (config->net_adapter && config->net_adapter[0] != L'\0' &&
@@ -3674,6 +3706,7 @@ static HRESULT start_existing_vm(VmInstance *inst, BOOL background)
     args->config.hdd_gb = inst->hdd_gb;
     args->config.cpu_cores = inst->cpu_cores;
     args->config.gpu_mode = inst->gpu_mode;
+    args->config.display_profile = inst->display_profile;
     wcscpy_s(args->config.gpu_id, ARRAYSIZE(args->config.gpu_id), inst->gpu_id);
     args->config.network_mode = inst->network_mode;
     wcscpy_s(args->config.mac_address, ARRAYSIZE(args->config.mac_address), inst->mac_address);
@@ -4037,6 +4070,24 @@ ASB_API int asb_vm_network_mode(AsbVm vm)
     return inst ? inst->network_mode : 0;
 }
 
+ASB_API int asb_vm_display_profile(AsbVm vm)
+{
+    VmInstance *inst = vm_inst(vm);
+    return inst ? inst->display_profile : ASB_DISPLAY_PROFILE_STANDARD;
+}
+
+ASB_API int asb_vm_active_display_profile(AsbVm vm)
+{
+    VmInstance *inst = vm_inst(vm);
+    return inst ? inst->active_display_profile : ASB_DISPLAY_PROFILE_UNKNOWN;
+}
+
+ASB_API BOOL asb_vm_display_profile_pending(AsbVm vm)
+{
+    VmInstance *inst = vm_inst(vm);
+    return inst ? inst->display_profile_pending : FALSE;
+}
+
 ASB_API BOOL asb_vm_ssh_enabled(AsbVm vm)
 {
     VmInstance *inst = vm_inst(vm);
@@ -4108,6 +4159,11 @@ ASB_API HRESULT asb_vm_set_gpu_selection(AsbVm vm, int gpu_mode, const wchar_t *
     if (idx < 0) return E_INVALIDARG;
     if (g_vms[idx].running || g_vms[idx].building_vhdx) return E_ACCESSDENIED;
     if (asb_validate_gpu_selection(gpu_mode, gpu_id)) return E_INVALIDARG;
+    if (gpu_mode == GPU_NONE &&
+        g_vms[idx].display_profile == ASB_DISPLAY_PROFILE_HIGH_PERFORMANCE) {
+        asb_log(L"GPU-PV cannot be disabled while High Performance display mode is selected.");
+        return E_INVALIDARG;
+    }
     g_vms[idx].gpu_mode = gpu_mode;
     wcscpy_s(g_vms[idx].gpu_id, ARRAYSIZE(g_vms[idx].gpu_id),
         gpu_id && gpu_id[0] ? find_gpu(gpu_id)->interface_path : L"");
@@ -4126,6 +4182,30 @@ ASB_API HRESULT asb_vm_set_network(AsbVm vm, int mode)
     g_vms[idx].network_mode = mode;
     save_vm_list();
     if (g_state_cb) g_state_cb(vm, g_vms[idx].running, g_state_ud);
+    return S_OK;
+}
+
+ASB_API HRESULT asb_vm_set_display_profile(AsbVm vm, int profile)
+{
+    int idx = vm_index_of(vm);
+    VmInstance *inst;
+    const wchar_t *error;
+    if (idx < 0) return E_INVALIDARG;
+    inst = &g_vms[idx];
+    error = asb_validate_display_profile(inst->os_type, inst->gpu_mode, profile);
+    if (error) {
+        asb_log(L"Display profile rejected for \"%s\": %s", inst->name, error);
+        return E_INVALIDARG;
+    }
+    /* Unlike resource sizing, this is desired guest state and is safe to
+       change while the VM is running. The agent reconnect path reconciles it. */
+    inst->display_profile = profile;
+    inst->display_profile_pending =
+        inst->active_display_profile != profile;
+    save_vm_list();
+    if (g_state_cb) g_state_cb(vm, inst->running, g_state_ud);
+    if (inst->agent_online)
+        vm_agent_reconcile_display_profile(inst);
     return S_OK;
 }
 

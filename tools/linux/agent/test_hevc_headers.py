@@ -231,12 +231,14 @@ int main() {
         self.assertIn("guest_bitstream_generated", source)
         self.assertIn("guest_encode_failures", source)
 
-    def test_probe_mode_cannot_switch_production_to_444(self):
+    def test_production_wrapper_selects_explicit_profile(self):
         source = Path(__file__).with_name("d3d12-video-encode-probe.cpp").read_text()
         production = Path(__file__).with_name("display_d3d12_encoder.cpp").read_text()
         self.assertNotIn("ASB_D3D12_HEVC444", source)
-        self.assertIn("encode_consumer_main(publisher, EncodeProbeMode::Hevc420)", production)
-        self.assertIn("!production_session && mode == EncodeProbeMode::Hevc444", source)
+        self.assertIn("encode_consumer_main(publisher, mode)", production)
+        self.assertIn('std::strcmp(mode_text, "hevc444")', production)
+        self.assertIn("EncodeProbeMode::Hevc444", production)
+        self.assertNotIn("!production_session && mode == EncodeProbeMode::Hevc444", source)
 
     def test_capability_does_not_claim_sustained_4k60(self):
         source = Path(__file__).with_name("d3d12-video-encode-probe.cpp").read_text()

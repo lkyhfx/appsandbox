@@ -28,6 +28,7 @@
                 <th>RAM (MB)</th>
                 <th>HDD (GB)</th>
                 <th>GPU</th>
+                <th>Display</th>
                 <th>Network</th>
                 <th class="win-only">Snapshot</th>
                 <th class="icon-col">&#x25B6;&#xFE0F;</th>
@@ -131,6 +132,14 @@
                 </select>
             </div>
 
+            <label for="display-profile" class="display-profile-field">Display Mode:</label>
+            <div class="form-row display-profile-field">
+                <select id="display-profile">
+                    <option value="0" selected>Standard — 1920×1080 @ 60 Hz</option>
+                    <option value="1">High Performance — 3840×2160 @ 60 Hz · HEVC 4:4:4</option>
+                </select>
+            </div>
+
             <label for="net-mode" class="windows-host-only">Network:</label>
             <div class="form-row windows-host-only">
                 <select id="net-mode" onchange="onNetModeChange()">
@@ -227,6 +236,14 @@
                         <option value="1">NAT</option>
                         <option value="2">External</option>
                         <option value="3">Internal</option>
+                    </select>
+                </div>
+
+                <label for="edit-display-profile">Display Mode:</label>
+                <div class="form-row">
+                    <select id="edit-display-profile">
+                        <option value="0">Standard — 1920×1080 @ 60 Hz</option>
+                        <option value="1">High Performance — 3840×2160 @ 60 Hz · HEVC 4:4:4</option>
                     </select>
                 </div>
             </div>

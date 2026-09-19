@@ -307,6 +307,10 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_int(jb, L"hddGb", (int)v->hdd_gb);
     jb_int(jb, L"cpuCores", (int)v->cpu_cores);
     jb_int(jb, L"gpuMode", v->gpu_mode);
+    jb_int(jb, L"displayProfile", v->display_profile);
+    jb_int(jb, L"activeDisplayProfile", v->active_display_profile);
+    jb_bool(jb, L"displayProfilePending", v->display_profile_pending);
+    jb_ascii(jb, L"displayProfileReason", v->display_profile_reason);
     jb_string(jb, L"gpuId", v->gpu_id);
     jb_string(jb, L"gpuName", v->gpu_name);
     jb_int(jb, L"networkMode", v->network_mode);
@@ -1081,12 +1085,16 @@ static void on_webview2_message(const wchar_t *json)
         if (json_get_int(json, L"cpuCores", &val)) cfg.cpu_cores = (DWORD)val;
         if (json_get_int(json, L"gpuMode", &val)) cfg.gpu_mode = val;
         if (json_get_int(json, L"networkMode", &val)) cfg.network_mode = val;
+        if (json_get_int(json, L"displayProfile", &val)) cfg.display_profile = val;
         json_get_bool(json, L"testMode", &cfg.test_mode);
         json_get_bool(json, L"sshEnabled", &cfg.ssh_enabled);
         json_get_bool(json, L"sshDeployKey", &cfg.ssh_deploy_key);
 
         {
             const wchar_t *error = asb_validate_gpu_selection(cfg.gpu_mode, cfg.gpu_id);
+            if (!error) error = asb_validate_display_profile(cfg.os_type,
+                                                              cfg.gpu_mode,
+                                                              cfg.display_profile);
             if (error) {
                 SecureZeroMemory(pass_buf, sizeof(pass_buf));
                 ui_show_alert(error);
@@ -1252,7 +1260,8 @@ static void on_webview2_message(const wchar_t *json)
             json_get_string(json, L"field", field, 64) &&
             json_get_string(json, L"value", value, 256)) {
             AsbVm vm = asb_vm_get(idx);
-            if (asb_vm_is_running(vm) || asb_vm_is_building(vm)) {
+            BOOL profile_only = wcscmp(field, L"displayProfile") == 0;
+            if ((asb_vm_is_running(vm) || asb_vm_is_building(vm)) && !profile_only) {
                 ui_show_alert(L"VM settings can only be changed when the VM is stopped and its disk build has finished.");
             } else {
                 HRESULT hr = E_INVALIDARG;
@@ -1271,6 +1280,7 @@ static void on_webview2_message(const wchar_t *json)
                     if (!error) hr = asb_vm_set_gpu_selection(vm, mode, gpu_id);
                 }
                 else if (wcscmp(field, L"networkMode") == 0) hr = asb_vm_set_network(vm, _wtoi(value));
+                else if (profile_only) hr = asb_vm_set_display_profile(vm, _wtoi(value));
                 if (FAILED(hr)) ui_show_alert(error ? error : L"VM configuration could not be updated.");
                 else asb_save();
             }

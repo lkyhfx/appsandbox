@@ -148,14 +148,28 @@ int main(int argc, char **argv)
         char output_text[32];
         std::snprintf(output_text, sizeof(output_text), "%d", output_pair[0]);
         setenv("ASB_D3D12_ENCODED_FD", output_text, 1);
-        bool ok = encode_consumer_main(publisher, EncodeProbeMode::Hevc420);
+        const char *mode_text = std::getenv("APPSANDBOX_DISPLAY_CODEC_MODE");
+        EncodeProbeMode mode = EncodeProbeMode::Hevc420;
+        if (mode_text && !std::strcmp(mode_text, "hevc444"))
+            mode = EncodeProbeMode::Hevc444;
+        else if (mode_text && std::strcmp(mode_text, "hevc420")) {
+            std::fprintf(stderr,
+                         "display_protocol=v2 fallback=1 fallback_reason=unknown-codec-mode\n");
+            close(publisher);
+            shutdown(output_pair[0], SHUT_RDWR);
+            close(output_pair[0]);
+            pump.join();
+            continue;
+        }
+        bool ok = encode_consumer_main(publisher, mode);
         unsetenv("ASB_D3D12_ENCODED_FD");
         close(publisher);
         shutdown(output_pair[0], SHUT_RDWR);
         close(output_pair[0]);
         pump.join();
         std::fprintf(stderr,
-                     "display_protocol=v2 display_backend=hevc-d3d12 session_ended=1 fallback_required=%u status=%s\n",
+                     "display_protocol=v2 display_backend=%s session_ended=1 fallback_required=%u status=%s\n",
+                     mode == EncodeProbeMode::Hevc444 ? "hevc444-d3d12" : "hevc420-d3d12",
                      ok ? 0U : 1U, ok ? "complete" : "failed");
     }
 

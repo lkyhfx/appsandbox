@@ -46,6 +46,11 @@ ASB_API BOOL vm_agent_send(VmInstance *instance, const char *command,
 ASB_API BOOL vm_agent_request(VmInstance *instance, const char *command,
                               char *response, int response_max, DWORD timeout_ms);
 
+/* Reconcile the persisted desired display profile with a profile-capable
+   guest. Safe to call from the UI or a worker; it preserves pending state and
+   never falls back from High Performance to HEVC420 silently. */
+ASB_API void vm_agent_reconcile_display_profile(VmInstance *instance);
+
 /* Post an agent/update status notification to the registered UI window. */
 void vm_agent_notify_status(VmInstance *instance);
 

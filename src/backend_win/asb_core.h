@@ -43,6 +43,10 @@ typedef struct AsbDisplay AsbDisplay;
 #define ASB_NET_EXTERNAL 2
 #define ASB_NET_INTERNAL 3
 
+#define ASB_DISPLAY_PROFILE_STANDARD         0
+#define ASB_DISPLAY_PROFILE_HIGH_PERFORMANCE 1
+#define ASB_DISPLAY_PROFILE_UNKNOWN         (-1)
+
 /* ---- VM configuration (for creating a new VM) ---- */
 
 typedef struct {
@@ -64,6 +68,7 @@ typedef struct {
     BOOL   is_template;            /* TRUE = create as template VM */
     const wchar_t *disk_directory; /* parent for a new VM folder; NULL/empty = default */
     const wchar_t *gpu_id;
+    int    display_profile;
 } AsbVmConfig;
 
 /* ---- Snapshot/branch info (returned by query functions) ---- */
@@ -188,6 +193,9 @@ ASB_API DWORD   asb_vm_hdd_gb(AsbVm vm);
 ASB_API DWORD   asb_vm_cpu_cores(AsbVm vm);
 ASB_API int     asb_vm_gpu_mode(AsbVm vm);
 ASB_API int     asb_vm_network_mode(AsbVm vm);
+ASB_API int     asb_vm_display_profile(AsbVm vm);
+ASB_API int     asb_vm_active_display_profile(AsbVm vm);
+ASB_API BOOL    asb_vm_display_profile_pending(AsbVm vm);
 ASB_API BOOL    asb_vm_ssh_enabled(AsbVm vm);
 ASB_API DWORD   asb_vm_ssh_port(AsbVm vm);
 
@@ -199,6 +207,9 @@ ASB_API HRESULT asb_vm_set_cpu(AsbVm vm, DWORD cores);
 ASB_API HRESULT asb_vm_set_gpu(AsbVm vm, int gpu_mode);
 ASB_API HRESULT asb_vm_set_gpu_selection(AsbVm vm, int gpu_mode, const wchar_t *gpu_id);
 ASB_API HRESULT asb_vm_set_network(AsbVm vm, int mode);
+ASB_API HRESULT asb_vm_set_display_profile(AsbVm vm, int profile);
+ASB_API const wchar_t *asb_validate_display_profile(const wchar_t *os_type,
+                                                    int gpu_mode, int profile);
 
 /* ---- Snapshots ---- */
 
