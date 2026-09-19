@@ -2907,6 +2907,21 @@ int wmain(int argc, wchar_t *argv[])
         return do_prefetch_repo(branch, out_dir);
     }
 
+    if (_wcsicmp(argv[1], L"--prefetch-release") == 0) {
+        const wchar_t *resources_dir = NULL, *out_dir = NULL;
+        for (int i = 2; i < argc; i++) {
+            if (_wcsicmp(argv[i], L"--resources-dir") == 0 && i + 1 < argc)
+                resources_dir = argv[++i];
+            else if (_wcsicmp(argv[i], L"--out-dir") == 0 && i + 1 < argc)
+                out_dir = argv[++i];
+        }
+        if (!resources_dir || !out_dir) {
+            log_err(L"--prefetch-release requires --resources-dir and --out-dir");
+            return 1;
+        }
+        return do_prefetch_release(resources_dir, out_dir);
+    }
+
     if (_wcsicmp(argv[1], L"--prefetch-wsl-deps") == 0) {
         const wchar_t *out_dir = NULL;
         for (int i = 2; i < argc; i++) {

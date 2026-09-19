@@ -18,6 +18,7 @@
 #define _GNU_SOURCE
 
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <openssl/evp.h>
@@ -49,6 +50,8 @@
 #define UPDATE_PORT            9
 #define UPDATE_MAX_BUNDLE     (512ULL * 1024ULL * 1024ULL)
 #define UPDATE_MAX_MANIFEST   (4ULL * 1024ULL * 1024ULL)
+#define UPDATE_MAX_UNCOMPRESSED (2ULL * 1024ULL * 1024ULL * 1024ULL)
+#define UPDATE_MAX_FILE_SIZE  (512ULL * 1024ULL * 1024ULL)
 #define UPDATE_MAX_FILES      4096
 #define UPDATE_HEALTH_SECONDS 90
 
@@ -60,14 +63,11 @@
 #define BUNDLE_ROOT            STATE_ROOT "/bundles"
 #define UPDATER_PATH           "/usr/local/libexec/appsandbox-guest-updater"
 
-/* Build systems should replace this with the release-signing public key:
- *   make UPDATE_PUBLIC_KEY_HEX=<64 hex chars>
- * The checked-in value is a real Ed25519 public key (RFC 8032 test vector),
- * never a magic all-zero key.  It has no corresponding private key in this
- * repository. */
+/* Build systems must inject the release-signing public key.  There is
+ * intentionally no checked-in fallback: a build without an explicit trust
+ * anchor must fail rather than silently producing a test build. */
 #ifndef ASB_UPDATE_PUBLIC_KEY_HEX
-#define ASB_UPDATE_PUBLIC_KEY_HEX \
-    "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+#error "ASB_UPDATE_PUBLIC_KEY_HEX must be supplied by the release build"
 #endif
 
 #pragma pack(push, 1)
@@ -125,10 +125,17 @@ typedef struct UpdateState {
     char sha256[65];
     char previous[PATH_MAX];
     char target[PATH_MAX];
+    char old_runtime_target[PATH_MAX];
+    char new_runtime_target[PATH_MAX];
+    char old_graphics_target[PATH_MAX];
+    char new_graphics_target[PATH_MAX];
+    char old_config_backup[PATH_MAX];
     char error[160];
     uint64_t bundle_size;
     uint64_t deadline;
     int reboot_required;
+    int runtime_changed;
+    int graphics_changed;
 } UpdateState;
 
 static int write_all(int fd, const void *data, size_t len)
@@ -430,8 +437,9 @@ static int parse_manifest(const unsigned char *data, size_t len, Manifest *m)
     t = calloc(8192, sizeof(*t));
     if (!t) return -1;
     nt = json_tokenize((const char *)data, len, t, 8192);
-    root = nt > 0 ? 0 : -1;
-    if (nt < 0 || t[root].type != 1 || t[root].start != 0 || t[root].end != (int)len)
+    root = 0;
+    if (nt <= 0 || t[root].type != 1 || t[root].start != 0 ||
+        t[root].end != (int)len)
         goto fail;
     v = object_value((const char *)data, t, nt, root, "schema");
     if (v < 0 || token_u64((const char *)data, &t[v], &u) < 0 || u != UPDATE_SCHEMA) goto fail;
@@ -508,31 +516,108 @@ static int valid_id(const char *s)
     return 1;
 }
 
+typedef struct ParsedVersion {
+    unsigned long long major;
+    unsigned long long minor;
+    unsigned long long patch;
+    char prerelease[64];
+} ParsedVersion;
+
+static int parse_version(const char *s, ParsedVersion *out)
+{
+    const char *p = s;
+    char *end;
+    unsigned long long *parts[3];
+    int i;
+    if (!s || !out || !*s || strlen(s) >= 96) return -1;
+    memset(out, 0, sizeof(*out));
+    parts[0] = &out->major; parts[1] = &out->minor; parts[2] = &out->patch;
+    for (i = 0; i < 3; i++) {
+        const char *start = p;
+        if (*p < '0' || *p > '9') return -1;
+        if (*p == '0' && p[1] >= '0' && p[1] <= '9') return -1;
+        errno = 0;
+        *parts[i] = strtoull(p, &end, 10);
+        if (errno || end == p || (unsigned long long)*parts[i] > UINT_MAX) return -1;
+        p = end;
+        if (i < 2) {
+            if (*p != '.') return -1;
+            p++;
+        }
+        if (p == start) return -1;
+    }
+    if (*p == '-') {
+        size_t n;
+        const char *start = ++p;
+        while (*p && *p != '+') {
+            if (!((*p >= '0' && *p <= '9') || (*p >= 'A' && *p <= 'Z') ||
+                  (*p >= 'a' && *p <= 'z') || *p == '.' || *p == '-')) return -1;
+            p++;
+        }
+        n = (size_t)(p - start);
+        if (!n || n >= sizeof(out->prerelease)) return -1;
+        memcpy(out->prerelease, start, n); out->prerelease[n] = 0;
+    }
+    if (*p == '+') {
+        p++;
+        if (!*p) return -1;
+        while (*p) {
+            if (!((*p >= '0' && *p <= '9') || (*p >= 'A' && *p <= 'Z') ||
+                  (*p >= 'a' && *p <= 'z') || *p == '.' || *p == '-')) return -1;
+            p++;
+        }
+    }
+    return *p == 0 ? 0 : -1;
+}
+
 static int valid_version(const char *s)
 {
-    size_t i, n;
-    if (!s || !s[0] || strlen(s) >= 96 || s[0] == '.' || s[0] == '-') return 0;
-    n = strlen(s);
-    for (i = 0; i < n; i++)
-        if (!((s[i] >= '0' && s[i] <= '9') || s[i] == '.' || s[i] == '-' ||
-              (s[i] >= 'a' && s[i] <= 'z') || (s[i] >= 'A' && s[i] <= 'Z')))
-            return 0;
-    return 1;
+    ParsedVersion v;
+    return parse_version(s, &v) == 0;
+}
+
+static int prerelease_cmp(const char *a, const char *b)
+{
+    char ac[64], bc[64], *as, *bs, *ae, *be;
+    if (!a[0] && !b[0]) return 0;
+    if (!a[0]) return 1;
+    if (!b[0]) return -1;
+    snprintf(ac, sizeof(ac), "%s", a); snprintf(bc, sizeof(bc), "%s", b);
+    as = ac; bs = bc;
+    for (;;) {
+        unsigned long long av, bv;
+        int anumeric = 1, bnumeric = 1;
+        ae = strchr(as, '.'); if (ae) *ae++ = 0;
+        be = strchr(bs, '.'); if (be) *be++ = 0;
+        for (char *p = as; *p; p++) if (*p < '0' || *p > '9') anumeric = 0;
+        for (char *p = bs; *p; p++) if (*p < '0' || *p > '9') bnumeric = 0;
+        if (anumeric && bnumeric) {
+            errno = 0; av = strtoull(as, NULL, 10); if (errno) return 0;
+            errno = 0; bv = strtoull(bs, NULL, 10); if (errno) return 0;
+            if (av != bv) return av > bv ? 1 : -1;
+        } else if (anumeric != bnumeric) {
+            return anumeric ? -1 : 1;
+        } else {
+            int c = strcmp(as, bs); if (c) return c > 0 ? 1 : -1;
+        }
+        if (!ae || !be) {
+            if (!ae && !be) return 0;
+            return !ae ? -1 : 1;
+        }
+        as = ae; bs = be;
+    }
 }
 
 static int version_cmp(const char *a, const char *b)
 {
-    unsigned long av[3] = {0}, bv[3] = {0};
-    int ai = 0, bi = 0;
-    const char *p;
-    for (p = a; *p && ai < 3; p++) {
-        if (*p == '.') ai++; else if (*p >= '0' && *p <= '9') av[ai] = av[ai] * 10 + (unsigned)(*p - '0');
-    }
-    for (p = b; *p && bi < 3; p++) {
-        if (*p == '.') bi++; else if (*p >= '0' && *p <= '9') bv[bi] = bv[bi] * 10 + (unsigned)(*p - '0');
-    }
-    for (ai = 0; ai < 3; ai++) if (av[ai] != bv[ai]) return av[ai] > bv[ai] ? 1 : -1;
-    return 0;
+    ParsedVersion av, bv;
+    int c;
+    if (parse_version(a, &av) < 0 || parse_version(b, &bv) < 0) return 0;
+    if (av.major != bv.major) return av.major > bv.major ? 1 : -1;
+    if (av.minor != bv.minor) return av.minor > bv.minor ? 1 : -1;
+    if (av.patch != bv.patch) return av.patch > bv.patch ? 1 : -1;
+    c = prerelease_cmp(av.prerelease, bv.prerelease);
+    return c;
 }
 
 static int hex_decode(const char *s, unsigned char *out, size_t out_len)
@@ -564,6 +649,24 @@ static void hex_encode(const unsigned char *data, size_t len, char *out)
     out[len * 2] = '\0';
 }
 
+static int public_key_is_valid(unsigned char key[32])
+{
+    static const unsigned char zero[32] = {0};
+    /* RFC 8032 Ed25519 test vector 1.  It is intentionally rejected even
+     * when a caller bypasses the Makefile validation. */
+    static const unsigned char known_test[32] = {
+        0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7,
+        0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a,
+        0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25,
+        0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07, 0x51, 0x1a
+    };
+    /* Do not accept an all-zero key or a known public test vector as a
+     * release trust anchor.  The Makefile performs the exact text-level
+     * validation; this is the runtime defense-in-depth check. */
+    return memcmp(key, zero, sizeof(zero)) != 0 &&
+           memcmp(key, known_test, sizeof(known_test)) != 0;
+}
+
 static int verify_signature(const unsigned char *manifest, size_t manifest_len,
                             const unsigned char *sig_data, size_t sig_len)
 {
@@ -572,7 +675,9 @@ static int verify_signature(const unsigned char *manifest, size_t manifest_len,
     EVP_MD_CTX *ctx = NULL;
     char sig_hex[129];
     int ok = -1;
-    if (hex_decode(ASB_UPDATE_PUBLIC_KEY_HEX, public_key, sizeof(public_key)) < 0) return -1;
+    if (strlen(ASB_UPDATE_PUBLIC_KEY_HEX) != 64 ||
+        hex_decode(ASB_UPDATE_PUBLIC_KEY_HEX, public_key, sizeof(public_key)) < 0 ||
+        !public_key_is_valid(public_key)) return -1;
     if (sig_len == sizeof(signature)) memcpy(signature, sig_data, sizeof(signature));
     else {
         size_t i = 0;
@@ -706,6 +811,7 @@ static int extract_bundle(const char *bundle, const char *stage,
 {
     int zfd = -1, status, done_blocks = 0, count = 0, fd = -1;
     pid_t zpid = 0;
+    uint64_t uncompressed_total = 0;
     unsigned char block[512];
     char payload_root[PATH_MAX];
     if (snprintf(payload_root, sizeof(payload_root), "%s/payload", stage) >= (int)sizeof(payload_root)) return -1;
@@ -714,7 +820,6 @@ static int extract_bundle(const char *bundle, const char *stage,
         char path[PATH_MAX], rel[PATH_MAX];
         uint64_t size, left;
         unsigned char type;
-        int fd = -1;
         if (read_all(zfd, block, sizeof(block)) < 0) goto fail;
         {
             int zero = 1; size_t i;
@@ -724,7 +829,9 @@ static int extract_bundle(const char *bundle, const char *stage,
         done_blocks = 0;
         type = block[156] ? block[156] : '0';
         if (tar_path(block, path, sizeof(path)) < 0 || tar_octal(block + 124, 12, &size) < 0 ||
-            size > UPDATE_MAX_BUNDLE) goto fail;
+            size > UPDATE_MAX_FILE_SIZE ||
+            uncompressed_total > UPDATE_MAX_UNCOMPRESSED - size) goto fail;
+        uncompressed_total += size;
         /* GNU tar commonly writes directory names with a trailing slash;
          * normalize that one harmless representation before applying the
          * strict relative-path checks. */
@@ -845,9 +952,10 @@ static int read_os_tuple(char *out, size_t cap)
 }
 
 static int verify_payload(const Manifest *m, const char *stage,
-                          const ExtractedFile *extracted, int extracted_count)
+                           const ExtractedFile *extracted, int extracted_count)
 {
     int i, j;
+    uint64_t declared_total = 0;
     char path[PATH_MAX], payload_root[PATH_MAX];
     if (snprintf(payload_root, sizeof(payload_root), "%s/payload", stage) >= (int)sizeof(payload_root)) return -1;
     if (!valid_version(m->version) || strcmp(m->arch, "amd64") != 0 ||
@@ -856,6 +964,9 @@ static int verify_payload(const Manifest *m, const char *stage,
         return -1;
     for (i = 0; i < m->file_count; i++) {
         const PayloadFile *f = &m->files[i];
+        if (f->size > UPDATE_MAX_FILE_SIZE || declared_total > UPDATE_MAX_UNCOMPRESSED - f->size)
+            return -1;
+        declared_total += f->size;
         if (strstr(f->path, "..") || !strcmp(f->component, "kernel") ||
             strstr(f->path, "dxgkrnl") || strstr(f->path, "asb_drm.ko") ||
             join_path(path, sizeof(path), payload_root, f->path) < 0 ||
@@ -884,11 +995,19 @@ static int read_state(UpdateState *s)
     } while (0)
     STATE_STR("state", s->state); STATE_STR("txid", s->txid); STATE_STR("version", s->version);
     STATE_STR("graphics_version", s->graphics_version); STATE_STR("sha256", s->sha256);
-    STATE_STR("previous", s->previous); STATE_STR("target", s->target); STATE_STR("error", s->error);
+    STATE_STR("previous", s->previous); STATE_STR("target", s->target);
+    STATE_STR("old_runtime_target", s->old_runtime_target);
+    STATE_STR("new_runtime_target", s->new_runtime_target);
+    STATE_STR("old_graphics_target", s->old_graphics_target);
+    STATE_STR("new_graphics_target", s->new_graphics_target);
+    STATE_STR("old_config_backup", s->old_config_backup);
+    STATE_STR("error", s->error);
 #undef STATE_STR
     p = strstr((char *)data, "\"bundle_size\":"); if (p) s->bundle_size = strtoull(p + 14, NULL, 10);
     p = strstr((char *)data, "\"deadline\":"); if (p) s->deadline = strtoull(p + 11, NULL, 10);
     p = strstr((char *)data, "\"reboot_required\":true"); s->reboot_required = p != NULL;
+    p = strstr((char *)data, "\"runtime_changed\":true"); s->runtime_changed = p != NULL;
+    p = strstr((char *)data, "\"graphics_changed\":true"); s->graphics_changed = p != NULL;
     free(data);
     return s->state[0] ? 0 : -1;
 }
@@ -899,11 +1018,19 @@ static int write_state(const UpdateState *s)
     int n = snprintf(buf, sizeof(buf),
         "{\"schema\":1,\"state\":\"%s\",\"txid\":\"%s\",\"version\":\"%s\","
         "\"graphics_version\":\"%s\",\"sha256\":\"%s\",\"bundle_size\":%llu,"
-        "\"previous\":\"%s\",\"target\":\"%s\",\"deadline\":%llu,"
-        "\"reboot_required\":%s,\"error\":\"%s\"}\n",
+        "\"previous\":\"%s\",\"target\":\"%s\","
+        "\"old_runtime_target\":\"%s\",\"new_runtime_target\":\"%s\","
+        "\"old_graphics_target\":\"%s\",\"new_graphics_target\":\"%s\","
+        "\"old_config_backup\":\"%s\",\"deadline\":%llu,"
+        "\"reboot_required\":%s,\"runtime_changed\":%s,\"graphics_changed\":%s,"
+        "\"error\":\"%s\"}\n",
         s->state, s->txid, s->version, s->graphics_version, s->sha256,
         (unsigned long long)s->bundle_size, s->previous, s->target,
-        (unsigned long long)s->deadline, s->reboot_required ? "true" : "false", s->error);
+        s->old_runtime_target, s->new_runtime_target, s->old_graphics_target,
+        s->new_graphics_target, s->old_config_backup,
+        (unsigned long long)s->deadline, s->reboot_required ? "true" : "false",
+        s->runtime_changed ? "true" : "false", s->graphics_changed ? "true" : "false",
+        s->error);
     if (n < 0 || n >= (int)sizeof(buf)) return -1;
     return atomic_write_file(STATE_FILE, buf, (size_t)n, 0600);
 }
@@ -938,10 +1065,33 @@ static int current_target(char *out, size_t cap)
     return !strncmp(out, "releases/", 9) && !strstr(out, "..") ? 0 : -1;
 }
 
+static int read_current_version(char *out, size_t cap)
+{
+    unsigned char *data = NULL;
+    size_t len = 0;
+    char value[96] = {0};
+    char *p, *e;
+    if (file_read_limited(UPDATE_ROOT "/current/RELEASE", &data, &len, 4096) < 0)
+        return -1;
+    p = strstr((char *)data, "version=");
+    if (!p) { free(data); return -1; }
+    p += 8;
+    e = strchr(p, '\n');
+    if (e) *e = 0;
+    if (snprintf(value, sizeof(value), "%s", p) >= (int)sizeof(value) ||
+        !valid_version(value) || snprintf(out, cap, "%s", value) >= (int)cap) {
+        free(data);
+        return -1;
+    }
+    free(data);
+    return 0;
+}
+
 static int absolute_symlink(const char *link_path, const char *target)
 {
     char tmp[PATH_MAX];
-    if (!target || target[0] != '/' || strstr(target, "..")) return -1;
+    if (!target || target[0] != '/' || strstr(target, "..") ||
+        strncmp(target, UPDATE_ROOT "/current/", strlen(UPDATE_ROOT "/current/"))) return -1;
     if (snprintf(tmp, sizeof(tmp), "%s.new.%ld", link_path, (long)getpid()) >= (int)sizeof(tmp)) return -1;
     unlink(tmp);
     if (symlink(target, tmp) < 0 || rename(tmp, link_path) < 0) { unlink(tmp); return -1; }
@@ -961,6 +1111,7 @@ static int extract_graphics(const char *archive, const char *version, const char
 {
     int zfd = -1, status, zeros = 0, fd = -1;
     pid_t zpid = 0;
+    uint64_t uncompressed_total = 0;
     unsigned char block[512];
     char stage[PATH_MAX], final[PATH_MAX];
     if (!valid_version(version) || snprintf(stage, sizeof(stage), "/opt/wsl-mesa/.staging-%s", txid) >= (int)sizeof(stage) ||
@@ -978,7 +1129,10 @@ static int extract_graphics(const char *archive, const char *version, const char
         zeros = 0;
         type = block[156] ? block[156] : '0';
         if (tar_path(block, path, sizeof(path)) < 0 ||
-            tar_octal(block + 124, 12, &size) < 0 || tar_octal(block + 100, 8, &mode) < 0) goto fail;
+            tar_octal(block + 124, 12, &size) < 0 || tar_octal(block + 100, 8, &mode) < 0 ||
+            size > UPDATE_MAX_FILE_SIZE ||
+            uncompressed_total > UPDATE_MAX_UNCOMPRESSED - size) goto fail;
+        uncompressed_total += size;
         if (type == '5' && path[0] && path[strlen(path) - 1] == '/')
             path[strlen(path) - 1] = '\0';
         if (!safe_relpath(path)) goto fail;
@@ -1005,6 +1159,12 @@ static int extract_graphics(const char *archive, const char *version, const char
         if (fchmod(fd, (mode_t)(mode & 0777)) < 0 || fsync(fd) < 0 || close(fd) < 0) { fd = -1; goto fail; }
         fd = -1;
         if (skip_bytes(zfd, (512 - (size % 512)) % 512) < 0) goto fail;
+    }
+    {
+        char marker[PATH_MAX];
+        if (append_path(marker, sizeof(marker), stage, "/GRAPHICS") < 0 ||
+            atomic_write_file(marker, version, strlen(version) + 1, 0644) < 0)
+            goto fail;
     }
     close(zfd);
     if (waitpid(zpid, &status, 0) != zpid || !WIFEXITED(status) || WEXITSTATUS(status) != 0 || rename(stage, final) < 0)
@@ -1065,7 +1225,7 @@ static int install_release_integrations(const char *release)
     return 0;
 }
 
-static int install_runtime_links(const char *release)
+static int install_runtime_links(void)
 {
     static const char *bins[] = {"appsandbox-agent", "appsandbox-display", "appsandbox-input",
                                  "appsandbox-audio", "appsandbox-clipboard"};
@@ -1073,11 +1233,11 @@ static int install_runtime_links(const char *release)
     char link[PATH_MAX], target[PATH_MAX];
     for (i = 0; i < sizeof(bins) / sizeof(bins[0]); i++) {
         snprintf(link, sizeof(link), "/usr/local/bin/%s", bins[i]);
-        snprintf(target, sizeof(target), "%s/bin/%s", release, bins[i]);
+        snprintf(target, sizeof(target), UPDATE_ROOT "/current/bin/%s", bins[i]);
         if (access(target, X_OK) == 0 && absolute_symlink(link, target) < 0) return -1;
     }
     snprintf(link, sizeof(link), "/usr/local/libexec/appsandbox-display-d3d12");
-    snprintf(target, sizeof(target), "%s/libexec/appsandbox-display-d3d12", release);
+    snprintf(target, sizeof(target), UPDATE_ROOT "/current/libexec/appsandbox-display-d3d12");
     if (access(target, X_OK) == 0 && absolute_symlink(link, target) < 0) return -1;
     return 0;
 }
@@ -1109,12 +1269,224 @@ static int service_active(const char *unit)
     return run_fixed(argv) == 0;
 }
 
+typedef struct HealthResult {
+    int agent_active;
+    int display_active;
+    int d3d12_helper_active;
+    int dxg_present;
+    int mutter_active;
+    int shared_path_initialized;
+    int encoder_initialized;
+    int native_d3d12_shared;
+    int gpu_copy;
+    int cpu_copy;
+    int cpu_conversion;
+    int framebuffer_mmap;
+    int cpu_memcpy_framebuffer;
+    int gpu_cpu_gpu;
+    int stale_frames;
+    int mismatches;
+    int encode_failures;
+    char configured_resolution[64];
+    char graphics_version[96];
+} HealthResult;
+
+static int health_probe_flag(const char *name, int fallback)
+{
+    unsigned char *data = NULL;
+    size_t len = 0;
+    char needle[64];
+    int result = fallback;
+    if (file_read_limited("/run/appsandbox/display-d3d12.health", &data, &len, 65536) < 0)
+        return fallback;
+    snprintf(needle, sizeof(needle), "%s=1", name);
+    if (strstr((char *)data, needle) || (snprintf(needle, sizeof(needle), "\"%s\":1", name),
+                                        strstr((char *)data, needle))) result = 1;
+    else {
+        snprintf(needle, sizeof(needle), "%s=0", name);
+        if (strstr((char *)data, needle)) result = 0;
+    }
+    free(data);
+    return result;
+}
+
+static int any_wayland_session(void)
+{
+    DIR *d = opendir("/run/user");
+    struct dirent *entry;
+    if (!d) return 0;
+    while ((entry = readdir(d)) != NULL) {
+        char path[PATH_MAX];
+        if (entry->d_name[0] < '0' || entry->d_name[0] > '9') continue;
+        if (snprintf(path, sizeof(path), "/run/user/%s/wayland-0", entry->d_name) < (int)sizeof(path) &&
+            access(path, F_OK) == 0) {
+            closedir(d);
+            return 1;
+        }
+    }
+    closedir(d);
+    return 0;
+}
+
+static void health_collect(HealthResult *h)
+{
+    unsigned char *data = NULL;
+    size_t len = 0;
+    char *p;
+    int width = 0, height = 0, refresh = 0;
+    memset(h, 0, sizeof(*h));
+    h->agent_active = service_active("appsandbox-agent.service");
+    h->display_active = service_active("appsandbox-display.service");
+    h->dxg_present = access("/dev/dxg", F_OK) == 0;
+    h->d3d12_helper_active = access("/etc/systemd/system/appsandbox-display-d3d12.service", F_OK) == 0 ?
+        service_active("appsandbox-display-d3d12.service") : 0;
+    h->mutter_active = any_wayland_session();
+    h->shared_path_initialized = access("/opt/wsl-mesa/current", F_OK) == 0;
+    h->encoder_initialized = h->d3d12_helper_active || access("/run/appsandbox/display-d3d12.sock", F_OK) == 0;
+    snprintf(h->configured_resolution, sizeof(h->configured_resolution), "unknown");
+    if (file_read_limited("/etc/modprobe.d/asb_drm.conf", &data, &len, 65536) == 0) {
+        p = strstr((char *)data, "width="); if (p) width = atoi(p + 6);
+        p = strstr((char *)data, "height="); if (p) height = atoi(p + 7);
+        p = strstr((char *)data, "refresh="); if (p) refresh = atoi(p + 8);
+        if (width > 0 && height > 0)
+            snprintf(h->configured_resolution, sizeof(h->configured_resolution),
+                     refresh > 0 ? "%dx%d@%d" : "%dx%d", width, height, refresh);
+        free(data);
+    }
+    snprintf(h->graphics_version, sizeof(h->graphics_version), "unknown");
+    if (file_read_limited("/opt/wsl-mesa/current/GRAPHICS", &data, &len, 256) == 0) {
+        sscanf((char *)data, "%95[0-9A-Za-z.+-]", h->graphics_version);
+        free(data); data = NULL;
+    } else if (file_read_limited(UPDATE_ROOT "/current/RELEASE", &data, &len, 4096) == 0) {
+        p = strstr((char *)data, "graphics_version=");
+        if (p) sscanf(p + 17, "%95[0-9A-Za-z.+-]", h->graphics_version);
+        free(data);
+    }
+    h->native_d3d12_shared = health_probe_flag("native_d3d12_shared", 0);
+    h->gpu_copy = health_probe_flag("gpu_copy", 0);
+    h->cpu_copy = health_probe_flag("cpu_copy", 0);
+    h->cpu_conversion = health_probe_flag("cpu_conversion", 0);
+    h->framebuffer_mmap = health_probe_flag("framebuffer_mmap", 0);
+    h->cpu_memcpy_framebuffer = health_probe_flag("cpu_memcpy_framebuffer", 0);
+    h->gpu_cpu_gpu = health_probe_flag("gpu_cpu_gpu", 0);
+    h->stale_frames = health_probe_flag("stale_frames", 0);
+    h->mismatches = health_probe_flag("mismatches", 0);
+    h->encode_failures = health_probe_flag("encode_failures", 0);
+}
+
 static int health_check(void)
 {
-    if (!service_active("appsandbox-agent.service") || !service_active("appsandbox-display.service")) return -1;
-    if (access("/dev/dxg", F_OK) == 0 && access("/etc/systemd/system/appsandbox-display-d3d12.service", F_OK) == 0 &&
-        !service_active("appsandbox-display-d3d12.service")) return -1;
+    HealthResult h;
+    health_collect(&h);
+    if (!h.agent_active || !h.display_active) return -1;
+    if (h.dxg_present && access("/etc/systemd/system/appsandbox-display-d3d12.service", F_OK) == 0 &&
+        !h.d3d12_helper_active) return -1;
     return 0;
+}
+
+static int health_main(void)
+{
+    HealthResult h;
+    health_collect(&h);
+    printf("{\"agent_active\":%d,\"display_active\":%d,\"d3d12_helper_active\":%d,"
+           "\"dxg_present\":%d,\"mutter_active\":%d,\"configured_resolution\":\"%s\","
+           "\"graphics_version\":\"%s\",\"shared_path_initialized\":%d,"
+           "\"encoder_initialized\":%d,\"native_d3d12_shared\":%d,\"gpu_copy\":%d,"
+           "\"cpu_copy\":%d,\"cpu_conversion\":%d,\"framebuffer_mmap\":%d,"
+           "\"cpu_memcpy_framebuffer\":%d,\"gpu_cpu_gpu\":%d,\"stale_frames\":%d,"
+           "\"mismatches\":%d,\"encode_failures\":%d}\n",
+           h.agent_active, h.display_active, h.d3d12_helper_active, h.dxg_present,
+           h.mutter_active, h.configured_resolution, h.graphics_version,
+           h.shared_path_initialized, h.encoder_initialized, h.native_d3d12_shared,
+           h.gpu_copy, h.cpu_copy, h.cpu_conversion, h.framebuffer_mmap,
+           h.cpu_memcpy_framebuffer, h.gpu_cpu_gpu, h.stale_frames, h.mismatches,
+           h.encode_failures);
+    return 0;
+}
+
+static int backup_live_config(UpdateState *s)
+{
+    unsigned char *data = NULL;
+    size_t len = 0;
+    char path[PATH_MAX];
+    if (access("/etc/modprobe.d/asb_drm.conf", F_OK) != 0) {
+        s->old_config_backup[0] = 0;
+        return 0;
+    }
+    if (file_read_limited("/etc/modprobe.d/asb_drm.conf", &data, &len, 65536) < 0 ||
+        snprintf(path, sizeof(path), "%s/%s.asb_drm.conf", STATE_ROOT, s->txid) >= (int)sizeof(path) ||
+        atomic_write_file(path, data, len, 0600) < 0) {
+        free(data);
+        return -1;
+    }
+    free(data);
+    snprintf(s->old_config_backup, sizeof(s->old_config_backup), "%s", path);
+    return 0;
+}
+
+static int restore_config(const UpdateState *s, const char *old_release)
+{
+    char config[PATH_MAX];
+    if (s->old_config_backup[0] && access(s->old_config_backup, R_OK) == 0)
+        return install_config_file(s->old_config_backup, "/etc/modprobe.d/asb_drm.conf");
+    if (old_release && old_release[0] &&
+        append_path(config, sizeof(config), old_release, "/config/asb_drm.conf") < 0)
+        return -1;
+    if (old_release && old_release[0] && access(config, R_OK) == 0)
+        return install_config_file(config, "/etc/modprobe.d/asb_drm.conf");
+    if (unlink("/etc/modprobe.d/asb_drm.conf") < 0 && errno != ENOENT) return -1;
+    return fsync_parent("/etc/modprobe.d/asb_drm.conf");
+}
+
+static int restore_activation_locked(UpdateState *s, const char *reason)
+{
+    char current[PATH_MAX], old_release[PATH_MAX];
+    int runtime_owned = 0, graphics_owned = 0;
+
+    if (s->runtime_changed) {
+        if (current_target(current, sizeof(current)) == 0) {
+            if (s->new_runtime_target[0] && !strcmp(current, s->new_runtime_target)) {
+                runtime_owned = 1;
+            } else if (s->old_runtime_target[0] && !strcmp(current, s->old_runtime_target)) {
+                runtime_owned = 0;
+            } else {
+                return -1; /* a later transaction owns the live pointer */
+            }
+        } else if (s->old_runtime_target[0]) {
+            return -1;
+        }
+        if (runtime_owned && s->old_runtime_target[0] &&
+            replace_symlink(UPDATE_ROOT "/current", s->old_runtime_target) < 0)
+            return -1;
+        if (s->old_runtime_target[0]) {
+            if (snprintf(old_release, sizeof(old_release), "%s/%s", UPDATE_ROOT,
+                         s->old_runtime_target) >= (int)sizeof(old_release) ||
+                install_release_integrations(old_release) < 0 ||
+                restore_config(s, old_release) < 0 || install_runtime_links() < 0)
+                return -1;
+        } else if (restore_config(s, NULL) < 0) {
+            return -1;
+        }
+    }
+
+    if (s->graphics_changed) {
+        char graphics[PATH_MAX];
+        if (graphics_target(graphics, sizeof(graphics)) == 0) {
+            if (s->new_graphics_target[0] && !strcmp(graphics, s->new_graphics_target)) {
+                graphics_owned = 1;
+            } else if (s->old_graphics_target[0] && !strcmp(graphics, s->old_graphics_target)) {
+                graphics_owned = 0;
+            } else {
+                return -1;
+            }
+        }
+        if (graphics_owned && s->old_graphics_target[0] &&
+            replace_symlink("/opt/wsl-mesa/current", s->old_graphics_target) < 0)
+            return -1;
+    }
+    strcpy(s->state, "rollback");
+    snprintf(s->error, sizeof(s->error), "%s", reason ? reason : "activation_failed");
+    return write_state(s);
 }
 
 static int apply_update(const char *txid)
@@ -1125,10 +1497,13 @@ static int apply_update(const char *txid)
     size_t manifest_len = 0, signature_len = 0;
     ExtractedFile *files = NULL;
     int file_count = 0, lock = -1, ok = -1;
+    int runtime_payload_present = 0;
     char bundle[PATH_MAX], stage[PATH_MAX], stage_payload[PATH_MAX], release[PATH_MAX], release_payload[PATH_MAX];
     char old_target[PATH_MAX], old_graphics[PATH_MAX], os[64], release_file[PATH_MAX], config_file[PATH_MAX];
+    char current_version[96] = {0};
     if (!valid_id(txid) || read_state(&s) < 0 || strcmp(s.txid, txid) ||
-        (strcmp(s.state, "received") && strcmp(s.state, "receiving"))) return -1;
+        (strcmp(s.state, "received") && strcmp(s.state, "receiving") &&
+         strcmp(s.state, "apply_requested"))) return -1;
     lock = update_lock(); if (lock < 0) return -1;
     snprintf(bundle, sizeof(bundle), "%s/%s.bundle", BUNDLE_ROOT, txid);
     snprintf(stage, sizeof(stage), "%s/%s", STAGING_ROOT, txid);
@@ -1139,28 +1514,50 @@ static int apply_update(const char *txid)
         strcmp(os, m.os) != 0 || verify_payload(&m, stage, files, file_count) < 0) {
         snprintf(s.error, sizeof(s.error), "verification_failed"); strcpy(s.state, "failed"); write_state(&s); goto done;
     }
+    for (int i = 0; i < m.file_count; i++)
+        if (strncmp(m.files[i].path, "graphics/", 9) != 0) { runtime_payload_present = 1; break; }
     if (!m.allow_downgrade && current_target(old_target, sizeof(old_target)) == 0) {
-        char old_release[96];
-        const char *old_name = strrchr(old_target, '/');
-        size_t old_len;
-        old_name = old_name ? old_name + 1 : old_target;
-        old_len = strlen(old_name);
-        if (old_len >= sizeof(old_release)) {
-            snprintf(s.error, sizeof(s.error), "current_release_invalid");
-            strcpy(s.state, "failed");
-            write_state(&s);
-            goto done;
+        if (read_current_version(current_version, sizeof(current_version)) < 0 ||
+            version_cmp(m.version, current_version) < 0) {
+            snprintf(s.error, sizeof(s.error), "downgrade_rejected");
+            strcpy(s.state, "failed"); write_state(&s); goto done;
         }
-        memcpy(old_release, old_name, old_len + 1);
-        if (version_cmp(m.version, old_release) < 0) { snprintf(s.error, sizeof(s.error), "downgrade_rejected"); strcpy(s.state, "failed"); write_state(&s); goto done; }
     }
     s.reboot_required = m.reboot_required || m.kernel_components_present;
     snprintf(s.version, sizeof(s.version), "%s", m.version);
     snprintf(s.graphics_version, sizeof(s.graphics_version), "%s", m.graphics_version);
     strcpy(s.state, "verified"); if (write_state(&s) < 0) goto done;
-    if (current_target(old_target, sizeof(old_target)) == 0) snprintf(s.previous, sizeof(s.previous), "%s", old_target); else s.previous[0] = 0;
+    if (current_target(old_target, sizeof(old_target)) == 0) {
+        snprintf(s.previous, sizeof(s.previous), "%s", old_target);
+        snprintf(s.old_runtime_target, sizeof(s.old_runtime_target), "%s", old_target);
+    } else {
+        if (!runtime_payload_present) {
+            snprintf(s.error, sizeof(s.error), "graphics_update_requires_current_runtime");
+            strcpy(s.state, "failed"); write_state(&s); goto done;
+        }
+        s.previous[0] = 0;
+        s.old_runtime_target[0] = 0;
+    }
     snprintf(release, sizeof(release), "%s/%s-%s", RELEASES_ROOT, m.version, txid);
-    snprintf(s.target, sizeof(s.target), "releases/%s-%s", m.version, txid);
+    if (runtime_payload_present) {
+        snprintf(s.target, sizeof(s.target), "releases/%s-%s", m.version, txid);
+        snprintf(s.new_runtime_target, sizeof(s.new_runtime_target), "%s", s.target);
+        s.runtime_changed = 1;
+    } else {
+        /* A graphics-only bundle still gets its own release directory for
+         * the Mesa archive, but it must not move the runtime A/B pointer. */
+        snprintf(s.target, sizeof(s.target), "%s", s.old_runtime_target);
+        snprintf(s.new_runtime_target, sizeof(s.new_runtime_target), "%s", s.old_runtime_target);
+        s.runtime_changed = 0;
+    }
+    if (graphics_target(old_graphics, sizeof(old_graphics)) == 0)
+        snprintf(s.old_graphics_target, sizeof(s.old_graphics_target), "%s", old_graphics);
+    else s.old_graphics_target[0] = 0;
+    s.graphics_changed = m.graphics_version[0] != 0;
+    if (s.graphics_changed)
+        snprintf(s.new_graphics_target, sizeof(s.new_graphics_target), "releases/%s-%s",
+                 m.graphics_version, txid);
+    else s.new_graphics_target[0] = 0;
     if (snprintf(stage_payload, sizeof(stage_payload), "%s/payload", stage) >= (int)sizeof(stage_payload) ||
         snprintf(release_payload, sizeof(release_payload), "%s/payload", release) >= (int)sizeof(release_payload) ||
         mkdir_p(release, 0755) < 0 || rename(stage_payload, release_payload) < 0) goto done;
@@ -1173,7 +1570,7 @@ static int apply_update(const char *txid)
             if (rename(src, dst) < 0 && errno != ENOENT) goto done; \
         } while (0)
         MOVE_PAYLOAD_DIR("bin"); MOVE_PAYLOAD_DIR("libexec"); MOVE_PAYLOAD_DIR("systemd");
-        MOVE_PAYLOAD_DIR("gnome"); MOVE_PAYLOAD_DIR("config");
+        MOVE_PAYLOAD_DIR("gnome"); MOVE_PAYLOAD_DIR("config"); MOVE_PAYLOAD_DIR("graphics");
 #undef MOVE_PAYLOAD_DIR
     }
     {
@@ -1188,41 +1585,49 @@ static int apply_update(const char *txid)
         if (append_path(graphics_archive, sizeof(graphics_archive), release,
                         "/graphics/wsl-mesa.tar.zst") < 0) goto done;
         if (extract_graphics(graphics_archive, m.graphics_version, txid) < 0) goto done;
-        if (graphics_target(old_graphics, sizeof(old_graphics)) == 0 &&
-            replace_symlink("/opt/wsl-mesa/previous", old_graphics) < 0) goto done;
+    }
+    /* No live path, service unit, or config is touched until this durable
+     * record says activation has begun and contains both sides of every A/B
+     * switch. */
+    if (backup_live_config(&s) < 0) goto done;
+    strcpy(s.state, "activating");
+    s.deadline = (uint64_t)time(NULL) + UPDATE_HEALTH_SECONDS;
+    if (write_state(&s) < 0) goto done;
+    if (s.graphics_changed) {
+        if (s.old_graphics_target[0] &&
+            replace_symlink("/opt/wsl-mesa/previous", s.old_graphics_target) < 0) goto done;
         {
-            char graphics_target_name[PATH_MAX];
-            snprintf(graphics_target_name, sizeof(graphics_target_name), "releases/%s-%s", m.graphics_version, txid);
-            if (replace_symlink("/opt/wsl-mesa/current", graphics_target_name) < 0) goto done;
+            if (replace_symlink("/opt/wsl-mesa/current", s.new_graphics_target) < 0) goto done;
         }
     }
     if (append_path(config_file, sizeof(config_file), release,
                     "/config/asb_drm.conf") < 0) goto done;
     if (install_release_integrations(release) < 0 ||
         install_config_file(config_file, "/etc/modprobe.d/asb_drm.conf") < 0) goto done;
-    if (install_runtime_links(release) < 0) goto done;
-    if (s.previous[0] && replace_symlink(UPDATE_ROOT "/previous", s.previous) < 0) goto done;
-    if (replace_symlink(UPDATE_ROOT "/current", s.target) < 0) goto done;
-    strcpy(s.state, "health_check"); s.deadline = (uint64_t)time(NULL) + UPDATE_HEALTH_SECONDS;
+    if (s.runtime_changed && s.previous[0] && replace_symlink(UPDATE_ROOT "/previous", s.previous) < 0) goto done;
+    if (s.runtime_changed && replace_symlink(UPDATE_ROOT "/current", s.target) < 0) goto done;
+    if (s.runtime_changed && install_runtime_links() < 0) goto done;
+    strcpy(s.state, "health_check");
     s.error[0] = 0; if (write_state(&s) < 0) goto done;
     if (s.reboot_required) {
         strcpy(s.state, "reboot_pending"); write_state(&s);
         /* The state is durable before reboot.  The updater service, not the
          * newly-installed agent, owns post-boot health and rollback. */
-        printf("reboot_required\n"); fflush(stdout);
         spawn_systemctl("reboot");
         ok = 0; goto done;
     }
-    /* Emit the reply before restarting the agent service: systemd may kill
-       this helper as part of that restart. The durable health state remains
-       owned by appsandbox-guest-update-watch.service. */
-    printf("ok\n"); fflush(stdout);
+    /* The watcher owns the durable health decision. Restarting the agent is
+     * deliberately after state persistence and cannot invalidate the host's
+     * already-returned update_apply acknowledgement. */
     spawn_systemctl("restart");
-    sleep(3);
-    if (health_check() == 0) { strcpy(s.state, "committed"); write_state(&s); }
     ok = 0;
 done:
-    if (ok < 0 && s.state[0] && strcmp(s.state, "failed") && strcmp(s.state, "rollback")) {
+    if (ok < 0 && s.state[0] && !strcmp(s.state, "activating")) {
+        if (restore_activation_locked(&s, "activation_failed") < 0) {
+            snprintf(s.error, sizeof(s.error), "activation_recovery_failed");
+            strcpy(s.state, "failed"); write_state(&s);
+        }
+    } else if (ok < 0 && s.state[0] && strcmp(s.state, "failed") && strcmp(s.state, "rollback")) {
         snprintf(s.error, sizeof(s.error), "activation_failed"); strcpy(s.state, "failed"); write_state(&s);
     }
     free(manifest); free(signature); free(files); if (lock >= 0) close(lock);
@@ -1232,40 +1637,113 @@ done:
 static int rollback_update(void)
 {
     UpdateState s;
-    char current[PATH_MAX], graphics_current[PATH_MAX], graphics_previous[PATH_MAX];
     int lock = update_lock();
-    if (lock < 0 || read_state(&s) < 0 || !s.previous[0] || current_target(current, sizeof(current)) < 0) {
+    if (lock < 0 || read_state(&s) < 0) {
         if (lock >= 0) close(lock);
         return -1;
     }
-    if (replace_symlink(UPDATE_ROOT "/current", s.previous) < 0 || replace_symlink(UPDATE_ROOT "/previous", current) < 0) {
-        close(lock); return -1;
+    /* States written by older updater builds only had previous/target. Treat
+     * that metadata as a runtime-only transaction; never infer graphics
+     * ownership from a global /opt/wsl-mesa/previous link. */
+    if (!s.old_runtime_target[0] && s.previous[0]) {
+        snprintf(s.old_runtime_target, sizeof(s.old_runtime_target), "%s", s.previous);
+        s.runtime_changed = 1; /* compatibility with pre-metadata state */
     }
-    {
-        char previous_release[PATH_MAX], config[PATH_MAX];
-        if (snprintf(previous_release, sizeof(previous_release), "%s/%s", UPDATE_ROOT, s.previous) >= (int)sizeof(previous_release) ||
-            install_runtime_links(previous_release) < 0) { close(lock); return -1; }
-        if (append_path(config, sizeof(config), previous_release,
-                        "/config/asb_drm.conf") < 0 ||
-            install_release_integrations(previous_release) < 0 ||
-            install_config_file(config, "/etc/modprobe.d/asb_drm.conf") < 0) {
-            close(lock);
-            return -1;
-        }
+    if (!s.new_runtime_target[0] && s.target[0]) {
+        snprintf(s.new_runtime_target, sizeof(s.new_runtime_target), "%s", s.target);
+        s.runtime_changed = 1; /* compatibility with pre-metadata state */
     }
-    {
-        ssize_t graphics_previous_len = readlink("/opt/wsl-mesa/previous", graphics_previous,
-                                                 sizeof(graphics_previous) - 1);
-        if (graphics_target(graphics_current, sizeof(graphics_current)) == 0 &&
-            graphics_previous_len >= 0 && graphics_previous_len < (ssize_t)sizeof(graphics_previous)) {
-        graphics_previous[graphics_previous_len] = 0;
-        if (replace_symlink("/opt/wsl-mesa/current", graphics_previous) == 0)
-            replace_symlink("/opt/wsl-mesa/previous", graphics_current);
-        }
+    if (restore_activation_locked(&s, "health_check_failed") < 0) {
+        close(lock);
+        return -1;
     }
-    strcpy(s.state, "rollback"); snprintf(s.error, sizeof(s.error), "health_check_failed"); write_state(&s);
     spawn_systemctl("restart");
     printf("rolled_back\n"); close(lock); return 0;
+}
+
+static int migrate_legacy_file(const char *source, const char *target, mode_t mode)
+{
+    unsigned char *data = NULL;
+    size_t len = 0;
+    int ok;
+    if (access(source, R_OK) != 0) return 0;
+    if (file_read_limited(source, &data, &len, UPDATE_MAX_FILE_SIZE) < 0) return -1;
+    ok = atomic_write_file(target, data, len, mode);
+    free(data);
+    return ok;
+}
+
+static int migrate_legacy_main(void)
+{
+    static const char *const bins[] = {"appsandbox-agent", "appsandbox-display", "appsandbox-input",
+                                       "appsandbox-audio", "appsandbox-clipboard"};
+    static const char *const libexecs[] = {"appsandbox-display-d3d12"};
+    static const char *const units[] = {"appsandbox-agent.service", "appsandbox-display.service",
+                                        "appsandbox-display-d3d12.service", "appsandbox-input.service",
+                                        "appsandbox-audio.service"};
+    static const char *const gnome_files[] = {"metadata.json", "extension.js"};
+    UpdateState s;
+    char release[PATH_MAX], path[PATH_MAX], target[PATH_MAX];
+    struct stat current_stat;
+    size_t i;
+    int lock = update_lock();
+    if (lock < 0) return -1;
+    if (current_target(target, sizeof(target)) == 0) {
+        puts("ready"); close(lock); return 0;
+    }
+    if (lstat(UPDATE_ROOT "/current", &current_stat) == 0 || errno != ENOENT ||
+        snprintf(release, sizeof(release), "%s/legacy", RELEASES_ROOT) >= (int)sizeof(release) ||
+        mkdir_p(release "/bin", 0755) < 0 || mkdir_p(release "/libexec", 0755) < 0 ||
+        mkdir_p(release "/systemd", 0755) < 0 || mkdir_p(release "/config", 0755) < 0 ||
+        mkdir_p(release "/gnome/appsandbox-pointer@appsandbox", 0755) < 0)
+        { close(lock); return -1; }
+    if (access("/usr/local/bin/appsandbox-agent", X_OK) != 0) { close(lock); return -1; }
+    for (i = 0; i < sizeof(bins) / sizeof(bins[0]); i++) {
+        snprintf(path, sizeof(path), "/usr/local/bin/%s", bins[i]);
+        snprintf(target, sizeof(target), "%s/bin/%s", release, bins[i]);
+        if (migrate_legacy_file(path, target, 0755) < 0) { close(lock); return -1; }
+    }
+    for (i = 0; i < sizeof(libexecs) / sizeof(libexecs[0]); i++) {
+        snprintf(path, sizeof(path), "/usr/local/libexec/%s", libexecs[i]);
+        snprintf(target, sizeof(target), "%s/libexec/%s", release, libexecs[i]);
+        if (migrate_legacy_file(path, target, 0755) < 0) { close(lock); return -1; }
+    }
+    for (i = 0; i < sizeof(units) / sizeof(units[0]); i++) {
+        snprintf(path, sizeof(path), "/etc/systemd/system/%s", units[i]);
+        snprintf(target, sizeof(target), "%s/systemd/%s", release, units[i]);
+        if (migrate_legacy_file(path, target, 0644) < 0) { close(lock); return -1; }
+    }
+    for (i = 0; i < sizeof(gnome_files) / sizeof(gnome_files[0]); i++) {
+        snprintf(path, sizeof(path),
+                 "/usr/share/gnome-shell/extensions/appsandbox-pointer@appsandbox/%s",
+                 gnome_files[i]);
+        snprintf(target, sizeof(target),
+                 "%s/gnome/appsandbox-pointer@appsandbox/%s", release, gnome_files[i]);
+        if (migrate_legacy_file(path, target, 0644) < 0) { close(lock); return -1; }
+    }
+    snprintf(path, sizeof(path), "/etc/modprobe.d/asb_drm.conf");
+    snprintf(target, sizeof(target), "%s/config/asb_drm.conf", release);
+    if (migrate_legacy_file(path, target, 0644) < 0) { close(lock); return -1; }
+    if (snprintf(path, sizeof(path), "%s/RELEASE", release) >= (int)sizeof(path) ||
+        atomic_write_file(path, "version=0.0.0\ngraphics_version=legacy-provisioned\ncommit=migrated\n",
+                          strlen("version=0.0.0\ngraphics_version=legacy-provisioned\ncommit=migrated\n"), 0644) < 0 ||
+        replace_symlink(UPDATE_ROOT "/current", "releases/legacy") < 0 || install_runtime_links() < 0)
+        { close(lock); return -1; }
+    {
+        struct stat graphics_current;
+        if (lstat("/opt/wsl-mesa/current", &graphics_current) < 0) {
+            if (errno != ENOENT || mkdir_p("/opt/wsl-mesa", 0755) < 0 ||
+                replace_symlink("/opt/wsl-mesa/current", ".") < 0) {
+                close(lock);
+                return -1;
+            }
+        }
+    }
+    memset(&s, 0, sizeof(s)); strcpy(s.state, "idle");
+    if (write_state(&s) < 0) { close(lock); return -1; }
+    puts("migrated");
+    close(lock);
+    return 0;
 }
 
 static int begin_update(const char *txid, const char *size_text, const char *sha)
@@ -1288,6 +1766,33 @@ static int begin_update(const char *txid, const char *size_text, const char *sha
     }
     if (write_state(&s) < 0) { close(lock); return -1; }
     printf("ready\n"); close(lock); return 0;
+}
+
+static int submit_apply(const char *txid)
+{
+    UpdateState s;
+    int lock;
+    if (!valid_id(txid)) return -1;
+    lock = update_lock();
+    if (lock < 0 || read_state(&s) < 0 || strcmp(s.txid, txid)) {
+        if (lock >= 0) close(lock);
+        return -1;
+    }
+    if (!strcmp(s.state, "received")) {
+        strcpy(s.state, "apply_requested");
+        s.error[0] = 0;
+        if (write_state(&s) < 0) { close(lock); return -1; }
+    } else if (strcmp(s.state, "apply_requested") && strcmp(s.state, "activating") &&
+               strcmp(s.state, "health_check") && strcmp(s.state, "reboot_pending") &&
+               strcmp(s.state, "committed")) {
+        close(lock);
+        return -1;
+    }
+    /* The caller receives this only after the request is atomically persisted;
+     * the watcher service is free to outlive both the agent and this process. */
+    puts("accepted");
+    close(lock);
+    return 0;
 }
 
 static int receive_stream(int fd)
@@ -1355,7 +1860,19 @@ static int watch_main(void)
 {
     for (;;) {
         UpdateState s;
-        if (read_state(&s) == 0 && (!strcmp(s.state, "reboot_pending") || !strcmp(s.state, "health_check"))) {
+        if (read_state(&s) == 0 && !strcmp(s.state, "apply_requested")) {
+            apply_update(s.txid);
+        } else if (read_state(&s) == 0 && !strcmp(s.state, "activating")) {
+            /* Power loss or a watchdog restart during activation cannot leave
+             * live pointers half-switched: restore only pointers still owned
+             * by this transaction. */
+            rollback_update();
+        } else if (read_state(&s) == 0 && !strcmp(s.state, "verified")) {
+            /* An unsubmitted verified transaction is inert. */
+            strcpy(s.state, "failed");
+            snprintf(s.error, sizeof(s.error), "activation_request_missing");
+            write_state(&s);
+        } else if (read_state(&s) == 0 && (!strcmp(s.state, "reboot_pending") || !strcmp(s.state, "health_check"))) {
             if (!strcmp(s.state, "reboot_pending")) { strcpy(s.state, "health_check"); s.deadline = (uint64_t)time(NULL) + UPDATE_HEALTH_SECONDS; write_state(&s); }
             if (health_check() == 0) { strcpy(s.state, "committed"); s.error[0] = 0; write_state(&s); }
             else if (s.deadline && (uint64_t)time(NULL) >= s.deadline) rollback_update();
@@ -1371,8 +1888,12 @@ static int query_main(void)
     if (file_read_limited(UPDATE_ROOT "/current/RELEASE", &data, &len, 4096) == 0) {
         char *p = strstr((char *)data, "version="); if (p) sscanf(p + 8, "%95[^\n]", version);
         p = strstr((char *)data, "graphics_version="); if (p) sscanf(p + 17, "%95[^\n]", graphics);
+        free(data); data = NULL;
     }
-    free(data);
+    if (file_read_limited("/opt/wsl-mesa/current/GRAPHICS", &data, &len, 256) == 0) {
+        sscanf((char *)data, "%95[0-9A-Za-z.+-]", graphics);
+        free(data);
+    }
     printf("guest_version:%s\ngraphics_version:%s\nguest_caps:update-v1,graphics-v1,health-v1\n", version, graphics);
     return 0;
 }
@@ -1382,7 +1903,10 @@ int main(int argc, char **argv)
     if (argc >= 2 && !strcmp(argv[1], "--daemon")) return daemon_main();
     if (argc >= 2 && !strcmp(argv[1], "--watch")) return watch_main();
     if (argc >= 2 && !strcmp(argv[1], "--query")) return query_main();
+    if (argc >= 2 && !strcmp(argv[1], "--health")) return health_main();
+    if (argc >= 2 && !strcmp(argv[1], "--migrate")) return migrate_legacy_main();
     if (argc >= 2 && !strcmp(argv[1], "--begin") && argc == 5) return begin_update(argv[2], argv[3], argv[4]);
+    if (argc >= 2 && !strcmp(argv[1], "--submit") && argc == 3) return submit_apply(argv[2]);
     if (argc >= 2 && !strcmp(argv[1], "--apply") && argc == 3) return apply_update(argv[2]);
     if (argc >= 2 && !strcmp(argv[1], "--rollback") && argc == 2) return rollback_update();
     if (argc >= 2 && !strcmp(argv[1], "--status") && argc == 3) { UpdateState s; if (read_state(&s) < 0 || strcmp(s.txid, argv[2])) return 1; printf("%s\n", s.state); return 0; }
@@ -1393,6 +1917,6 @@ int main(int argc, char **argv)
         snprintf(part, sizeof(part), "%s/%s.bundle.part", BUNDLE_ROOT, argv[2]);
         unlink(bundle); unlink(part); strcpy(s.state, "failed"); strcpy(s.error, "cancelled"); write_state(&s); close(l); puts("ok"); return 0;
     }
-    fprintf(stderr, "usage: %s --daemon|--watch|--query|--begin TXID SIZE SHA256|--apply TXID|--status TXID|--cancel TXID|--rollback\n", argv[0]);
+    fprintf(stderr, "usage: %s --daemon|--watch|--query|--begin TXID SIZE SHA256|--submit TXID|--apply TXID|--status TXID|--cancel TXID|--rollback\n", argv[0]);
     return 2;
 }

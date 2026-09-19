@@ -2466,29 +2466,38 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
        staging dir, since the prefetches write directly into it.) */
 
     /* ---- 1a. Set up staging dir + run 3 prefetches that populate it
-       directly (no host cache). Order doesn't matter functionally;
-       sequential for simpler logging. Failures are non-fatal — VM
-       still builds; firstboot STEP 17 verification will flag any
-       missing artifacts in the rootfs. ---- */
+       directly (no host cache). The release-resource prefetch is a
+       production prerequisite; source/branch fallback is intentionally not
+       allowed for a new VM. ---- */
     swprintf_s(staging, MAX_PATH, L"%s\\_vhdx_staging", args->vhdx_dir);
     CreateDirectoryW(staging, NULL);
     swprintf_s(manifest, MAX_PATH, L"%s\\manifest.txt", staging);
+
+    GetModuleFileNameW(g_dll_module, exe_dir, MAX_PATH);
+    slash = wcsrchr(exe_dir, L'\\'); if (slash) *slash = L'\0';
+    swprintf_s(res_dir, MAX_PATH, L"%s\\resources", exe_dir);
+    if (GetFileAttributesW(res_dir) == INVALID_FILE_ATTRIBUTES)
+        wcscpy_s(res_dir, MAX_PATH, exe_dir);
 
     {
         wchar_t extras[MAX_PATH], args_buf[2048];
         swprintf_s(extras, MAX_PATH, L"%s\\extras", staging);
         CreateDirectoryW(extras, NULL);
 
-        /* Prefetch 1: Linux sources from GitHub. Writes agent-src/,
-           asb_drm-src/, dxgkrnl-src/, systemd/, modprobe.d-asb_drm.conf,
-           50-appsandbox-gpu, org.gnome.Shell-no-gpu.conf, appsandbox-gpu,
-           wsl-mesa.tar.zst directly into <staging>/extras/. */
-        asb_log(L"Prefetch 1/3: downloading Linux sources from GitHub...");
+        /* Production provisioning is a closed-world copy from the exact Host
+           release. Developer source prefetch remains available only through
+           the explicit iso-patch --prefetch-repo command. */
+        asb_log(L"Prefetch 1/3: staging pinned Linux release resources...");
         swprintf_s(args_buf, 2048,
-            L"--prefetch-repo --branch \"main\" --out-dir \"%s\"",
-            extras);
-        if (spawn_iso_patch_prefetch(args_buf) != 0)
-            asb_log(L"WARN: prefetch-repo failed (agent + DKMS build will fail)");
+            L"--prefetch-release --resources-dir \"%s\\linux\" --out-dir \"%s\"",
+            res_dir, extras);
+        if (spawn_iso_patch_prefetch(args_buf) != 0) {
+            args->result = E_FAIL;
+            wcscpy_s(args->error_msg, ARRAYSIZE(args->error_msg),
+                     L"Pinned Linux release resources are missing or invalid.");
+            SecureZeroMemory(args->config.admin_pass, sizeof(args->config.admin_pass));
+            goto done;
+        }
 
         /* Prefetch 2: apt build-deps closure from archive.ubuntu.com.
            Needs (codename, kernel) detected from the ISO. */
@@ -2523,12 +2532,6 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
         if (spawn_iso_patch_prefetch(args_buf) != 0)
             asb_log(L"WARN: prefetch-wsl-deps failed");
     }
-
-    GetModuleFileNameW(g_dll_module, exe_dir, MAX_PATH);
-    slash = wcsrchr(exe_dir, L'\\'); if (slash) *slash = L'\0';
-    swprintf_s(res_dir, MAX_PATH, L"%s\\resources", exe_dir);
-    if (GetFileAttributesW(res_dir) == INVALID_FILE_ATTRIBUTES)
-        wcscpy_s(res_dir, MAX_PATH, exe_dir);
 
     /* Hash the modal-supplied admin password into glibc $6$ format so the
        firstboot can drop it straight into /etc/shadow via `usermod -p`.

@@ -39,7 +39,7 @@ all: $(BINS)
 d3d12-helper: appsandbox-display-d3d12
 
 appsandbox-agent: appsandbox-agent.c
-	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS) -lcrypto
 
 # Display daemon needs libdrm for drmModeGetFB2 + drmPrimeHandleToFD.
 appsandbox-display: appsandbox-display.c

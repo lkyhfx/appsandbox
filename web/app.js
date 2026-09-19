@@ -1023,11 +1023,14 @@ function buildRowCells(vm, i, statusTd) {
                 : 'In-VM agent is not connected'));
 
     var bld = vm.buildingVhdx;
-    var updateSupported = vm.osType === 'Linux' && vm.guestUpdaterSupported && vm.agentOnline;
+    /* Legacy Linux guests can be migrated in-place by the host's fixed
+       updater bootstrap protocol. Keep Update Guest available whenever the
+       legacy agent is online so VM recreation is not required. */
+    var updateSupported = vm.osType === 'Linux' && vm.agentOnline;
     var updateActive = !!vm.updateActive;
     var updateTitle = !updateSupported
         ? (vm.osType !== 'Linux' ? 'Guest updates are available for Linux VMs only' :
-            !vm.agentOnline ? 'Start the VM and wait for the guest agent' : 'Guest Updater is not installed')
+            !vm.agentOnline ? 'Start the VM and wait for the guest agent' : 'Guest Updater bootstrap unavailable')
         : updateActive ? 'Cancel the active guest update' :
             'Update Guest... Current: ' + (vm.guestVersion || 'unknown') +
             ' | Graphics: ' + (vm.graphicsVersion || 'unknown');

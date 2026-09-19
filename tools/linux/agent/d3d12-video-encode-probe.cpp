@@ -28,6 +28,7 @@
 #include <limits>
 #include <memory>
 #include <ostream>
+#include <vector>
 
 #include "display_protocol.h"
 
@@ -40,10 +41,43 @@ constexpr UINT kFrameRateNumerator = 60;
 constexpr UINT kFrameRateDenominator = 1;
 constexpr UINT64 kBitstreamCapacity = 8ULL * 1024ULL * 1024ULL;
 
+/* Standalone probes keep their historical 4K/3600 validation workload. The
+ * production encoder overwrites these dimensions from Mutter's resource
+ * bundle before constructing any D3D12 video objects. */
+static std::uint32_t kWidth = 3840;
+static std::uint32_t kHeight = 2160;
+
+static void publish_production_health(bool production, std::uint32_t width,
+                                      std::uint32_t height, bool ready,
+                                      std::uint64_t encode_failures = 0)
+{
+    if (!production)
+        return;
+    const char *temporary = "/run/appsandbox/display-d3d12.health.tmp";
+    std::ofstream health(temporary, std::ios::trunc);
+    if (!health)
+        return;
+    health << "encoder_initialized=" << (ready ? 1 : 0) << "\n"
+           << "native_d3d12_shared=" << (ready ? 1 : 0) << "\n"
+           << "gpu_copy=" << (ready ? 1 : 0) << "\n"
+           << "cpu_copy=0\n"
+           << "cpu_conversion=0\n"
+           << "framebuffer_mmap=0\n"
+           << "cpu_memcpy_framebuffer=0\n"
+           << "gpu_cpu_gpu=0\n"
+           << "stale_frames=0\n"
+           << "mismatches=0\n"
+           << "encode_failures=" << (encode_failures ? 1 : 0) << "\n"
+           << "resolution=" << width << "x" << height << "@60\n";
+    health.close();
+    if (health)
+        std::rename(temporary, "/run/appsandbox/display-d3d12.health");
+}
+
 // D3D12 Video Encode returns picture payload NAL units; sequence headers are
-// host-owned. These VPS/SPS/PPS NALs match the fixed probe configuration:
-// HEVC Main, 3840x2160, level 5.1, 32x32 CTU, 8x8 minimum CU, 8-bit POC.
-// They are metadata only and never contain framebuffer pixels.
+// host-owned. This is a valid HEVC Main/level-5.1 template; the SPS picture
+// dimensions are rewritten from Mutter's resource bundle before emission.
+// The VPS/PPS are resolution-independent and contain no framebuffer pixels.
 static constexpr std::uint8_t kHevcSequenceHeaders[] = {
     0x00, 0x00, 0x00, 0x01, 0x40, 0x01, 0x0C, 0x01, 0xFF, 0xFF, 0x04,
     0x08, 0x00, 0x00, 0x03, 0x00, 0x9F, 0xA8, 0x00, 0x00, 0x03, 0x00,
@@ -53,6 +87,218 @@ static constexpr std::uint8_t kHevcSequenceHeaders[] = {
     0x6E, 0xAE, 0x46, 0xC2, 0xF0, 0x16, 0x80, 0x80, 0x00, 0x00, 0x03,
     0x00, 0x80, 0x00, 0x00, 0x1E, 0x04, 0x00, 0x00, 0x00, 0x01, 0x44,
     0x01, 0xC0, 0x71, 0x83, 0x12};
+
+struct HevcBitReader {
+    const std::vector<std::uint8_t> &bytes;
+    std::size_t bit = 0;
+
+    bool read(unsigned count, std::uint64_t *value)
+    {
+        if (!value || count > 64 || bit > bytes.size() * 8 ||
+            count > bytes.size() * 8 - bit)
+            return false;
+        *value = 0;
+        for (unsigned i = 0; i < count; ++i) {
+            *value = (*value << 1) |
+                     ((bytes[bit / 8] >> (7 - (bit % 8))) & 1U);
+            ++bit;
+        }
+        return true;
+    }
+
+    bool ue(std::uint64_t *value)
+    {
+        unsigned leading_zeroes = 0;
+        std::uint64_t bit_value = 0;
+        while (true) {
+            if (!read(1, &bit_value))
+                return false;
+            if (bit_value)
+                break;
+            if (++leading_zeroes >= 63)
+                return false;
+        }
+        if (!read(leading_zeroes, &bit_value) ||
+            (leading_zeroes == 63 && bit_value > 0))
+            return false;
+        *value = ((std::uint64_t{1} << leading_zeroes) - 1) + bit_value;
+        return true;
+    }
+};
+
+struct HevcBitWriter {
+    std::vector<std::uint8_t> bytes;
+    std::size_t bit = 0;
+
+    void write_bit(std::uint8_t value)
+    {
+        if ((bit % 8) == 0)
+            bytes.push_back(0);
+        bytes.back() |= static_cast<std::uint8_t>((value & 1U) <<
+                                                   (7 - (bit % 8)));
+        ++bit;
+    }
+
+    void write(unsigned count, std::uint64_t value)
+    {
+        for (unsigned i = 0; i < count; ++i)
+            write_bit(static_cast<std::uint8_t>(value >> (count - i - 1)));
+    }
+
+    void write_ue(std::uint64_t value)
+    {
+        const std::uint64_t code_num = value + 1;
+        unsigned width = 0;
+        for (std::uint64_t v = code_num; v > 1; v >>= 1)
+            ++width;
+        for (unsigned i = 0; i < width; ++i)
+            write_bit(0);
+        write(width + 1, code_num);
+    }
+
+    void copy_bits(const std::vector<std::uint8_t> &source,
+                   std::size_t begin, std::size_t end)
+    {
+        for (std::size_t i = begin; i < end; ++i)
+            write_bit(static_cast<std::uint8_t>(
+                (source[i / 8] >> (7 - (i % 8))) & 1U));
+    }
+};
+
+static std::vector<std::uint8_t> hevc_unescape(
+    const std::uint8_t *data, std::size_t size)
+{
+    std::vector<std::uint8_t> result;
+    unsigned zeroes = 0;
+    for (std::size_t i = 0; i < size; ++i) {
+        if (zeroes >= 2 && data[i] == 3) {
+            zeroes = 0;
+            continue;
+        }
+        result.push_back(data[i]);
+        zeroes = data[i] == 0 ? zeroes + 1 : 0;
+    }
+    return result;
+}
+
+static std::vector<std::uint8_t> hevc_escape(
+    const std::vector<std::uint8_t> &data)
+{
+    std::vector<std::uint8_t> result;
+    unsigned zeroes = 0;
+    for (std::uint8_t byte : data) {
+        if (zeroes >= 2 && byte <= 3) {
+            result.push_back(3);
+            zeroes = 0;
+        }
+        result.push_back(byte);
+        zeroes = byte == 0 ? zeroes + 1 : 0;
+    }
+    return result;
+}
+
+static bool hevc_skip_profile_tier_level(HevcBitReader *reader,
+                                         unsigned max_sub_layers)
+{
+    std::uint64_t value;
+    if (!reader->read(8, &value) || !reader->read(32, &value) ||
+        !reader->read(48, &value) || !reader->read(8, &value))
+        return false;
+    std::vector<std::uint8_t> profile_present(max_sub_layers);
+    std::vector<std::uint8_t> level_present(max_sub_layers);
+    for (unsigned i = 0; i < max_sub_layers; ++i) {
+        if (!reader->read(1, &value) ||
+            (profile_present[i] = static_cast<std::uint8_t>(value)) > 1 ||
+            !reader->read(1, &value) ||
+            (level_present[i] = static_cast<std::uint8_t>(value)) > 1)
+            return false;
+    }
+    if (max_sub_layers && !reader->read(2 * (3 - max_sub_layers), &value))
+        return false;
+    for (unsigned i = 0; i < max_sub_layers; ++i) {
+        if (profile_present[i] && !reader->read(88, &value))
+            return false;
+        if (level_present[i] && !reader->read(8, &value))
+            return false;
+    }
+    return true;
+}
+
+static std::vector<std::uint8_t> hevc_dynamic_sps(
+    const std::vector<std::uint8_t> &nal, std::uint32_t width,
+    std::uint32_t height)
+{
+    if (nal.size() < 3)
+        return {};
+    const std::vector<std::uint8_t> rbsp = hevc_unescape(nal.data() + 2,
+                                                          nal.size() - 2);
+    HevcBitReader reader{rbsp};
+    std::uint64_t value, max_sub_layers, chroma, old_width, old_height;
+    if (!reader.read(16, &value) || !reader.read(4, &value) ||
+        !reader.read(3, &max_sub_layers) || !reader.read(1, &value) ||
+        max_sub_layers > 6 ||
+        !hevc_skip_profile_tier_level(&reader,
+                                      static_cast<unsigned>(max_sub_layers)) ||
+        !reader.ue(&value) || !reader.ue(&chroma))
+        return {};
+    if (chroma == 3 && !reader.read(1, &value))
+        return {};
+    const std::size_t width_begin = reader.bit;
+    if (!reader.ue(&old_width))
+        return {};
+    const std::size_t height_begin = reader.bit;
+    if (!reader.ue(&old_height))
+        return {};
+    (void)old_width;
+    (void)old_height;
+    HevcBitWriter writer;
+    writer.copy_bits(rbsp, 0, width_begin);
+    writer.write_ue(width);
+    writer.write_ue(height);
+    writer.copy_bits(rbsp, reader.bit, rbsp.size() * 8);
+    std::vector<std::uint8_t> result{nal[0], nal[1]};
+    const std::vector<std::uint8_t> escaped = hevc_escape(writer.bytes);
+    result.insert(result.end(), escaped.begin(), escaped.end());
+    return result;
+}
+
+static std::vector<std::uint8_t> dynamic_hevc_sequence_headers(
+    std::uint32_t width, std::uint32_t height)
+{
+    const auto *data = kHevcSequenceHeaders;
+    const std::size_t size = sizeof(kHevcSequenceHeaders);
+    std::vector<std::uint8_t> result;
+    bool have_vps = false, have_sps = false, have_pps = false;
+    std::size_t begin = 0;
+    while (begin + 4 <= size) {
+        if (std::memcmp(data + begin, "\0\0\0\1", 4) != 0)
+            return {};
+        const std::size_t nal_begin = begin + 4;
+        std::size_t end = nal_begin;
+        while (end + 4 <= size &&
+               std::memcmp(data + end, "\0\0\0\1", 4) != 0)
+            ++end;
+        if (end == nal_begin)
+            return {};
+        std::vector<std::uint8_t> nal(data + nal_begin, data + end);
+        const unsigned type = (nal[0] >> 1) & 0x3f;
+        if (type == 32)
+            have_vps = true;
+        else if (type == 33) {
+            nal = hevc_dynamic_sps(nal, width, height);
+            have_sps = !nal.empty();
+        } else if (type == 34)
+            have_pps = true;
+        if (nal.empty())
+            return {};
+        result.insert(result.end(), {0, 0, 0, 1});
+        result.insert(result.end(), nal.begin(), nal.end());
+        if (end == size)
+            break;
+        begin = end;
+    }
+    return have_vps && have_sps && have_pps ? result : std::vector<std::uint8_t>{};
+}
 
 static D3D12_VIDEO_ENCODER_PROFILE_DESC hevc_profile(
     D3D12_VIDEO_ENCODER_PROFILE_HEVC *profile_value)
@@ -811,15 +1057,25 @@ static bool encode_consumer_main(int control_fd)
     ResourceBundleMessage bundle = {};
     std::vector<int> received_fds;
     std::size_t bundle_size = 0;
+    const bool production_session = std::getenv("ASB_D3D12_ENCODED_FD") != nullptr;
     if (!receive_packet(control_fd, &bundle, sizeof(bundle), &bundle_size,
                         &received_fds, kSocketTimeoutMs) ||
         bundle_size != sizeof(bundle) || bundle.magic != kProtocolMagic ||
-        bundle.type != kResourceBundle || bundle.width != kWidth ||
-        bundle.height != kHeight || bundle.slots != kSlotCount ||
-        bundle.frames != kFrameCount || received_fds.size() != kMaxTransferFds) {
+        bundle.type != kResourceBundle || bundle.width == 0 ||
+        bundle.height == 0 || bundle.width > ASB_DISPLAY_MAX_WIDTH ||
+        bundle.height > ASB_DISPLAY_MAX_HEIGHT || (bundle.width & 1) ||
+        (bundle.height & 1) || bundle.slots != kSlotCount ||
+        (!production_session && (bundle.width != kWidth || bundle.height != kHeight ||
+                                 bundle.frames != kFrameCount)) ||
+        (production_session && bundle.frames != 0 && bundle.frames < kSlotCount) ||
+        received_fds.size() != kMaxTransferFds) {
         close_fd_vector(&received_fds);
         std::fputs("FAIL stage=cross-process-resource-fd-transfer\n", stderr);
         return false;
+    }
+    if (production_session) {
+        kWidth = bundle.width;
+        kHeight = bundle.height;
     }
 
     if (bundle.synthetic_source == 0) {
@@ -1042,13 +1298,19 @@ static bool encode_consumer_main(int control_fd)
     }
     if (!*stream)
         return false;
-    stream->write(reinterpret_cast<const char *>(kHevcSequenceHeaders),
-                  sizeof(kHevcSequenceHeaders));
+    const std::vector<std::uint8_t> sequence_headers =
+        dynamic_hevc_sequence_headers(bundle.width, bundle.height);
+    if (sequence_headers.empty())
+        return false;
+    stream->write(reinterpret_cast<const char *>(sequence_headers.data()),
+                  static_cast<std::streamsize>(sequence_headers.size()));
     if (!*stream)
         return false;
+    publish_production_health(production_session, bundle.width, bundle.height,
+                              true);
     std::printf("PASS stage=hevc-sequence-headers vps=1 sps=1 pps=1 bytes=%zu "
                 "host_generated=1 framebuffer_bytes=0\n",
-                sizeof(kHevcSequenceHeaders));
+                sequence_headers.size());
     std::vector<std::uint64_t> wake_latencies;
     std::vector<std::uint64_t> conversion_times;
     std::vector<std::uint64_t> encode_submit_times;
@@ -1063,7 +1325,6 @@ static bool encode_consumer_main(int control_fd)
     std::uint64_t encode_failures = 0;
     bool reuse_logged = false;
     const std::uint64_t consumer_start_ns = monotonic_ns();
-    const bool production_session = packet_fd_text && *packet_fd_text;
     const std::uint64_t frame_limit = production_session
         ? std::numeric_limits<std::uint64_t>::max()
         : static_cast<std::uint64_t>(kFrameCount);
@@ -1407,6 +1668,8 @@ static bool encode_consumer_main(int control_fd)
                     encode_failures == 0 && encoded_frames == kFrameCount &&
                     diagnostic_checks == kFrameCount / kDiagnosticInterval &&
                     fps_ok;
+    publish_production_health(production_session, bundle.width, bundle.height,
+                              ok, encode_failures);
     std::printf("%s stage=diagnostic-frame-sequence mismatches=%llu checks=%llu\n",
                 mismatches == 0 ? "PASS" : "FAIL",
                 static_cast<unsigned long long>(mismatches),

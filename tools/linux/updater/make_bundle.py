@@ -10,9 +10,17 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import tempfile
+
+
+DISALLOWED_KERNEL_MARKERS = (
+    "dxgkrnl",
+    "asb_drm.ko",
+    "modules/",
+)
 
 
 def safe_rel(path: pathlib.Path) -> str:
@@ -22,12 +30,28 @@ def safe_rel(path: pathlib.Path) -> str:
     return value
 
 
+def validate_runtime_path(rel: str) -> None:
+    lowered = rel.lower()
+    if any(marker in lowered for marker in DISALLOWED_KERNEL_MARKERS):
+        raise ValueError(f"kernel component is not allowed in a runtime bundle: {rel}")
+
+
+def semver(value: str) -> str:
+    pattern = r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+    if not re.fullmatch(pattern, value):
+        raise ValueError(f"version must be MAJOR.MINOR.PATCH: {value}")
+    return value
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--payload", type=pathlib.Path, required=True)
-    ap.add_argument("--version", required=True)
+    ap.add_argument("--version", required=True, type=semver)
     ap.add_argument("--commit", required=True)
-    ap.add_argument("--graphics-version", default="")
+    ap.add_argument("--graphics-version", default="", type=lambda v: semver(v) if v else "")
+    ap.add_argument("--arch", default="amd64", choices=("amd64",))
+    ap.add_argument("--os", default="ubuntu-26.04", choices=("ubuntu-26.04",))
+    ap.add_argument("--allow-downgrade", action="store_true")
     ap.add_argument("--signing-key", type=pathlib.Path, required=True)
     ap.add_argument("--output", type=pathlib.Path, required=True)
     ap.add_argument("--reboot-required", action="store_true")
@@ -38,6 +62,7 @@ def main() -> int:
         if not source.is_file():
             continue
         rel = safe_rel(source.relative_to(args.payload))
+        validate_runtime_path(rel)
         data = source.read_bytes()
         component = rel.split("/", 1)[0]
         files.append({
@@ -54,13 +79,14 @@ def main() -> int:
         "schema": 1,
         "version": args.version,
         "commit": args.commit,
-        "arch": "amd64",
-        "os": "ubuntu-26.04",
+        "arch": args.arch,
+        "os": args.os,
         "host_protocol_min": 1,
         "host_protocol_max": 1,
         "updater_min_version": "1.0.0",
         "graphics_version": args.graphics_version,
         "reboot_required": bool(args.reboot_required),
+        "allow_downgrade": bool(args.allow_downgrade),
         "kernel_components_present": False,
         "files": files,
     }
@@ -76,20 +102,22 @@ def main() -> int:
             os.chmod(target, item["mode"])
         (root / "manifest.json").write_bytes(manifest_bytes)
         signature = root / "manifest.sig"
-        with tempfile.NamedTemporaryFile() as signed:
-            signed.write(manifest_bytes)
-            signed.flush()
+        signed_path = root / "manifest-to-sign.json"
+        signed_path.write_bytes(manifest_bytes)
+        try:
             with signature.open("wb") as output:
-                subprocess.run(["openssl", "pkeyutl", "-sign", "-inkey", str(args.signing_key),
-                                "-in", signed.name], check=True, stdout=output)
+                subprocess.run(["openssl", "pkeyutl", "-sign", "-rawin", "-inkey", str(args.signing_key),
+                                "-in", str(signed_path)], check=True, stdout=output)
+        finally:
+            signed_path.unlink(missing_ok=True)
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(suffix=".tar") as tar:
-            subprocess.run(["tar", "--format=ustar", "--sort=name", "--owner=0", "--group=0",
-                            "--numeric-owner", "-C", str(root), "-cf", tar.name,
-                            "manifest.json", "manifest.sig", "payload"], check=True)
-            with args.output.open("wb") as output:
-                subprocess.run(["zstd", "--quiet", "--no-progress", "-T0", "-c", tar.name],
-                               check=True, stdout=output)
+        tar_path = root / "bundle.tar"
+        subprocess.run(["tar", "--format=ustar", "--owner=0", "--group=0",
+                        "--numeric-owner", "-C", str(root), "-cf", str(tar_path),
+                        "manifest.json", "manifest.sig", "payload"], check=True)
+        with args.output.open("wb") as output:
+            subprocess.run(["zstd", "--quiet", "--no-progress", "-T0", "-c", str(tar_path)],
+                           check=True, stdout=output)
     return 0
 
 

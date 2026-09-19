@@ -10,7 +10,7 @@
 # 1. Clone the appsandbox repo onto a Linux machine that has matching kernel
 #    headers installed (e.g. Ubuntu 26.04 with linux-headers-generic).
 # 2. cd tools/linux
-# 3. make
+# 3. make PUBLIC_KEY_HEX=<release Ed25519 public key hex>
 # 4. Build artifacts land under tools/linux/dist/ — gitignored, this dir is
 #    only valid on this machine for this kernel.
 # 5. Copy dist/ over to your Windows host's appsandbox checkout, into
@@ -32,6 +32,7 @@
 KVER  := $(shell uname -r)
 ARCH  := $(shell uname -m)
 DISTDIR := $(CURDIR)/dist
+GUEST_RUNTIME_VERSION ?= 1.0.0
 
 .PHONY: all compile agents updater modules dxgkrnl asb_drm install-agents install-modules \
         clean distclean copy-help
@@ -75,8 +76,41 @@ install-agents: agents updater
 	install -m 0755 updater/appsandbox-guest-updater $(DISTDIR)/libexec/
 	install -m 0644 updater/appsandbox-guest-updater.service $(DISTDIR)/
 	install -m 0644 updater/appsandbox-guest-update-watch.service $(DISTDIR)/
+	@printf '%s\n' '$(PUBLIC_KEY_HEX)' > $(DISTDIR)/trusted-public-key.hex
+	@printf 'version=%s\n' '$(GUEST_RUNTIME_VERSION)' > $(DISTDIR)/guest-runtime.version
 	install -d $(DISTDIR)/gnome/appsandbox-pointer@appsandbox
 	install -m 0644 agent/gnome/appsandbox-pointer@appsandbox/*.json agent/gnome/appsandbox-pointer@appsandbox/*.js $(DISTDIR)/gnome/appsandbox-pointer@appsandbox/
+
+	# Also emit the exact closed-world tree consumed by Windows production
+	# provisioning. Keep the legacy flat dist outputs above for developer
+	# workflows, but never make provisioning infer artifacts from them.
+	install -d $(DISTDIR)/agent-src $(DISTDIR)/asb_drm-src \
+	           $(DISTDIR)/dxgkrnl-src $(DISTDIR)/systemd $(DISTDIR)/updater
+	cp -a agent/. $(DISTDIR)/agent-src/
+	cp -a asb_drm/. $(DISTDIR)/asb_drm-src/
+	cp -a dxgkrnl/src/. $(DISTDIR)/dxgkrnl-src/
+	install -m 0644 agent/systemd/*.service $(DISTDIR)/systemd/
+	install -m 0644 updater/appsandbox-guest-updater.service \
+	           updater/appsandbox-guest-update-watch.service $(DISTDIR)/systemd/
+	install -m 0644 asb_drm/systemd-asb-evict-simpledrm.service \
+	           $(DISTDIR)/systemd/asb-evict-simpledrm.service
+	install -m 0644 agent/modules-load.d-snd-aloop.conf \
+	           $(DISTDIR)/systemd/modules-load.d-snd-aloop.conf
+	install -m 0644 asb_drm/modules-load.d-asb_drm.conf \
+	           $(DISTDIR)/systemd/modules-load.d-asb_drm.conf
+	install -m 0755 updater/appsandbox-guest-updater $(DISTDIR)/updater/
+	install -m 0644 updater/appsandbox-guest-updater.service \
+	           updater/appsandbox-guest-update-watch.service $(DISTDIR)/updater/
+	sha256sum updater/appsandbox-guest-updater > \
+	           $(DISTDIR)/updater/appsandbox-guest-updater.sha256
+	install -m 0644 $(DISTDIR)/trusted-public-key.hex \
+	           $(DISTDIR)/updater/trusted-public-key.hex
+	install -m 0644 asb_drm/modprobe.d-asb_drm.conf \
+	           $(DISTDIR)/modprobe.d-asb_drm.conf
+	install -m 0644 wsl-mesa/50-appsandbox-gpu \
+	           wsl-mesa/org.gnome.Shell-no-gpu.conf wsl-mesa/appsandbox-gpu $(DISTDIR)/
+	install -m 0644 wsl-mesa/prebuilt/ubuntu-26.04-amd64/wsl-mesa.tar.zst \
+	           $(DISTDIR)/wsl-mesa.tar.zst
 
 # ---- kernel modules ---------------------------------------------------------
 #

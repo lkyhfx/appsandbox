@@ -4,6 +4,7 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / "appsandbox-guest-updater.c").read_text()
+MAKEFILE = (ROOT / "Makefile").read_text()
 
 
 class UpdateSecurityContractTests(unittest.TestCase):
@@ -24,6 +25,51 @@ class UpdateSecurityContractTests(unittest.TestCase):
         self.assertIn("host_protocol_min", SOURCE)
         self.assertIn("updater_min_version", SOURCE)
         self.assertIn("downgrade_rejected", SOURCE)
+
+    def test_release_key_is_explicit_and_test_key_is_rejected(self):
+        self.assertIn("PUBLIC_KEY_HEX must be provided", MAKEFILE)
+        self.assertIn("PUBLIC_KEY_HEX must be exactly 64 hexadecimal characters", MAKEFILE)
+        self.assertIn("PUBLIC_KEY_HEX must not be all zero", MAKEFILE)
+        self.assertIn("PUBLIC_KEY_HEX is a known RFC/test key", MAKEFILE)
+        self.assertIn("ASB_UPDATE_PUBLIC_KEY_HEX must be supplied", SOURCE)
+        self.assertNotIn("#define ASB_UPDATE_PUBLIC_KEY_HEX \\", SOURCE)
+
+    def test_graphics_moves_before_install_and_stable_links_use_current(self):
+        self.assertIn('MOVE_PAYLOAD_DIR("graphics")', SOURCE)
+        self.assertIn('"/opt/wsl-mesa/current"', SOURCE)
+        self.assertIn('UPDATE_ROOT "/current/bin/%s"', SOURCE)
+        self.assertIn('read_current_version', SOURCE)
+
+    def test_provisioned_baseline_is_semver_valid(self):
+        vhdx = (ROOT.parents[2] / "tools" / "iso-patch" / "ubuntu_vhdx.c").read_text(
+            encoding="utf-8", errors="replace")
+        self.assertIn("ASB_BASE_VERSION=0.0.0", vhdx)
+        self.assertIn("graphics_version=0.0.0", vhdx)
+        self.assertNotIn("version=initial\\\\ngraphics_version=legacy-provisioned", vhdx)
+        self.assertIn("appsandbox-guest-update-watch.service", vhdx)
+
+    def test_release_build_emits_prefetch_release_layout(self):
+        linux_make = (ROOT.parents[2] / "tools" / "linux" / "Makefile").read_text(
+            encoding="utf-8", errors="replace")
+        self.assertIn("$(DISTDIR)/updater/appsandbox-guest-updater.sha256", linux_make)
+        self.assertIn("$(DISTDIR)/systemd", linux_make)
+        self.assertIn("$(DISTDIR)/agent-src", linux_make)
+        self.assertIn("$(DISTDIR)/dxgkrnl-src", linux_make)
+
+    def test_activation_metadata_is_durable_before_live_switch(self):
+        self.assertIn('strcpy(s.state, "activating")', SOURCE)
+        self.assertIn('old_runtime_target', SOURCE)
+        self.assertIn('new_runtime_target', SOURCE)
+        self.assertIn('old_graphics_target', SOURCE)
+        self.assertIn('new_graphics_target', SOURCE)
+        self.assertIn('old_config_backup', SOURCE)
+        self.assertIn('s.graphics_changed', SOURCE)
+
+    def test_async_apply_and_legacy_migration_exist(self):
+        self.assertIn('strcpy(s.state, "apply_requested")', SOURCE)
+        self.assertIn('puts("accepted")', SOURCE)
+        self.assertIn('--migrate', SOURCE)
+        self.assertIn('/usr/local/libexec/%s', SOURCE)
 
     def test_kernel_components_are_not_in_normal_update(self):
         self.assertIn("kernel_components_present", SOURCE)

@@ -34,6 +34,7 @@
 #include <unistd.h>
 
 #include <netinet/in.h>
+#include <openssl/evp.h>
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -50,12 +51,37 @@
 #define REPLY_MAX               256
 #define GUEST_UPDATER_PATH      "/usr/local/libexec/appsandbox-guest-updater"
 #define UPDATE_TXID_MAX         39
+#define BOOTSTRAP_PORT          10
+#define BOOTSTRAP_MAX_SIZE      (64ULL * 1024ULL * 1024ULL)
+#define BOOTSTRAP_SERVICE_PATH  "/etc/systemd/system/appsandbox-guest-updater.service"
+#define BOOTSTRAP_WATCH_PATH    "/etc/systemd/system/appsandbox-guest-update-watch.service"
+
+#pragma pack(push, 1)
+typedef struct BootstrapHeader {
+    char magic[8];
+    uint32_t protocol;
+    uint32_t header_size;
+    uint64_t payload_size;
+    unsigned char sha256[32];
+} BootstrapHeader;
+typedef struct BootstrapPayloadHeader {
+    uint64_t updater_size;
+    uint64_t service_size;
+    uint64_t watch_size;
+} BootstrapPayloadHeader;
+#pragma pack(pop)
 
 /* ---- Global state for the currently-active client connection ---- */
 
 static volatile sig_atomic_t g_stop      = 0;
 static volatile int          g_client_fd = -1;
 static pthread_mutex_t       g_send_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t       g_bootstrap_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile int          g_bootstrap_armed = 0;
+static uint64_t              g_bootstrap_size = 0;
+static char                  g_bootstrap_sha[65] = {0};
+static pthread_t              g_bootstrap_thread;
+static volatile int           g_bootstrap_running = 0;
 
 /* ---- Logging (timestamped, goes to stderr → systemd journal) ---- */
 
@@ -122,6 +148,187 @@ static int recv_line(int fd, char *buf, int max)
     }
     buf[pos] = '\0';
     return overflow ? -2 : pos;
+}
+
+static int recv_all_bytes(int fd, void *buf, size_t len)
+{
+    unsigned char *p = (unsigned char *)buf;
+    while (len) {
+        ssize_t n = read(fd, p, len);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return -1;
+        p += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static void hex_digest(const unsigned char digest[32], char out[65])
+{
+    static const char hex[] = "0123456789abcdef";
+    int i;
+    for (i = 0; i < 32; i++) {
+        out[i * 2] = hex[digest[i] >> 4];
+        out[i * 2 + 1] = hex[digest[i] & 15];
+    }
+    out[64] = 0;
+}
+
+static int bootstrap_digest(const void *data, size_t len, unsigned char out[32])
+{
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    unsigned int out_len = 0;
+    int ok = ctx && EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) == 1 &&
+             EVP_DigestUpdate(ctx, data, len) == 1 &&
+             EVP_DigestFinal_ex(ctx, out, &out_len) == 1 && out_len == 32;
+    EVP_MD_CTX_free(ctx);
+    return ok ? 0 : -1;
+}
+
+static int bootstrap_write_all(int fd, const void *data, size_t len)
+{
+    const unsigned char *p = (const unsigned char *)data;
+    while (len) {
+        ssize_t n = write(fd, p, len);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return -1;
+        p += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+static int bootstrap_fsync_parent(const char *path)
+{
+    char parent[512];
+    char *slash;
+    int fd;
+    if (snprintf(parent, sizeof(parent), "%s", path) >= (int)sizeof(parent)) return -1;
+    slash = strrchr(parent, '/');
+    if (!slash) return -1;
+    *slash = 0;
+    fd = open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    if (fsync(fd) < 0 && errno != EINVAL) { close(fd); return -1; }
+    close(fd);
+    return 0;
+}
+
+static int install_bootstrap_file(const unsigned char *data, size_t len,
+                                  const char *path, mode_t mode)
+{
+    char tmp[512];
+    int fd = -1, ok = -1;
+    if (snprintf(tmp, sizeof(tmp), "%s.bootstrap.%ld", path, (long)getpid()) >= (int)sizeof(tmp)) return -1;
+    unlink(tmp);
+    fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, mode);
+    if (fd < 0) return -1;
+    if (bootstrap_write_all(fd, data, len) == 0 && fchmod(fd, mode) == 0 && fsync(fd) == 0 &&
+        close(fd) == 0 && rename(tmp, path) == 0 && bootstrap_fsync_parent(path) == 0) ok = 0;
+    else if (fd >= 0) close(fd);
+    if (ok < 0) unlink(tmp);
+    return ok;
+}
+
+static int bootstrap_run_systemd(void)
+{
+    static char *const reload[] = { (char *)"/usr/bin/systemctl", (char *)"daemon-reload", NULL };
+    static char *const enable[] = { (char *)"/usr/bin/systemctl", (char *)"enable", (char *)"--now",
+                                    (char *)"appsandbox-guest-updater.service",
+                                    (char *)"appsandbox-guest-update-watch.service", NULL };
+    pid_t pid;
+    int status;
+    char *const *commands[] = { reload, enable };
+    size_t i;
+    for (i = 0; i < sizeof(commands) / sizeof(commands[0]); i++) {
+        pid = fork();
+        if (pid < 0) return -1;
+        if (pid == 0) { execv(commands[i][0], (char *const *)commands[i]); _exit(127); }
+        if (waitpid(pid, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) return -1;
+    }
+    return 0;
+}
+
+static int bootstrap_receive(int fd)
+{
+    BootstrapHeader header;
+    BootstrapPayloadHeader payload_header;
+    unsigned char *payload = NULL, digest[32];
+    uint64_t expected_size;
+    char expected_sha[65];
+    uint64_t total;
+    size_t off;
+    int ok = -1;
+    pthread_mutex_lock(&g_bootstrap_lock);
+    expected_size = g_bootstrap_size;
+    snprintf(expected_sha, sizeof(expected_sha), "%s", g_bootstrap_sha);
+    if (!g_bootstrap_armed) expected_size = 0;
+    g_bootstrap_armed = 0;
+    pthread_mutex_unlock(&g_bootstrap_lock);
+    if (expected_size == 0 || expected_size > BOOTSTRAP_MAX_SIZE ||
+        recv_all_bytes(fd, &header, sizeof(header)) < 0 ||
+        memcmp(header.magic, "ASBBST1", 7) != 0 || header.protocol != 1 ||
+        header.header_size != sizeof(header) || header.payload_size != expected_size) return -1;
+    payload = malloc((size_t)header.payload_size);
+    if (!payload || recv_all_bytes(fd, payload, (size_t)header.payload_size) < 0 ||
+        bootstrap_digest(payload, (size_t)header.payload_size, digest) < 0) goto done;
+    {
+        char received_sha[65];
+        hex_digest(digest, received_sha);
+        if (strcmp(received_sha, expected_sha) != 0) goto done;
+        if (memcmp(digest, header.sha256, sizeof(digest)) != 0) goto done;
+    }
+    if (header.payload_size < sizeof(payload_header)) goto done;
+    memcpy(&payload_header, payload, sizeof(payload_header));
+    total = sizeof(payload_header);
+    if (payload_header.updater_size > BOOTSTRAP_MAX_SIZE ||
+        payload_header.service_size > 1024 * 1024 || payload_header.watch_size > 1024 * 1024 ||
+        payload_header.updater_size > UINT64_MAX - total) goto done;
+    total += payload_header.updater_size;
+    if (payload_header.service_size > UINT64_MAX - total) goto done;
+    total += payload_header.service_size;
+    if (payload_header.watch_size > UINT64_MAX - total) goto done;
+    total += payload_header.watch_size;
+    if (total != header.payload_size) goto done;
+    off = sizeof(payload_header);
+    if (install_bootstrap_file(payload + off, (size_t)payload_header.updater_size,
+                               GUEST_UPDATER_PATH, 0755) < 0) goto done;
+    off += (size_t)payload_header.updater_size;
+    if (install_bootstrap_file(payload + off, (size_t)payload_header.service_size,
+                               BOOTSTRAP_SERVICE_PATH, 0644) < 0) goto done;
+    off += (size_t)payload_header.service_size;
+    if (install_bootstrap_file(payload + off, (size_t)payload_header.watch_size,
+                               BOOTSTRAP_WATCH_PATH, 0644) < 0) goto done;
+    if (bootstrap_run_systemd() < 0) goto done;
+    ok = 0;
+done:
+    free(payload);
+    send_line(fd, ok == 0 ? "ok" : "error:bootstrap_failed");
+    return ok;
+}
+
+static void *bootstrap_listener_proc(void *arg)
+{
+    int ls;
+    struct sockaddr_vm addr = {0};
+    (void)arg;
+    ls = socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (ls < 0) return NULL;
+    addr.svm_family = AF_VSOCK; addr.svm_cid = VMADDR_CID_ANY; addr.svm_port = BOOTSTRAP_PORT;
+    if (bind(ls, (struct sockaddr *)&addr, sizeof(addr)) < 0 || listen(ls, 1) < 0) {
+        close(ls); return NULL;
+    }
+    while (g_bootstrap_running) {
+        struct pollfd pfd = { ls, POLLIN, 0 };
+        int r = poll(&pfd, 1, 1000);
+        if (r <= 0) continue;
+        if (pfd.revents & POLLIN) {
+            int fd = accept4(ls, NULL, NULL, SOCK_CLOEXEC);
+            if (fd >= 0) { bootstrap_receive(fd); close(fd); }
+        }
+    }
+    close(ls);
+    return NULL;
 }
 
 /* ---- Subprocess helpers ---- */
@@ -472,6 +679,38 @@ static int update_token(const char *s, size_t min_len, size_t max_len, int hex_o
     return 1;
 }
 
+static void handle_bootstrap_arm(int fd, const char *tag, const char *args)
+{
+    char copy[160], *save = NULL, *size_text, *sha, *extra;
+    char *end;
+    unsigned long long size;
+    if (!args || strlen(args) >= sizeof(copy)) {
+        send_reply(fd, tag, "error:bad_bootstrap_command");
+        return;
+    }
+    strcpy(copy, args);
+    size_text = strtok_r(copy, " \t", &save);
+    sha = strtok_r(NULL, " \t", &save);
+    extra = strtok_r(NULL, " \t", &save);
+    if (!size_text || !sha || extra || !update_token(size_text, 1, 20, 0) ||
+        !update_token(sha, 64, 64, 1)) {
+        send_reply(fd, tag, "error:bad_bootstrap_command");
+        return;
+    }
+    errno = 0;
+    size = strtoull(size_text, &end, 10);
+    if (errno || end == size_text || *end || size == 0 || size > BOOTSTRAP_MAX_SIZE) {
+        send_reply(fd, tag, "error:bad_bootstrap_size");
+        return;
+    }
+    pthread_mutex_lock(&g_bootstrap_lock);
+    g_bootstrap_size = (uint64_t)size;
+    snprintf(g_bootstrap_sha, sizeof(g_bootstrap_sha), "%s", sha);
+    g_bootstrap_armed = 1;
+    pthread_mutex_unlock(&g_bootstrap_lock);
+    send_reply(fd, tag, "bootstrap_ready");
+}
+
 /* Execute only the installed updater with a fixed verb and already-validated
  * argv. The host cannot cause a shell command to run through this path. */
 static int updater_exec(char *const argv[], char *output, size_t output_cap)
@@ -521,6 +760,15 @@ static void send_guest_update_metadata(int fd)
         }
         fclose(f);
     }
+    /* Graphics-only transactions keep the runtime RELEASE stable while the
+     * Mesa A/B pointer moves. Prefer the active slot marker when present. */
+    f = fopen("/opt/wsl-mesa/current/GRAPHICS", "r");
+    if (f) {
+        char line[128];
+        if (fgets(line, sizeof(line), f))
+            sscanf(line, "%95[0-9A-Za-z.+-]", graphics);
+        fclose(f);
+    }
     send_line(fd, "guest_caps:update-v1,graphics-v1,health-v1");
     {
         char line[128];
@@ -549,13 +797,17 @@ static void handle_guest_update(int fd, const char *tag, const char *cmd)
         send_reply(fd, tag, access(GUEST_UPDATER_PATH, X_OK) == 0 ? "ok" : "error:unsupported");
         return;
     }
-    if (!strcmp(verb, "update_begin") && a && b && c &&
+    if (!strcmp(verb, "update_health") && !a) {
+        argv[1] = "--health";
+    } else if (!strcmp(verb, "update_migrate") && !a) {
+        argv[1] = "--migrate";
+    } else if (!strcmp(verb, "update_begin") && a && b && c &&
         update_token(a, 8, UPDATE_TXID_MAX, 0) && update_token(b, 1, 12, 0) &&
         update_token(c, 64, 64, 1)) {
         argv[1] = "--begin"; argv[2] = a; argv[3] = b; argv[4] = c;
     } else if ((!strcmp(verb, "update_apply") || !strcmp(verb, "update_status") ||
                 !strcmp(verb, "update_cancel")) && a && update_token(a, 8, UPDATE_TXID_MAX, 0)) {
-        argv[1] = !strcmp(verb, "update_apply") ? "--apply" :
+        argv[1] = !strcmp(verb, "update_apply") ? "--submit" :
                   !strcmp(verb, "update_status") ? "--status" : "--cancel";
         argv[2] = a;
     } else if (!strcmp(verb, "update_rollback") && !a) {
@@ -1261,6 +1513,9 @@ static void handle_client(int fd)
             handle_gpu_query_response(fd, n_shares);
             /* No reply — host sends this fire-and-forget */
         }
+        else if (!strncmp(cmd, "bootstrap_updater ", 18)) {
+            handle_bootstrap_arm(fd, tag, cmd + 18);
+        }
         else if (!strncmp(cmd, "update_", 7)) {
             handle_guest_update(fd, tag, cmd);
         }
@@ -1353,6 +1608,13 @@ int main(int argc, char **argv)
     ls = listen_vsock();
     if (ls < 0) return 1;
 
+    /* Legacy guests expose a fixed, one-purpose bootstrap channel.  It never
+     * accepts a destination path or command from the host; the payload format
+     * has exactly three files and installs only the pinned updater paths. */
+    g_bootstrap_running = 1;
+    if (pthread_create(&g_bootstrap_thread, NULL, bootstrap_listener_proc, NULL) != 0)
+        g_bootstrap_running = 0;
+
     /* Start the clipboard monitor thread BEFORE accepting any control
      * clients. It'll spawn the helper as soon as the user session is
      * ready, independent of host-driven idd_connect. */
@@ -1370,6 +1632,8 @@ int main(int argc, char **argv)
     }
 
     close(ls);
+    g_bootstrap_running = 0;
+    if (g_bootstrap_thread) pthread_join(g_bootstrap_thread, NULL);
     agent_log("agent stopped");
     return 0;
 }

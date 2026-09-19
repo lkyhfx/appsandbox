@@ -39,18 +39,18 @@ tools/wsl-mesa/
 ```bash
 sudo mkdir -p /opt/wsl-mesa
 sudo zstd -d wsl-mesa.tar.zst -c | sudo tar -C / -x
-echo /opt/wsl-mesa/lib/x86_64-linux-gnu | sudo tee /etc/ld.so.conf.d/wsl-mesa.conf
+echo /opt/wsl-mesa/current/lib/x86_64-linux-gnu | sudo tee /etc/ld.so.conf.d/wsl-mesa.conf
 sudo ldconfig
 # Vulkan ICD search:
 sudo install -d /etc/vulkan/icd.d
-sudo ln -sf /opt/wsl-mesa/share/vulkan/icd.d/dzn_icd.x86_64.json \
+sudo ln -sf /opt/wsl-mesa/current/share/vulkan/icd.d/dzn_icd.x86_64.json \
             /etc/vulkan/icd.d/dzn_icd.x86_64.json
 ```
 
 To **opt in per-process** instead of system-wide:
 ```bash
-export LD_LIBRARY_PATH=/opt/wsl-mesa/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
-export VK_DRIVER_FILES=/opt/wsl-mesa/share/vulkan/icd.d/dzn_icd.x86_64.json
+export LD_LIBRARY_PATH=/opt/wsl-mesa/current/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+export VK_DRIVER_FILES=/opt/wsl-mesa/current/share/vulkan/icd.d/dzn_icd.x86_64.json
 export __GLX_VENDOR_LIBRARY_NAME=mesa
 export MESA_LOADER_DRIVER_OVERRIDE=d3d12
 ```
@@ -90,3 +90,8 @@ Mesa build before shipping a production bundle. The bundle's graphics version,
 source commit, LLVM/Mesa build inputs, and artifact digest must be recorded in
 the signed manifest. Kernel modules and the host's proprietary graphics stack
 are excluded from this userspace artifact.
+
+The production D3D12 share hook discovers the fixed
+`/run/appsandbox/display-d3d12.sock` endpoint when the encoder service is
+present; no per-session `ASB_MUTTER_D3D12_SHARE_SOCKET` export is required.
+The optional variable remains available only as a diagnostic socket override.

@@ -154,9 +154,7 @@ index 0000000..0000000
 +constexpr uint32_t kConsumerReady = 2;
 +constexpr uint32_t kFrameInfo = 3;
 +constexpr uint32_t kSlotCount = 3;
-+constexpr uint32_t kWidth = 3840;
-+constexpr uint32_t kHeight = 2160;
-+constexpr uint32_t kFrames = 3600;
++/* Production dimensions come from the actual Mutter render target. */
 +constexpr int kPollTimeoutMs = 0;
 +
 +struct ResourceBundle {
@@ -301,7 +299,7 @@ index 0000000..0000000
 +{
 +   const char *path = getenv("ASB_MUTTER_D3D12_SHARE_SOCKET");
 +   if (!path || !*path)
-+      return false;
++      path = "/run/appsandbox/display-d3d12.sock";
 +   if (strlen(path) >= sizeof(((struct sockaddr_un *)nullptr)->sun_path))
 +      return false;
 +   probe->socket_fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
@@ -332,7 +330,9 @@ index 0000000..0000000
 +      fflush(stderr);
 +      ensure_logged = true;
 +   }
-+   if (source_desc.Width != kWidth || source_desc.Height != kHeight ||
++   if (source_desc.Width == 0 || source_desc.Height == 0 ||
++       source_desc.Width > 16384 || source_desc.Height > 16384 ||
++       (source_desc.Width & 1) || (source_desc.Height & 1) ||
 +       source_desc.SampleDesc.Count != 1 ||
 +       !(source_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
 +         source_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM)) {
@@ -381,8 +381,9 @@ index 0000000..0000000
 +                                       IID_PPV_ARGS(&probe->fence))))
 +      return false;
 +
-+   ResourceBundle bundle = {kMagic, kResourceBundle, kWidth, kHeight,
-+                            kSlotCount, kFrames,
++   ResourceBundle bundle = {kMagic, kResourceBundle,
++                            static_cast<uint32_t>(source_desc.Width), source_desc.Height,
++                            kSlotCount, 0,
 +                            static_cast<uint32_t>(source_desc.Format), 0, 1,
 +                            kSlotCount};
 +   std::vector<int> fds;
@@ -408,7 +409,7 @@ index 0000000..0000000
 +   fflush(stderr);
 +   debug_printf("PASS stage=mutter-real-render-target synthetic_source=0 "
 +                "width=%u height=%u format=%s dxgi_format=%u\n",
-+                kWidth, kHeight,
++                static_cast<unsigned>(source_desc.Width), source_desc.Height,
 +                source_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ? "RGBA8" : "BGRA8",
 +                static_cast<unsigned>(source_desc.Format));
 +   debug_printf("PASS stage=mutter-shared-resource format=%s "
@@ -467,22 +468,22 @@ index 0000000..0000000
 +
 +bool d3d12_mutter_share_probe_record(struct d3d12_context *ctx)
 +{
-+   if (getenv("ASB_MUTTER_D3D12_SHARE_SOCKET")) {
-+      void *cbuf_texture = (void *)ctx->fb.cbufs[0].texture;
-+      if (cbuf_texture && !hook_logged) {
-+         fprintf(stderr, "MUTTER_D3D12 hook-target has_commands=%d cbuf_texture=%p\\n",
-+                 ctx->has_commands, cbuf_texture);
-+         fflush(stderr);
-+         hook_logged = true;
-+      } else if (!cbuf_texture && !empty_hook_logged) {
-+         fprintf(stderr, "MUTTER_D3D12 hook-empty has_commands=%d\\n",
-+                 ctx->has_commands);
-+         fflush(stderr);
-+         empty_hook_logged = true;
-+      }
++   if (access("/run/appsandbox/display-d3d12.sock", F_OK) != 0 &&
++       !getenv("ASB_MUTTER_D3D12_SHARE_SOCKET"))
++      return false;
++   void *cbuf_texture = (void *)ctx->fb.cbufs[0].texture;
++   if (cbuf_texture && !hook_logged) {
++      fprintf(stderr, "MUTTER_D3D12 hook-target has_commands=%d cbuf_texture=%p\\n",
++              ctx->has_commands, cbuf_texture);
++      fflush(stderr);
++      hook_logged = true;
++   } else if (!cbuf_texture && !empty_hook_logged) {
++      fprintf(stderr, "MUTTER_D3D12 hook-empty has_commands=%d\\n",
++              ctx->has_commands);
++      fflush(stderr);
++      empty_hook_logged = true;
 +   }
-+   if (!getenv("ASB_MUTTER_D3D12_SHARE_SOCKET") ||
-+       !ctx->fb.cbufs[0].texture)
++   if (!ctx->fb.cbufs[0].texture)
 +      return false;
 +   auto **state = reinterpret_cast<Probe **>(&ctx->mutter_share_probe);
 +   if (!*state)

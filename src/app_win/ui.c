@@ -1140,9 +1140,9 @@ static void on_webview2_message(const wchar_t *json)
             VmInstance *inst = asb_vm_instance(asb_vm_get(idx));
             OPENFILENAMEW ofn;
             wchar_t bundle[MAX_PATH] = {0};
-            if (!inst || _wcsicmp(inst->os_type, L"Linux") != 0 || !inst->guest_updater_supported ||
+            if (!inst || _wcsicmp(inst->os_type, L"Linux") != 0 ||
                 !inst->agent_online || inst->update_active) {
-                ui_show_alert(L"This Linux guest is offline, busy, or does not have the Guest Updater installed.");
+                ui_show_alert(L"This Linux guest is offline or busy.");
                 return;
             }
             ZeroMemory(&ofn, sizeof(ofn));

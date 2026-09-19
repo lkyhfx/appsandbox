@@ -156,7 +156,7 @@ static int u_cp_file(const wchar_t *src, const wchar_t *dst)
     return 0;
 }
 
-/* Recursive copy: src_dir/* -> dst_dir/. Creates dst_dir. */
+/* Recursive copy of src_dir contents into dst_dir. Creates dst_dir. */
 static int u_cp_tree(const wchar_t *src_dir, const wchar_t *dst_dir)
 {
     u_mkdir_p(dst_dir);
@@ -442,5 +442,73 @@ int do_prefetch_repo(const wchar_t *branch, const wchar_t *out_dir)
     }
 
     log_msg(L"prefetch-repo: OK -> %s", out_dir);
+    return 0;
+}
+
+/* Production path: the Host release has already selected and shipped every
+ * guest artifact.  Keep the copy list explicit so a resource accidentally
+ * added to the Host bundle cannot become guest code without a provisioning
+ * review. */
+int do_prefetch_release(const wchar_t *resources_dir, const wchar_t *out_dir)
+{
+    static const struct {
+        const wchar_t *src;
+        const wchar_t *dst;
+        int required;
+    } files[] = {
+        { L"updater/appsandbox-guest-updater", L"updater/appsandbox-guest-updater", 1 },
+        { L"updater/appsandbox-guest-updater.sha256", L"updater/appsandbox-guest-updater.sha256", 1 },
+        { L"updater/appsandbox-guest-updater.service", L"systemd/appsandbox-guest-updater.service", 1 },
+        { L"updater/appsandbox-guest-update-watch.service", L"systemd/appsandbox-guest-update-watch.service", 1 },
+        { L"updater/trusted-public-key.hex", L"trusted-public-key.hex", 1 },
+        { L"guest-runtime.version", L"guest-runtime.version", 1 },
+        { L"modprobe.d-asb_drm.conf", L"modprobe.d-asb_drm.conf", 0 },
+        { L"50-appsandbox-gpu", L"50-appsandbox-gpu", 0 },
+        { L"org.gnome.Shell-no-gpu.conf", L"org.gnome.Shell-no-gpu.conf", 0 },
+        { L"appsandbox-gpu", L"appsandbox-gpu", 0 },
+        { L"wsl-mesa.tar.zst", L"wsl-mesa.tar.zst", 0 }
+    };
+    static const struct {
+        const wchar_t *name;
+        int required;
+    } trees[] = {
+        { L"agent-src", 1 }, { L"asb_drm-src", 1 },
+        { L"dxgkrnl-src", 1 }, { L"systemd", 1 },
+        { L"updater-src", 0 }
+    };
+    size_t i;
+    if (!resources_dir || !out_dir || !resources_dir[0] || !out_dir[0]) return -1;
+    if (GetFileAttributesW(resources_dir) == INVALID_FILE_ATTRIBUTES) {
+        log_err(L"prefetch-release: Host release resource directory missing: %s", resources_dir);
+        return -1;
+    }
+    u_mkdir_p(out_dir);
+    for (i = 0; i < sizeof(trees) / sizeof(trees[0]); i++) {
+        wchar_t src[MAX_PATH], dst[MAX_PATH];
+        swprintf_s(src, MAX_PATH, L"%s\\%s", resources_dir, trees[i].name);
+        swprintf_s(dst, MAX_PATH, L"%s\\%s", out_dir, trees[i].name);
+        if (GetFileAttributesW(src) == INVALID_FILE_ATTRIBUTES) {
+            if (trees[i].required) {
+                log_err(L"prefetch-release: required source tree missing: %s", src);
+                return -1;
+            }
+        } else if (u_cp_tree(src, dst) < 0) {
+            return -1;
+        }
+    }
+    for (i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        wchar_t src[MAX_PATH], dst[MAX_PATH];
+        swprintf_s(src, MAX_PATH, L"%s\\%s", resources_dir, files[i].src);
+        swprintf_s(dst, MAX_PATH, L"%s\\%s", out_dir, files[i].dst);
+        if (GetFileAttributesW(src) == INVALID_FILE_ATTRIBUTES) {
+            if (files[i].required) {
+                log_err(L"prefetch-release: required artifact missing: %s", src);
+                return -1;
+            }
+            continue;
+        }
+        if (u_cp_file(src, dst) != 0) return -1;
+    }
+    log_msg(L"prefetch-release: pinned Host resources staged from %s", resources_dir);
     return 0;
 }
