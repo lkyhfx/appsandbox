@@ -12,4 +12,4 @@ If there is no `.codegraph/` directory, skip CodeGraph entirely — indexing is 
 For non-trivial tasks, delegate independent exploration,
 code-path tracing, test discovery, and verification to parallel
 Luna subagents. Keep planning, architectural decisions,
-integration, and final validation in the primary Sol agent.
+integration, and final validation in the primary agent.
