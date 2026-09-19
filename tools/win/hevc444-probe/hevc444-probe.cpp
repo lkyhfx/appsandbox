@@ -194,9 +194,9 @@ static bool probe_media_foundation(const D3D11Context &d3d11,
         WCHAR *name = nullptr;
         UINT32 name_length = 0;
         GUID clsid = GUID_NULL;
-        (void)activates[i]->GetString(MFT_FRIENDLY_NAME_Attribute, &name,
-                                      &name_length);
-        (void)activates[i]->GetGUID(MFT_CLSID_Attribute, &clsid);
+        (void)activates[i]->GetAllocatedString(MFT_FRIENDLY_NAME_Attribute,
+                                                &name, &name_length);
+        (void)activates[i]->GetGUID(MFT_TRANSFORM_CLSID_Attribute, &clsid);
         std::printf("decoder name=%ls CLSID=%s hardware_status=1\n",
                     name ? name : L"(unknown)", guid_string(clsid).c_str());
         if (name) CoTaskMemFree(name);
@@ -350,20 +350,6 @@ static bool probe_d3d12_decode(const D3D11Context &d3d11,
 
 static bool probe_ayuv_to_rgb(const D3D11Context &d3d11)
 {
-    UINT ayuv_caps = 0, bgra_caps = 0;
-    HRESULT hr = d3d11.video_device->CheckVideoProcessorFormat(
-        DXGI_FORMAT_AYUV, &ayuv_caps);
-    if (SUCCEEDED(hr)) hr = d3d11.video_device->CheckVideoProcessorFormat(
-        DXGI_FORMAT_B8G8R8A8_UNORM, &bgra_caps);
-    const bool formats_ok = SUCCEEDED(hr) &&
-        (ayuv_caps & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT) != 0 &&
-        (bgra_caps & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT) != 0;
-    if (!formats_ok) {
-        if (FAILED(hr)) print_hr("host-ayuv-to-rgb-format-query", hr);
-        else std::fputs("BLOCKED stage=host-ayuv-to-rgb-video-processor "
-                        "reason=format-support\n", stderr);
-        return false;
-    }
     D3D11_VIDEO_PROCESSOR_CONTENT_DESC content = {};
     content.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
     content.InputFrameRate = {kFpsNumerator, kFpsDenominator};
@@ -374,11 +360,25 @@ static bool probe_ayuv_to_rgb(const D3D11Context &d3d11)
     content.OutputHeight = kHeight;
     content.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
     ComPtr<ID3D11VideoProcessorEnumerator> enumerator;
-    hr = d3d11.video_device->CreateVideoProcessorEnumerator(&content,
-                                                             &enumerator);
+    HRESULT hr = d3d11.video_device->CreateVideoProcessorEnumerator(
+        &content, &enumerator);
     if (SUCCEEDED(hr)) {
         D3D11_VIDEO_PROCESSOR_CAPS caps = {};
         hr = enumerator->GetVideoProcessorCaps(&caps);
+    }
+    UINT ayuv_caps = 0, bgra_caps = 0;
+    if (SUCCEEDED(hr)) hr = enumerator->CheckVideoProcessorFormat(
+        DXGI_FORMAT_AYUV, &ayuv_caps);
+    if (SUCCEEDED(hr)) hr = enumerator->CheckVideoProcessorFormat(
+        DXGI_FORMAT_B8G8R8A8_UNORM, &bgra_caps);
+    const bool formats_ok = SUCCEEDED(hr) &&
+        (ayuv_caps & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT) != 0 &&
+        (bgra_caps & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_OUTPUT) != 0;
+    if (!formats_ok) {
+        if (FAILED(hr)) print_hr("host-ayuv-to-rgb-format-query", hr);
+        else std::fputs("BLOCKED stage=host-ayuv-to-rgb-video-processor "
+                        "reason=format-support\n", stderr);
+        return false;
     }
     ComPtr<ID3D11VideoProcessor> processor;
     if (SUCCEEDED(hr)) hr = d3d11.video_device->CreateVideoProcessor(

@@ -1663,8 +1663,11 @@ static bool encode_consumer_main(int control_fd)
     std::printf("%s stage=consumer-done-eventfd slots=3 "
                 "set_event_on_completion=1 scm_rights=1\n",
                 stage_prefix(production_session));
-    std::printf("%s stage=consumer-gpu-operation %s_to_nv12=GPU-only "
-                "d3d12_encode=GPU-only cpu_framebuffer_copy=0\n",
+    std::printf(hevc444_session
+                    ? "%s stage=consumer-gpu-operation %s_to_ayuv=GPU-only "
+                      "d3d12_encode=GPU-only cpu_framebuffer_copy=0\n"
+                    : "%s stage=consumer-gpu-operation %s_to_nv12=GPU-only "
+                      "d3d12_encode=GPU-only cpu_framebuffer_copy=0\n",
                 stage_prefix(production_session),
                 bundle.format == kDxgiFormatR8G8B8A8Unorm ? "rgba" : "bgra");
 
