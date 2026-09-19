@@ -315,17 +315,25 @@ static int file_read_limited(const char *path, unsigned char **out, size_t *out_
 static int atomic_write_file(const char *path, const void *data, size_t len, mode_t mode)
 {
     char tmp[PATH_MAX];
-    int fd, ok = -1;
+    int fd;
     if (snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", path, (long)getpid()) >= (int)sizeof(tmp))
         return -1;
     fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, mode);
     if (fd < 0) return -1;
-    if (write_all(fd, data, len) == 0 && fsync(fd) == 0 && close(fd) == 0 &&
-        rename(tmp, path) == 0 && fsync_parent(path) == 0)
-        ok = 0;
-    else close(fd);
-    if (ok < 0) unlink(tmp);
-    return ok;
+    if (write_all(fd, data, len) < 0 || fsync(fd) < 0)
+        goto fail;
+    if (close(fd) < 0) {
+        fd = -1;
+        goto fail;
+    }
+    fd = -1;
+    if (rename(tmp, path) < 0 || fsync_parent(path) < 0)
+        goto fail;
+    return 0;
+fail:
+    if (fd >= 0) close(fd);
+    unlink(tmp);
+    return -1;
 }
 
 /* Stream a regular file through an atomic replacement. This is used for the
@@ -348,19 +356,28 @@ static int copy_file_atomic(const char *source, const char *target, mode_t mode)
     if (out < 0) { close(in); return -1; }
     for (;;) {
         ssize_t n = read(in, buf, sizeof(buf));
-        ssize_t written;
         if (n < 0 && errno == EINTR) continue;
         if (n < 0) break;
         if (n == 0) { ok = 0; break; }
         copied += (uint64_t)n;
         if (copied > UPDATE_MAX_FILE_SIZE) break;
-        written = write(out, buf, (size_t)n);
-        if (written != n) break;
+        if (write_all(out, buf, (size_t)n) < 0) break;
     }
-    if (ok == 0 && fchmod(out, mode & 07777) == 0 && fsync(out) == 0 &&
-        close(out) == 0 && close(in) == 0 && rename(tmp, target) == 0 &&
-        fsync_parent(target) == 0)
-        return 0;
+    if (ok == 0 && fchmod(out, mode & 07777) == 0 && fsync(out) == 0) {
+        if (close(out) < 0) {
+            out = -1;
+            goto fail;
+        }
+        out = -1;
+        if (close(in) < 0) {
+            in = -1;
+            goto fail;
+        }
+        in = -1;
+        if (rename(tmp, target) == 0 && fsync_parent(target) == 0)
+            return 0;
+    }
+fail:
     if (out >= 0) close(out);
     if (in >= 0) close(in);
     unlink(tmp);
@@ -1464,11 +1481,12 @@ static void health_read_producer(HealthResult *h)
         }
         for (i = 0; i < sizeof(fields) / sizeof(fields[0]); i++)
             if (!strcmp(line, fields[i].name)) break;
-        if (i == sizeof(fields) / sizeof(fields[0]) || (seen & (1U << i)) || value > INT_MAX) goto done;
+        if (i == sizeof(fields) / sizeof(fields[0]) || (seen & (1U << i)) || value > INT_MAX ||
+            (i != 10 && value > 1)) goto done;
         *(int *)((char *)h + fields[i].offset) = (int)value;
         seen |= 1U << i;
     }
-    /* 13 numeric health fields, frames_encoded, graphics metadata, session,
+    /* 12 numeric health fields, frames_encoded, graphics metadata, session,
      * resolution, and timestamp are all required before readiness is trusted. */
     h->producer_valid = seen == ((1U << 17) - 1U);
 done:
