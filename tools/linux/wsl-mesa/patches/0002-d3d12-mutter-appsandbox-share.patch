@@ -1,10 +1,10 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+﻿From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: AppSandbox contributors <appsandbox@example.invalid>
 Date: Fri, 18 Sep 2026 00:00:00 +0800
 Subject: [PATCH] d3d12: native AppSandbox shared ring for Mutter
 
 This patch is enabled only for the AppSandbox D3D12 display path. It is gated by
-ASB_MUTTER_D3D12_SHARE_SOCKET and is not used by appsandbox-display.
+the deterministic ASB_D3D12_DISPLAY=1 feature flag and the fixed control socket.
 
 Hook points:
 
@@ -20,7 +20,7 @@ No mmap, glReadPixels, PRIME, DMA-BUF, CPU pixel copy, or shared fence is used.
 The consumer receives the resource and ready event descriptors with SCM_RIGHTS
 and opens the resources on an independent D3D12 device.
 
-The probe currently uses `gpu_copy=1` because the D3D12 driver owns the shared
+The share currently uses `gpu_copy=1` because the D3D12 driver owns the shared
 ring while Mutter owns the render target.  This is the explicitly allowed
 second-priority path; the direct shared render-target path remains a separate
 optimization after this evidence is collected.
@@ -28,30 +28,30 @@ optimization after this evidence is collected.
 ---
  src/gallium/drivers/d3d12/d3d12_context.h            |   1 +
  src/gallium/drivers/d3d12/d3d12_context_common.cpp   |   6 +
- src/gallium/drivers/d3d12/d3d12_mutter_share_probe.cpp | 434 ++++++++++++++++++++++++
- src/gallium/drivers/d3d12/d3d12_mutter_share_probe.h |  15 +
+ src/gallium/drivers/d3d12/d3d12_appsandbox_share.cpp | 434 ++++++++++++++++++++++++
+ src/gallium/drivers/d3d12/d3d12_appsandbox_share.h |  15 +
  src/gallium/drivers/d3d12/meson.build                |   1 +
  5 files changed, 457 insertions(+)
 
-diff --git a/src/gallium/drivers/d3d12/d3d12_mutter_share_probe.h b/src/gallium/drivers/d3d12/d3d12_mutter_share_probe.h
+diff --git a/src/gallium/drivers/d3d12/d3d12_appsandbox_share.h b/src/gallium/drivers/d3d12/d3d12_appsandbox_share.h
 new file mode 100644
 index 0000000..0000000
 --- /dev/null
-+++ b/src/gallium/drivers/d3d12/d3d12_mutter_share_probe.h
++++ b/src/gallium/drivers/d3d12/d3d12_appsandbox_share.h
 @@ -0,0 +1,15 @@
 +/* SPDX-License-Identifier: MIT */
-+#ifndef D3D12_MUTTER_SHARE_PROBE_H
-+#define D3D12_MUTTER_SHARE_PROBE_H
++#ifndef D3D12_APPSANDBOX_SHARE_H
++#define D3D12_APPSANDBOX_SHARE_H
 +
 +struct d3d12_context;
 +
 +/* Returns true when a copy was recorded in the current command list. */
-+bool d3d12_mutter_share_probe_record(struct d3d12_context *ctx);
++bool d3d12_appsandbox_share_record(struct d3d12_context *ctx);
 +
 +/* Called after d3d12_flush_cmdlist() submits the list containing the copy. */
-+void d3d12_mutter_share_probe_publish(struct d3d12_context *ctx);
++void d3d12_appsandbox_share_publish(struct d3d12_context *ctx);
 +
-+void d3d12_mutter_share_probe_destroy(struct d3d12_context *ctx);
++void d3d12_appsandbox_share_destroy(struct d3d12_context *ctx);
 +
 +#endif
 diff --git a/src/gallium/drivers/d3d12/d3d12_context.h b/src/gallium/drivers/d3d12/d3d12_context.h
@@ -64,7 +64,7 @@ index 0000000..0000000 100644
  #else
     void *resource_state_manager; /* opaque pointer; we don't know about classes in C */
  #endif
-+   void *mutter_share_probe;
++   void *appsandbox_share;
  
  #ifdef HAVE_GALLIUM_D3D12_GRAPHICS
 diff --git a/src/gallium/drivers/d3d12/d3d12_context_common.cpp b/src/gallium/drivers/d3d12/d3d12_context_common.cpp
@@ -75,13 +75,13 @@ index 0000000..0000000 100644
  #include "d3d12_blit.h"
  #include "d3d12_cmd_signature.h"
  #include "d3d12_context.h"
-+#include "d3d12_mutter_share_probe.h"
++#include "d3d12_appsandbox_share.h"
  #ifdef HAVE_GALLIUM_D3D12_GRAPHICS
 @@ -71,4 +71,5 @@ static void
  d3d12_context_destroy(struct pipe_context *pctx)
  {
     struct d3d12_context *ctx = d3d12_context(pctx);
-+   d3d12_mutter_share_probe_destroy(ctx);
++   d3d12_appsandbox_share_destroy(ctx);
  
 @@ -100,11 +101,15 @@ static void
  static void
@@ -92,11 +92,11 @@ index 0000000..0000000 100644
     struct d3d12_context *ctx = d3d12_context(pipe);
     struct d3d12_batch *batch = d3d12_current_batch(ctx);
  
-+   const bool mutter_probe_copy =
-+      d3d12_mutter_share_probe_record(ctx);
++   const bool appsandbox_share_copy =
++      d3d12_appsandbox_share_record(ctx);
     bool flushed = d3d12_flush_cmdlist(ctx);
-+   if (flushed && mutter_probe_copy)
-+      d3d12_mutter_share_probe_publish(ctx);
++   if (flushed && appsandbox_share_copy)
++      d3d12_appsandbox_share_publish(ctx);
  
     if (fence) {
 diff --git a/src/gallium/drivers/d3d12/meson.build b/src/gallium/drivers/d3d12/meson.build
@@ -105,17 +105,17 @@ index 0000000..0000000 100644
 +++ b/src/gallium/drivers/d3d12/meson.build
 @@ -100,2 +100,3 @@
    'd3d12_resource.cpp',
-+  'd3d12_mutter_share_probe.cpp',
++  'd3d12_appsandbox_share.cpp',
    'd3d12_resource_state.cpp',
-diff --git a/src/gallium/drivers/d3d12/d3d12_mutter_share_probe.cpp b/src/gallium/drivers/d3d12/d3d12_mutter_share_probe.cpp
+diff --git a/src/gallium/drivers/d3d12/d3d12_appsandbox_share.cpp b/src/gallium/drivers/d3d12/d3d12_appsandbox_share.cpp
 new file mode 100644
 index 0000000..0000000
 --- /dev/null
-+++ b/src/gallium/drivers/d3d12/d3d12_mutter_share_probe.cpp
++++ b/src/gallium/drivers/d3d12/d3d12_appsandbox_share.cpp
 @@ -0,0 +1,434 @@
 +/* SPDX-License-Identifier: MIT */
 +
-+#include "d3d12_mutter_share_probe.h"
++#include "d3d12_appsandbox_share.h"
 +
 +#include "d3d12_context.h"
 +#include "d3d12_resource.h"
@@ -172,9 +172,9 @@ index 0000000..0000000
 +   uint8_t expected_r, expected_g, expected_b, expected_a;
 +   uint32_t expected_valid;
 +};
-+static_assert(sizeof(ResourceBundle) == 40, "probe ABI");
-+static_assert(sizeof(ConsumerReady) == 20, "probe ABI");
-+static_assert(sizeof(FrameInfo) == 40, "probe ABI");
++static_assert(sizeof(ResourceBundle) == 40, "share ABI");
++static_assert(sizeof(ConsumerReady) == 20, "share ABI");
++static_assert(sizeof(FrameInfo) == 40, "share ABI");
 +
 +struct Slot {
 +   ComPtr<ID3D12Resource> resource;
@@ -183,7 +183,7 @@ index 0000000..0000000
 +   int done_fd = -1;
 +};
 +
-+struct Probe {
++struct AppsandboxShare {
 +   int socket_fd = -1;
 +   std::array<Slot, kSlotCount> slots;
 +   ComPtr<ID3D12Fence> fence;
@@ -295,20 +295,18 @@ index 0000000..0000000
 +      value, reinterpret_cast<HANDLE>(static_cast<intptr_t>(fd))));
 +}
 +
-+static bool connect_probe(Probe *probe)
++static bool connect_share(AppsandboxShare *share)
 +{
-+   const char *path = getenv("ASB_MUTTER_D3D12_SHARE_SOCKET");
-+   if (!path || !*path)
-+      path = "/run/appsandbox/display-d3d12.sock";
++   const char *path = "/run/appsandbox/display-d3d12.sock";
 +   if (strlen(path) >= sizeof(((struct sockaddr_un *)nullptr)->sun_path))
 +      return false;
-+   probe->socket_fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
-+   if (probe->socket_fd < 0)
++   share->socket_fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
++   if (share->socket_fd < 0)
 +      return false;
 +   sockaddr_un address = {};
 +   address.sun_family = AF_UNIX;
 +   strncpy(address.sun_path, path, sizeof(address.sun_path) - 1);
-+   if (connect(probe->socket_fd, reinterpret_cast<sockaddr *>(&address),
++   if (connect(share->socket_fd, reinterpret_cast<sockaddr *>(&address),
 +               sizeof(address)) != 0)
 +      return false;
 +   return true;
@@ -316,15 +314,15 @@ index 0000000..0000000
 +
 +static bool ensure_ring(struct d3d12_context *ctx,
 +                        struct d3d12_resource *source,
-+                        Probe *probe)
++                        AppsandboxShare *share)
 +{
-+   if (probe->initialized)
++   if (share->initialized)
 +      return true;
 +   struct d3d12_screen *screen = d3d12_screen(ctx->base.screen);
 +   ID3D12Resource *source_resource = d3d12_resource_resource(source);
 +   const D3D12_RESOURCE_DESC source_desc = source_resource->GetDesc();
 +   if (!ensure_logged) {
-+      fprintf(stderr, "MUTTER_D3D12 ensure-ring source width=%llu height=%u format=%u flags=0x%08x\\n",
++      fprintf(stderr, "ASB_D3D12 ensure-ring source width=%llu height=%u format=%u flags=0x%08x\\n",
 +              static_cast<unsigned long long>(source_desc.Width), source_desc.Height,
 +              static_cast<unsigned>(source_desc.Format), static_cast<unsigned>(source_desc.Flags));
 +      fflush(stderr);
@@ -336,13 +334,13 @@ index 0000000..0000000
 +       source_desc.SampleDesc.Count != 1 ||
 +       !(source_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
 +         source_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM)) {
-+      fprintf(stderr, "MUTTER_D3D12 blocker=real-render-target width=%llu height=%u format=%u\n",
++      fprintf(stderr, "ASB_D3D12 blocker=real-render-target width=%llu height=%u format=%u\n",
 +              static_cast<unsigned long long>(source_desc.Width), source_desc.Height,
 +              static_cast<unsigned>(source_desc.Format));
 +      fflush(stderr);
 +      return false;
 +   }
-+   debug_printf("MUTTER_D3D12 target_resource=%p width=%llu height=%u "
++   debug_printf("ASB_D3D12 target_resource=%p width=%llu height=%u "
 +                "format=%s dxgi_format=%u source_state=RENDER_TARGET "
 +                "source_desc_flags=0x%08x ring_heap_flag=D3D12_HEAP_FLAG_SHARED "
 +                "ring_slots=%u modifier=not-applicable\n",
@@ -351,8 +349,8 @@ index 0000000..0000000
 +                source_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ? "RGBA8" : "BGRA8",
 +                static_cast<unsigned>(source_desc.Format), static_cast<unsigned>(source_desc.Flags),
 +                kSlotCount);
-+   if (!connect_probe(probe)) {
-+      fprintf(stderr, "MUTTER_D3D12 blocker=consumer-connect errno=%d\n", errno);
++   if (!connect_share(share)) {
++      fprintf(stderr, "ASB_D3D12 blocker=consumer-connect errno=%d\n", errno);
 +      fflush(stderr);
 +      return false;
 +   }
@@ -365,20 +363,20 @@ index 0000000..0000000
 +      if (FAILED(screen->dev->CreateCommittedResource(
 +             &heap, D3D12_HEAP_FLAG_SHARED, &source_desc,
 +             D3D12_RESOURCE_STATE_COMMON, nullptr,
-+             IID_PPV_ARGS(&probe->slots[i].resource))))
++             IID_PPV_ARGS(&share->slots[i].resource))))
 +         return false;
 +      HANDLE raw = nullptr;
 +      if (FAILED(screen->dev->CreateSharedHandle(
-+             probe->slots[i].resource.Get(), nullptr, GENERIC_ALL, nullptr,
++             share->slots[i].resource.Get(), nullptr, GENERIC_ALL, nullptr,
 +             &raw)))
 +         return false;
-+      probe->slots[i].resource_fd = static_cast<int>(reinterpret_cast<intptr_t>(raw));
-+      probe->slots[i].ready_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-+      if (probe->slots[i].resource_fd < 0 || probe->slots[i].ready_fd < 0)
++      share->slots[i].resource_fd = static_cast<int>(reinterpret_cast<intptr_t>(raw));
++      share->slots[i].ready_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
++      if (share->slots[i].resource_fd < 0 || share->slots[i].ready_fd < 0)
 +         return false;
 +   }
 +   if (FAILED(screen->dev->CreateFence(0, D3D12_FENCE_FLAG_NONE,
-+                                       IID_PPV_ARGS(&probe->fence))))
++                                       IID_PPV_ARGS(&share->fence))))
 +      return false;
 +
 +   ResourceBundle bundle = {kMagic, kResourceBundle,
@@ -387,32 +385,32 @@ index 0000000..0000000
 +                            static_cast<uint32_t>(source_desc.Format), 0, 1,
 +                            kSlotCount};
 +   std::vector<int> fds;
-+   for (Slot &slot : probe->slots) {
++   for (Slot &slot : share->slots) {
 +      fds.push_back(slot.resource_fd);
 +      fds.push_back(slot.ready_fd);
 +   }
-+   if (!send_fds(probe->socket_fd, &bundle, sizeof(bundle), fds))
++   if (!send_fds(share->socket_fd, &bundle, sizeof(bundle), fds))
 +      return false;
-+   for (Slot &slot : probe->slots)
++   for (Slot &slot : share->slots)
 +      close_fd(slot.resource_fd); /* Mesa keeps the ID3D12Resource alive. */
 +   ConsumerReady ready = {};
 +   std::vector<int> received;
-+   if (!recv_fds(probe->socket_fd, &ready, sizeof(ready), received) ||
++   if (!recv_fds(share->socket_fd, &ready, sizeof(ready), received) ||
 +       ready.magic != kMagic || ready.type != kConsumerReady ||
 +       ready.opened_resources != kSlotCount ||
 +       ready.done_eventfds != kSlotCount || received.size() != kSlotCount)
 +      return false;
 +   for (uint32_t i = 0; i < kSlotCount; ++i)
-+      probe->slots[i].done_fd = received[i];
-+   probe->initialized = true;
-+   fprintf(stderr, "PASS stage=mutter-d3d12-renderer renderer=D3D12\n");
++      share->slots[i].done_fd = received[i];
++   share->initialized = true;
++   fprintf(stderr, "APPSANDBOX stage=d3d12-renderer renderer=D3D12\n");
 +   fflush(stderr);
-+   debug_printf("PASS stage=mutter-real-render-target synthetic_source=0 "
++   debug_printf("APPSANDBOX stage=real-render-target synthetic_source=0 "
 +                "width=%u height=%u format=%s dxgi_format=%u\n",
 +                static_cast<unsigned>(source_desc.Width), source_desc.Height,
 +                source_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ? "RGBA8" : "BGRA8",
 +                static_cast<unsigned>(source_desc.Format));
-+   debug_printf("PASS stage=mutter-shared-resource format=%s "
++   debug_printf("APPSANDBOX stage=shared-resource format=%s "
 +                "native_d3d12_shared=1 gpu_copy=1 cpu_copy=0 resource_count=3\n",
 +                source_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ? "RGBA8" : "BGRA8");
 +   return true;
@@ -420,36 +418,36 @@ index 0000000..0000000
 +
 +static bool record_copy(struct d3d12_context *ctx,
 +                        struct d3d12_resource *source,
-+                        Probe *probe)
++                        AppsandboxShare *share)
 +{
-+   if (!ctx->has_commands || !ensure_ring(ctx, source, probe))
++   if (!ctx->has_commands || !ensure_ring(ctx, source, share))
 +      return false;
 +   ID3D12Resource *source_resource = d3d12_resource_resource(source);
-+   if (probe->last_source != nullptr && probe->last_source != source_resource)
-+      ++probe->source_resource_changes;
-+   probe->last_source = source_resource;
-+   const uint32_t slot_index = static_cast<uint32_t>(probe->frame % kSlotCount);
++   if (share->last_source != nullptr && share->last_source != source_resource)
++      ++share->source_resource_changes;
++   share->last_source = source_resource;
++   const uint32_t slot_index = static_cast<uint32_t>(share->frame % kSlotCount);
 +   uint64_t recycle_us = 0;
-+   if (probe->frame >= kSlotCount &&
-+       !try_done(probe->slots[slot_index].done_fd, &recycle_us)) {
-+      debug_printf("MUTTER_D3D12 capture_drop=ring-full slot=%u\n", slot_index);
++   if (share->frame >= kSlotCount &&
++       !try_done(share->slots[slot_index].done_fd, &recycle_us)) {
++      debug_printf("ASB_D3D12 capture_drop=ring-full slot=%u\n", slot_index);
 +      return false;
 +   }
-+   if (probe->frame >= kSlotCount)
-+      probe->slot_recycle_us.push_back(recycle_us);
++   if (share->frame >= kSlotCount)
++      share->slot_recycle_us.push_back(recycle_us);
 +
-+   probe->copy_start_ns = now_ns();
++   share->copy_start_ns = now_ns();
 +   d3d12_transition_resource_state(ctx, source, D3D12_RESOURCE_STATE_COPY_SOURCE,
 +                                   D3D12_TRANSITION_FLAG_INVALIDATE_BINDINGS);
 +   d3d12_apply_resource_states(ctx, false);
 +   D3D12_RESOURCE_BARRIER barrier = {};
 +   barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-+   barrier.Transition.pResource = probe->slots[slot_index].resource.Get();
++   barrier.Transition.pResource = share->slots[slot_index].resource.Get();
 +   barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 +   barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
 +   barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
 +   ctx->cmdlist->ResourceBarrier(1, &barrier);
-+   ctx->cmdlist->CopyResource(probe->slots[slot_index].resource.Get(),
++   ctx->cmdlist->CopyResource(share->slots[slot_index].resource.Get(),
 +                              d3d12_resource_resource(source));
 +   barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
 +   barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
@@ -459,95 +457,98 @@ index 0000000..0000000
 +                                   D3D12_TRANSITION_FLAG_INVALIDATE_BINDINGS);
 +   d3d12_apply_resource_states(ctx, false);
 +   ctx->has_commands = true;
-+   probe->pending_slot = slot_index;
-+   probe->pending = true;
++   share->pending_slot = slot_index;
++   share->pending = true;
 +   return true;
 +}
 +
 +} // namespace
 +
-+bool d3d12_mutter_share_probe_record(struct d3d12_context *ctx)
++bool d3d12_appsandbox_share_record(struct d3d12_context *ctx)
 +{
-+   if (access("/run/appsandbox/display-d3d12.sock", F_OK) != 0 &&
-+       !getenv("ASB_MUTTER_D3D12_SHARE_SOCKET"))
++   const char *display = getenv("ASB_D3D12_DISPLAY");
++   if (!display || strcmp(display, "1") != 0 ||
++       access("/run/appsandbox/display-d3d12.sock", F_OK) != 0)
 +      return false;
 +   void *cbuf_texture = (void *)ctx->fb.cbufs[0].texture;
 +   if (cbuf_texture && !hook_logged) {
-+      fprintf(stderr, "MUTTER_D3D12 hook-target has_commands=%d cbuf_texture=%p\\n",
++      fprintf(stderr, "ASB_D3D12 hook-target has_commands=%d cbuf_texture=%p\\n",
 +              ctx->has_commands, cbuf_texture);
 +      fflush(stderr);
 +      hook_logged = true;
 +   } else if (!cbuf_texture && !empty_hook_logged) {
-+      fprintf(stderr, "MUTTER_D3D12 hook-empty has_commands=%d\\n",
++      fprintf(stderr, "ASB_D3D12 hook-empty has_commands=%d\\n",
 +              ctx->has_commands);
 +      fflush(stderr);
 +      empty_hook_logged = true;
 +   }
 +   if (!ctx->fb.cbufs[0].texture)
 +      return false;
-+   auto **state = reinterpret_cast<Probe **>(&ctx->mutter_share_probe);
++   auto **state = reinterpret_cast<AppsandboxShare **>(&ctx->appsandbox_share);
 +   if (!*state)
-+      *state = new Probe();
++      *state = new AppsandboxShare();
 +   struct d3d12_resource *source = d3d12_resource(ctx->fb.cbufs[0].texture);
 +   return record_copy(ctx, source, *state);
 +}
 +
-+void d3d12_mutter_share_probe_publish(struct d3d12_context *ctx)
++void d3d12_appsandbox_share_publish(struct d3d12_context *ctx)
 +{
-+   auto *probe = reinterpret_cast<Probe *>(ctx->mutter_share_probe);
-+   if (!probe || !probe->pending)
++   auto *share = reinterpret_cast<AppsandboxShare *>(ctx->appsandbox_share);
++   if (!share || !share->pending)
 +      return;
 +   struct d3d12_screen *screen = d3d12_screen(ctx->base.screen);
-+   if (probe->copy_start_ns != 0)
-+      probe->gpu_copy_us.push_back((now_ns() - probe->copy_start_ns) / 1000);
-+   const uint64_t value = probe->frame + 1;
-+   if (FAILED(screen->cmdqueue->Signal(probe->fence.Get(), value)) ||
-+       !set_completion(probe->fence.Get(), value,
-+                       probe->slots[probe->pending_slot].ready_fd)) {
-+      debug_printf("MUTTER_D3D12 blocker=producer-eventfd-sync\n");
-+      probe->pending = false;
++   if (share->copy_start_ns != 0)
++      share->gpu_copy_us.push_back((now_ns() - share->copy_start_ns) / 1000);
++   const uint64_t value = share->frame + 1;
++   if (FAILED(screen->cmdqueue->Signal(share->fence.Get(), value)) ||
++       !set_completion(share->fence.Get(), value,
++                       share->slots[share->pending_slot].ready_fd)) {
++      debug_printf("ASB_D3D12 blocker=producer-eventfd-sync\n");
++      share->pending = false;
 +      return;
 +   }
 +   const uint8_t expected_r = 31U;
 +   const uint8_t expected_g = 127U;
 +   const uint8_t expected_b = 223U;
-+   FrameInfo info = {kMagic, kFrameInfo, probe->frame, probe->pending_slot,
-+                     ((probe->frame + 1) % 120) == 0 ? 1U : 0U,
++   FrameInfo info = {kMagic, kFrameInfo, share->frame, share->pending_slot,
++                     ((share->frame + 1) % 120) == 0 ? 1U : 0U,
 +                     now_ns(),
 +                     expected_r, expected_g, expected_b, 255,
 +                     1};
-+   if (!send_fds(probe->socket_fd, &info, sizeof(info), {}))
-+      debug_printf("MUTTER_D3D12 blocker=consumer-control-socket\n");
-+   ++probe->frame;
-+   probe->pending = false;
++   if (!send_fds(share->socket_fd, &info, sizeof(info), {}))
++      debug_printf("ASB_D3D12 blocker=consumer-control-socket\n");
++   ++share->frame;
++   share->pending = false;
 +}
 +
-+void d3d12_mutter_share_probe_destroy(struct d3d12_context *ctx)
++void d3d12_appsandbox_share_destroy(struct d3d12_context *ctx)
 +{
-+   auto *probe = reinterpret_cast<Probe *>(ctx->mutter_share_probe);
-+   if (!probe)
++   auto *share = reinterpret_cast<AppsandboxShare *>(ctx->appsandbox_share);
++   if (!share)
 +      return;
 +   debug_printf("gpu_copy_us p50=%.3f p95=%.3f p99=%.3f samples=%zu\n",
-+                percentile_us(probe->gpu_copy_us, 0.50),
-+                percentile_us(probe->gpu_copy_us, 0.95),
-+                percentile_us(probe->gpu_copy_us, 0.99),
-+                probe->gpu_copy_us.size());
++                percentile_us(share->gpu_copy_us, 0.50),
++                percentile_us(share->gpu_copy_us, 0.95),
++                percentile_us(share->gpu_copy_us, 0.99),
++                share->gpu_copy_us.size());
 +   debug_printf("slot_recycle_us p50=%.3f p95=%.3f p99=%.3f samples=%zu\n",
-+                percentile_us(probe->slot_recycle_us, 0.50),
-+                percentile_us(probe->slot_recycle_us, 0.95),
-+                percentile_us(probe->slot_recycle_us, 0.99),
-+                probe->slot_recycle_us.size());
-+   debug_printf("MUTTER_D3D12 source_resource_changes=%llu frames=%llu\n",
-+                static_cast<unsigned long long>(probe->source_resource_changes),
-+                static_cast<unsigned long long>(probe->frame));
-+   for (Slot &slot : probe->slots) {
++                percentile_us(share->slot_recycle_us, 0.50),
++                percentile_us(share->slot_recycle_us, 0.95),
++                percentile_us(share->slot_recycle_us, 0.99),
++                share->slot_recycle_us.size());
++   debug_printf("ASB_D3D12 source_resource_changes=%llu frames=%llu\n",
++                static_cast<unsigned long long>(share->source_resource_changes),
++                static_cast<unsigned long long>(share->frame));
++   for (Slot &slot : share->slots) {
 +      close_fd(slot.resource_fd);
 +      close_fd(slot.ready_fd);
 +      close_fd(slot.done_fd);
 +   }
-+   close_fd(probe->socket_fd);
-+   delete probe;
-+   ctx->mutter_share_probe = nullptr;
++   close_fd(share->socket_fd);
++   delete share;
++   ctx->appsandbox_share = nullptr;
 +}
 -- 
 2.51.0
+
+

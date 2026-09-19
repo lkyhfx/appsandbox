@@ -36,8 +36,9 @@ all: appsandbox-guest-updater
 # The Host verifier is built in the release pipeline with the same public key.
 # Keep this target separate from the Linux updater so a missing cross compiler
 # cannot silently produce a release without the pinned helper.
-host-verifier: host/main.go
-	GO111MODULE=off GOOS=$(HOST_GOOS) GOARCH=$(HOST_GOARCH) $(HOST_GO) build -trimpath -ldflags '-s -w -X main.releasePublicKeyHex=$(PUBLIC_KEY_HEX)' \
+host-verifier: host/main.go host/go.mod host/go.sum
+	GOOS=$(HOST_GOOS) GOARCH=$(HOST_GOARCH) $(HOST_GO) build -mod=readonly -trimpath -buildvcs=false \
+		-ldflags '-s -w -X main.releasePublicKeyHex=$(PUBLIC_KEY_HEX)' \
 		-o appsandbox-guest-bundle-verifier.exe ./host
 
 appsandbox-guest-updater: appsandbox-guest-updater.c

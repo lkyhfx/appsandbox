@@ -14,6 +14,7 @@ RuntimeDirectory=appsandbox
 RuntimeDirectoryMode=0750
 User=root
 Environment=LD_LIBRARY_PATH=/opt/appsandbox/wsl-deps
+Environment=ASB_D3D12_DISPLAY=1
 StandardOutput=journal
 StandardError=journal
 

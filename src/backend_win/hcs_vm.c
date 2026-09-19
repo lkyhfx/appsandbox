@@ -811,6 +811,28 @@ BOOL hcs_try_open_vm(VmInstance *instance)
     return FALSE;
 }
 
+/* Reopen an existing compute system after an offline VHDX transaction.  The
+   stopped handle is intentionally kept so hcs_start_vm can start the same HCS
+   object; no VM or disk recreation is permitted during migration. */
+BOOL hcs_open_stopped_vm(VmInstance *instance)
+{
+    HCS_SYSTEM sys = NULL;
+    HRESULT hr;
+
+    if (!instance || !g_hcs_dll || !pfnOpen)
+        return FALSE;
+    hr = pfnOpen(instance->name, GENERIC_ALL, &sys);
+    if (FAILED(hr) || !sys) {
+        ui_log(L"hcs_open_stopped: open failed for \"%s\" (0x%08X)", instance->name, hr);
+        return FALSE;
+    }
+    instance->handle = sys;
+    instance->running = FALSE;
+    hcs_register_vm_callback(instance);
+    ui_log(L"hcs_open_stopped: reopened \"%s\" without recreating the VM.", instance->name);
+    return TRUE;
+}
+
 /* Wait for a file to become unlocked (vmwp.exe releasing handles after terminate).
    Returns TRUE if file is available, FALSE if still locked after timeout. */
 static BOOL wait_for_file_available(const wchar_t *path, int timeout_ms)
@@ -1627,6 +1649,16 @@ void hcs_close_handle_sync(HCS_SYSTEM handle)
 {
     if (g_hcs_dll && pfnClose && handle)
         pfnClose(handle);
+}
+
+void hcs_close_vm_sync(VmInstance *instance)
+{
+    HCS_SYSTEM handle;
+    if (!instance) return;
+    hcs_unregister_vm_callback(instance);
+    handle = instance->handle;
+    instance->handle = NULL;
+    hcs_close_handle_sync(handle);
 }
 
 BOOL hcs_query_guest_status(VmInstance *instance)

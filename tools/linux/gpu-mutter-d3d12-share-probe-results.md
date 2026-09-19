@@ -33,8 +33,8 @@ therefore still not a PASS. No synthetic frame or fake PASS is substituted.
 - `agent/d3d12-share-probe-protocol.h` — shared wire ABI.
 - `agent/d3d12-mutter-consumer.cpp` — socket listener using the validated
   D3D12 BGRA8 → GPU NV12 → HEVC consumer.
-- `agent/mutter-d3d12-share-probe.patch` — opt-in Mutter post-paint hook.
-- `wsl-mesa/patches/0002-d3d12-mutter-native-share-probe.patch` — opt-in Mesa
+- `agent/mutter-appsandbox-display.patch` — opt-in Mutter post-paint hook.
+- `wsl-mesa/patches/0002-d3d12-mutter-appsandbox-share.patch` — opt-in Mesa
   d3d12 hook for the real Gallium framebuffer.
 - `agent/gpu-mutter-d3d12-share-probe.sh` — isolated session runner.
 

@@ -24,8 +24,6 @@
 #pragma comment(lib, "ws2_32.lib")
 
 #define UPDATE_SERVICE_PORT 9
-#define BOOTSTRAP_SERVICE_PORT 10
-#define BOOTSTRAP_MAX_SIZE (64ULL * 1024ULL * 1024ULL)
 #define UPDATE_PROTOCOL     1
 #define UPDATE_MAX_BUNDLE   (512ULL * 1024ULL * 1024ULL)
 #define UPDATE_MAX_WAIT_MS  (180000UL)
@@ -41,6 +39,15 @@
 #ifndef ASB_BUNDLE_VERIFIER_SHA256
 #define ASB_BUNDLE_VERIFIER_SHA256 ""
 #endif
+#ifndef ASB_RELEASE_PUBLIC_KEY_HEX
+#define ASB_RELEASE_PUBLIC_KEY_HEX ""
+#endif
+
+/* Volatile storage keeps the exact release bindings visible in the Host PE;
+ * the release script checks these bytes in addition to the generated JSON. */
+static const volatile char g_embedded_release_public_key[] = ASB_RELEASE_PUBLIC_KEY_HEX;
+static const volatile char g_embedded_bootstrap_updater_sha256[] = ASB_BOOTSTRAP_UPDATER_SHA256;
+static const volatile char g_embedded_bundle_verifier_sha256[] = ASB_BUNDLE_VERIFIER_SHA256;
 
 #define AF_HYPERV 34
 #define HV_PROTOCOL_RAW 1
@@ -60,21 +67,6 @@ typedef struct UpdateStreamHeader {
     ULONGLONG bundle_size;
     BYTE sha256[32];
 } UpdateStreamHeader;
-#pragma pack(pop)
-
-#pragma pack(push, 1)
-typedef struct BootstrapHeader {
-    char magic[8];
-    DWORD protocol;
-    DWORD header_size;
-    ULONGLONG payload_size;
-    BYTE sha256[32];
-} BootstrapHeader;
-typedef struct BootstrapPayloadHeader {
-    ULONGLONG updater_size;
-    ULONGLONG service_size;
-    ULONGLONG watch_size;
-} BootstrapPayloadHeader;
 #pragma pack(pop)
 
 typedef struct UpdateJob {
@@ -212,29 +204,6 @@ done:
     return ok;
 }
 
-static BOOL sha256_buffer(const BYTE *data, SIZE_T size, BYTE digest[32])
-{
-    BCRYPT_ALG_HANDLE alg = NULL;
-    BCRYPT_HASH_HANDLE hash = NULL;
-    PUCHAR object = NULL;
-    DWORD object_len = 0, result = 0;
-    BOOL ok = FALSE;
-    if (!data || !digest || size > 0xffffffffULL) return FALSE;
-    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, NULL, 0) != 0 ||
-        BCryptGetProperty(alg, BCRYPT_OBJECT_LENGTH, (PUCHAR)&object_len,
-                          sizeof(object_len), &result, 0) != 0) goto done;
-    object = (PUCHAR)HeapAlloc(GetProcessHeap(), 0, object_len);
-    if (!object || BCryptCreateHash(alg, &hash, object, object_len, NULL, 0, 0) != 0 ||
-        BCryptHashData(hash, (PUCHAR)data, (ULONG)size, 0) != 0 ||
-        BCryptFinishHash(hash, digest, 32, 0) != 0) goto done;
-    ok = TRUE;
-done:
-    if (hash) BCryptDestroyHash(hash);
-    if (alg) BCryptCloseAlgorithmProvider(alg, 0);
-    if (object) HeapFree(GetProcessHeap(), 0, object);
-    return ok;
-}
-
 static BOOL read_file_bytes(const wchar_t *path, BYTE **data_out, ULONGLONG *size_out,
                             ULONGLONG max_size)
 {
@@ -264,6 +233,23 @@ done:
 static void hex_digest(const BYTE digest[32], char out[65]);
 static BOOL get_linux_resource_path(const wchar_t *relative, wchar_t *out, size_t cap);
 static BOOL verify_pinned_resource(const wchar_t *path, const char *embedded_sha);
+
+static BOOL embedded_release_trust_valid(void)
+{
+    const volatile char *values[] = { g_embedded_release_public_key,
+                                      g_embedded_bootstrap_updater_sha256,
+                                      g_embedded_bundle_verifier_sha256 };
+    size_t i, j;
+    for (i = 0; i < ARRAYSIZE(values); i++) {
+        size_t length = 0;
+        while (length <= 64 && values[i][length] != '\0') length++;
+        if (length != 64) return FALSE;
+        for (j = 0; j < length; j++) {
+            if (!isxdigit((unsigned char)values[i][j])) return FALSE;
+        }
+    }
+    return TRUE;
+}
 
 static BOOL append_quoted_arg(wchar_t *command, size_t cap, const wchar_t *arg)
 {
@@ -384,16 +370,6 @@ static BOOL get_linux_resource_path(const wchar_t *relative, wchar_t *out, size_
     return swprintf_s(out, cap, L"%s\\resources\\linux\\%s", exe, relative) > 0;
 }
 
-static BOOL pinned_updater_binary(wchar_t *binary, size_t cap)
-{
-    BYTE digest[32];
-    ULONGLONG file_size = 0;
-    if (!get_linux_resource_path(L"updater\\appsandbox-guest-updater", binary, cap) ||
-        !sha256_file(binary, digest, &file_size) ||
-        !verify_pinned_resource(binary, ASB_BOOTSTRAP_UPDATER_SHA256)) return FALSE;
-    return TRUE;
-}
-
 static BOOL verify_pinned_resource(const wchar_t *path, const char *embedded_sha)
 {
     wchar_t hash_path[MAX_PATH];
@@ -422,102 +398,175 @@ static BOOL verify_pinned_resource(const wchar_t *path, const char *embedded_sha
     return _stricmp(actual, expected) == 0;
 }
 
-static BOOL transfer_bootstrap(UpdateJob *job, const char *expected_sha)
+static BOOL flush_vhdx_path(const wchar_t *path)
 {
-    VmInstance *vm = asb_find_vm_by_id(job->vm_id);
-    wchar_t binary_path[MAX_PATH], service_path[MAX_PATH], watch_path[MAX_PATH];
-    BYTE *updater = NULL, *service = NULL, *watch = NULL, *payload = NULL, digest[32];
-    ULONGLONG updater_size = 0, service_size = 0, watch_size = 0, payload_size;
-    BootstrapPayloadHeader payload_header;
-    BootstrapHeader header;
-    SOCKET s = INVALID_SOCKET;
-    char response[64] = {0};
-    int n;
-    BOOL ok = FALSE;
-    if (!vm || !expected_sha ||
-        !pinned_updater_binary(binary_path, ARRAYSIZE(binary_path)) ||
-        !get_linux_resource_path(L"updater\\appsandbox-guest-updater.service", service_path, ARRAYSIZE(service_path)) ||
-        !get_linux_resource_path(L"updater\\appsandbox-guest-update-watch.service", watch_path, ARRAYSIZE(watch_path)) ||
-        !read_file_bytes(binary_path, &updater, &updater_size, BOOTSTRAP_MAX_SIZE) ||
-        !read_file_bytes(service_path, &service, &service_size, 1024 * 1024) ||
-        !read_file_bytes(watch_path, &watch, &watch_size, 1024 * 1024)) goto done;
-    if (updater_size > BOOTSTRAP_MAX_SIZE || service_size > 1024 * 1024 || watch_size > 1024 * 1024 ||
-        updater_size > 0xffffffffffffffffULL - sizeof(payload_header)) goto done;
-    payload_size = sizeof(payload_header) + updater_size + service_size + watch_size;
-    if (payload_size > BOOTSTRAP_MAX_SIZE || !sha256_buffer(updater, (SIZE_T)updater_size, digest)) goto done;
-    {
-        char actual[65];
-        hex_digest(digest, actual);
-        if (_stricmp(actual, expected_sha) != 0) goto done;
-    }
-    payload = (BYTE *)HeapAlloc(GetProcessHeap(), 0, (SIZE_T)payload_size);
-    if (!payload) goto done;
-    payload_header.updater_size = updater_size;
-    payload_header.service_size = service_size;
-    payload_header.watch_size = watch_size;
-    memcpy(payload, &payload_header, sizeof(payload_header));
-    memcpy(payload + sizeof(payload_header), updater, (SIZE_T)updater_size);
-    memcpy(payload + sizeof(payload_header) + (SIZE_T)updater_size, service, (SIZE_T)service_size);
-    memcpy(payload + sizeof(payload_header) + (SIZE_T)updater_size + (SIZE_T)service_size,
-           watch, (SIZE_T)watch_size);
-    if (!sha256_buffer(payload, (SIZE_T)payload_size, digest)) goto done;
-    /* Arm the guest through the fixed legacy-agent command before opening the
-     * dedicated bootstrap VSOCK channel. */
-    {
-        char sha[65], cmd[128];
-        char arm_response[128];
-        hex_digest(digest, sha);
-        sprintf_s(cmd, sizeof(cmd), "bootstrap_updater %llu %s",
-                  (unsigned long long)payload_size, sha);
-        if (!vm_agent_request(vm, cmd, arm_response, sizeof(arm_response), 10000) ||
-            strcmp(arm_response, "bootstrap_ready")) goto done;
-    }
-    s = connect_update_transport(vm, BOOTSTRAP_SERVICE_PORT);
-    if (s == INVALID_SOCKET) goto done;
-    ZeroMemory(&header, sizeof(header));
-    memcpy(header.magic, "ASBBST1", 7);
-    header.protocol = 1; header.header_size = sizeof(header); header.payload_size = payload_size;
-    memcpy(header.sha256, digest, sizeof(digest));
-    if (!send_all(s, &header, sizeof(header)) || !send_all(s, payload, (size_t)payload_size)) goto done;
-    n = recv(s, response, sizeof(response) - 1, 0);
-    if (n <= 0) goto done;
-    response[n] = '\0';
-    ok = strncmp(response, "ok", 2) == 0;
-done:
-    if (s != INVALID_SOCKET) closesocket(s);
-    if (payload) HeapFree(GetProcessHeap(), 0, payload);
-    if (updater) HeapFree(GetProcessHeap(), 0, updater);
-    if (service) HeapFree(GetProcessHeap(), 0, service);
-    if (watch) HeapFree(GetProcessHeap(), 0, watch);
+    HANDLE h;
+    BOOL ok;
+    if (!path || !path[0]) return FALSE;
+    h = CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return FALSE;
+    ok = FlushFileBuffers(h);
+    CloseHandle(h);
     return ok;
 }
 
-static BOOL bootstrap_guest_updater(UpdateJob *job)
+static BOOL windows_path_to_wsl(const wchar_t *windows_path, wchar_t *out, size_t cap)
 {
-    wchar_t binary_path[MAX_PATH], hash_path[MAX_PATH];
-    BYTE digest[32], *data = NULL;
-    ULONGLONG size = 0, hash_size = 0;
-    char sha[65], expected[65] = {0};
-    size_t n = 0;
-    (void)size;
-    if (!get_linux_resource_path(L"updater\\appsandbox-guest-updater", binary_path, ARRAYSIZE(binary_path)) ||
-        !get_linux_resource_path(L"updater\\appsandbox-guest-updater.sha256", hash_path, ARRAYSIZE(hash_path)) ||
-        !sha256_file(binary_path, digest, &size) || !read_file_bytes(hash_path, &data, &hash_size, 4096)) return FALSE;
-    hex_digest(digest, sha);
-    while (n < (size_t)hash_size && n < sizeof(expected) - 1 && data[n] != '\r' && data[n] != '\n' &&
-           data[n] != ' ' && data[n] != '\t') {
-        expected[n] = (char)data[n];
-        n++;
+    const wchar_t *p = windows_path;
+    size_t i, used;
+    if (!p || !out || cap < 5) return FALSE;
+    if (wcsncmp(p, L"\\\\?\\", 4) == 0) p += 4;
+    if (!((p[0] >= L'A' && p[0] <= L'Z') ||
+          (p[0] >= L'a' && p[0] <= L'z')) || p[1] != L':') return FALSE;
+    used = 0;
+    out[used++] = L'/';
+    out[used++] = (p[0] >= L'A' && p[0] <= L'Z') ? (wchar_t)(p[0] + (L'a' - L'A')) : p[0];
+    out[used++] = L'/';
+    for (i = 2; p[i]; i++) {
+        if (used + 2 >= cap) return FALSE;
+        out[used++] = p[i] == L'\\' ? L'/' : p[i];
     }
-    HeapFree(GetProcessHeap(), 0, data);
-    if (n != 64 || _stricmp(sha, expected) != 0) return FALSE;
-    if (!transfer_bootstrap(job, sha)) return FALSE;
-    {
-        VmInstance *vm = asb_find_vm_by_id(job->vm_id);
-        char response[128];
-        if (!vm || !vm_agent_request(vm, "update_migrate", response, sizeof(response), 10000) ||
-            (strcmp(response, "migrated") && strcmp(response, "ready"))) return FALSE;
+    out[used] = L'\0';
+    return TRUE;
+}
+
+static BOOL run_wsl_args(const wchar_t *args, DWORD timeout_ms)
+{
+    wchar_t exe[MAX_PATH], command_line[8192];
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    DWORD n, wait_result, exit_code = 1;
+    if (!args) return FALSE;
+    n = GetSystemDirectoryW(exe, ARRAYSIZE(exe));
+    if (!n || n >= ARRAYSIZE(exe) || swprintf_s(exe + n, ARRAYSIZE(exe) - n,
+                                                  L"\\wsl.exe") < 0) return FALSE;
+    if (swprintf_s(command_line, ARRAYSIZE(command_line), L"wsl.exe %s", args) < 0) return FALSE;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    ZeroMemory(&pi, sizeof(pi));
+    if (!CreateProcessW(exe, command_line, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+                        NULL, NULL, &si, &pi)) {
+        ui_log(L"offline migration: could not start wsl.exe (error %lu)", GetLastError());
+        return FALSE;
     }
+    wait_result = WaitForSingleObject(pi.hProcess, timeout_ms);
+    if (wait_result == WAIT_OBJECT_0)
+        GetExitCodeProcess(pi.hProcess, &exit_code);
+    else if (wait_result == WAIT_TIMEOUT)
+        TerminateProcess(pi.hProcess, 124);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return wait_result == WAIT_OBJECT_0 && exit_code == 0;
+}
+
+static BOOL wait_for_vm_stopped(VmInstance *vm)
+{
+    DWORD start = GetTickCount();
+    if (!vm) return FALSE;
+    while (GetTickCount() - start < 120000UL) {
+        if (!vm->running && !hcs_is_running_by_enum(vm->name)) return TRUE;
+        Sleep(250);
+    }
+    return FALSE;
+}
+
+static BOOL restart_after_offline_migration(VmInstance *vm)
+{
+    DWORD start;
+    if (!vm || !hcs_open_stopped_vm(vm) || FAILED(hcs_start_vm(vm))) {
+        if (vm && vm->handle) hcs_close_vm(vm);
+        return FALSE;
+    }
+    hcs_start_monitor(vm);
+    vm_agent_start(vm);
+    start = GetTickCount();
+    while (GetTickCount() - start < 120000UL) {
+        if (vm->agent_online && vm->guest_updater_supported) return TRUE;
+        Sleep(250);
+    }
+    return FALSE;
+}
+
+BOOL vm_guest_update_bootstrap_legacy(VmInstance *instance)
+{
+    wchar_t vhdx_wsl[4096], script_wsl[4096], updater_wsl[4096];
+    wchar_t service_wsl[4096], watch_wsl[4096], bootstrap_wsl[4096];
+    wchar_t updater[MAX_PATH], script[MAX_PATH], service[MAX_PATH];
+    wchar_t watch[MAX_PATH], bootstrap[MAX_PATH], args[8192];
+    BOOL mounted = FALSE, migrated = FALSE, restarted = FALSE;
+    BOOL stopped;
+    if (!instance || _wcsicmp(instance->os_type, L"Linux") != 0 ||
+        !instance->vhdx_path[0]) return FALSE;
+    stopped = !instance->running;
+    update_set(instance->unique_id, ASB_UPDATE_LEGACY_MIGRATION, 5, FALSE, NULL, NULL);
+    if (!get_linux_resource_path(L"updater\\appsandbox-guest-updater", updater, ARRAYSIZE(updater)) ||
+        !verify_pinned_resource(updater, ASB_BOOTSTRAP_UPDATER_SHA256) ||
+        !get_linux_resource_path(L"offline_legacy_bootstrap.py", script, ARRAYSIZE(script)) ||
+        !get_linux_resource_path(L"updater\\appsandbox-guest-updater.service", service, ARRAYSIZE(service)) ||
+        !get_linux_resource_path(L"updater\\appsandbox-guest-update-watch.service", watch, ARRAYSIZE(watch)) ||
+        !get_linux_resource_path(L"bootstrap-runtime", bootstrap, ARRAYSIZE(bootstrap)) ||
+        !windows_path_to_wsl(instance->vhdx_path, vhdx_wsl, ARRAYSIZE(vhdx_wsl)) ||
+        !windows_path_to_wsl(script, script_wsl, ARRAYSIZE(script_wsl)) ||
+        !windows_path_to_wsl(updater, updater_wsl, ARRAYSIZE(updater_wsl)) ||
+        !windows_path_to_wsl(service, service_wsl, ARRAYSIZE(service_wsl)) ||
+        !windows_path_to_wsl(watch, watch_wsl, ARRAYSIZE(watch_wsl)) ||
+        !windows_path_to_wsl(bootstrap, bootstrap_wsl, ARRAYSIZE(bootstrap_wsl))) goto done;
+    if (instance->running) {
+        if (FAILED(hcs_stop_vm(instance)) || !wait_for_vm_stopped(instance)) goto done;
+        stopped = TRUE;
+    }
+    vm_agent_stop(instance);
+    if (!flush_vhdx_path(instance->vhdx_path)) goto done;
+    if (instance->handle) hcs_close_vm_sync(instance);
+
+    args[0] = L'\0';
+    if (swprintf_s(args, ARRAYSIZE(args), L"--mount ") < 0 ||
+        !append_quoted_arg(args, ARRAYSIZE(args), instance->vhdx_path) ||
+        wcscat_s(args, ARRAYSIZE(args), L" --vhd --type ext4") != 0 ||
+        !run_wsl_args(args, 120000UL)) goto done;
+    mounted = TRUE;
+    update_set(instance->unique_id, ASB_UPDATE_LEGACY_MIGRATION, 45, FALSE, NULL, NULL);
+    args[0] = L'\0';
+    if (swprintf_s(args, ARRAYSIZE(args), L"-u root -- python3 ") < 0 ||
+        !append_quoted_arg(args, ARRAYSIZE(args), script_wsl) ||
+        wcscat_s(args, ARRAYSIZE(args), L" --discover-mounted-root --updater ") != 0 ||
+        !append_quoted_arg(args, ARRAYSIZE(args), updater_wsl) ||
+        wcscat_s(args, ARRAYSIZE(args), L" --service ") != 0 ||
+        !append_quoted_arg(args, ARRAYSIZE(args), service_wsl) ||
+        wcscat_s(args, ARRAYSIZE(args), L" --watch ") != 0 ||
+        !append_quoted_arg(args, ARRAYSIZE(args), watch_wsl) ||
+        wcscat_s(args, ARRAYSIZE(args), L" --bootstrap-root ") != 0 ||
+        !append_quoted_arg(args, ARRAYSIZE(args), bootstrap_wsl) ||
+        !run_wsl_args(args, 300000UL)) goto done;
+    migrated = TRUE;
+done:
+    if (mounted) {
+        args[0] = L'\0';
+        if (swprintf_s(args, ARRAYSIZE(args), L"--unmount ") >= 0 &&
+            append_quoted_arg(args, ARRAYSIZE(args), instance->vhdx_path))
+            run_wsl_args(args, 120000UL);
+        mounted = FALSE;
+    }
+    flush_vhdx_path(instance->vhdx_path);
+    if (!stopped) {
+        update_set(instance->unique_id, ASB_UPDATE_FAILED, 0, FALSE, NULL,
+                   "legacy_migration_shutdown_failed");
+        return FALSE;
+    }
+    restarted = restart_after_offline_migration(instance);
+    if (!restarted) {
+        update_set(instance->unique_id, ASB_UPDATE_FAILED, 0, FALSE, NULL,
+                   "legacy_migration_restart_failed");
+        return FALSE;
+    }
+    if (!migrated) {
+        update_set(instance->unique_id, ASB_UPDATE_FAILED, 0, FALSE, NULL,
+                   "legacy_migration_failed");
+        return FALSE;
+    }
+    update_set(instance->unique_id, ASB_UPDATE_VERIFYING, 8, FALSE, NULL, NULL);
     return TRUE;
 }
 
@@ -609,7 +658,8 @@ static DWORD WINAPI update_thread_proc(LPVOID param)
     ULONGLONG size = 0;
     char sha[65], txid[40], response[256], cmd[256];
     BOOL reboot = FALSE;
-    if (!vm || _wcsicmp(vm->os_type, L"Linux") != 0 || !vm->agent_online) goto fail;
+    if (!vm || _wcsicmp(vm->os_type, L"Linux") != 0 || !vm->agent_online ||
+        !embedded_release_trust_valid()) goto fail;
     update_set(job->vm_id, ASB_UPDATE_VERIFYING, 2, FALSE, NULL, NULL);
     if (!sha256_file(job->bundle_path, digest, &size)) { update_set(job->vm_id, ASB_UPDATE_FAILED, 0, FALSE, NULL, "bundle_read_failed"); goto done; }
     hex_digest(digest, sha);
@@ -621,19 +671,23 @@ static DWORD WINAPI update_thread_proc(LPVOID param)
     EnterCriticalSection(&g_update_cs);
     strncpy_s(job->txid, sizeof(job->txid), txid, _TRUNCATE);
     LeaveCriticalSection(&g_update_cs);
+    if (!vm->guest_updater_supported) {
+        update_set(job->vm_id, ASB_UPDATE_LEGACY_MIGRATION, 5, FALSE, txid, NULL);
+        if (!vm_guest_update_bootstrap_legacy(vm)) {
+            update_set(job->vm_id, ASB_UPDATE_FAILED, 0, FALSE, txid,
+                       "legacy_migration_failed");
+            goto done;
+        }
+        vm = asb_find_vm_by_id(job->vm_id);
+        if (!vm || !vm->agent_online || !vm->guest_updater_supported) {
+            update_set(job->vm_id, ASB_UPDATE_FAILED, 0, FALSE, txid,
+                       "updater_unavailable");
+            goto done;
+        }
+    }
     sprintf_s(cmd, sizeof(cmd), "update_query");
     if (!vm_agent_request(vm, cmd, response, sizeof(response), 5000) || strcmp(response, "ok")) {
-        /* Existing Linux guests have only the legacy agent.  Bootstrap is a
-         * fixed binary/unit protocol on VSOCK port 10; it is not a shell
-         * escape hatch and it does not accept a destination path. */
-        if (!vm->guest_updater_supported && bootstrap_guest_updater(job)) {
-            Sleep(1500);
-            if (!vm_agent_request(vm, cmd, response, sizeof(response), 10000) || strcmp(response, "ok")) {
-                update_set(job->vm_id, ASB_UPDATE_FAILED, 0, FALSE, txid, "updater_unavailable"); goto done;
-            }
-        } else {
-            update_set(job->vm_id, ASB_UPDATE_FAILED, 0, FALSE, txid, "updater_unavailable"); goto done;
-        }
+        update_set(job->vm_id, ASB_UPDATE_FAILED, 0, FALSE, txid, "updater_unavailable"); goto done;
     }
     sprintf_s(cmd, sizeof(cmd), "update_begin %s %llu %s", txid, (unsigned long long)size, sha);
     if (!vm_agent_request(vm, cmd, response, sizeof(response), 10000) || strcmp(response, "ready")) { update_set(job->vm_id, ASB_UPDATE_FAILED, 0, FALSE, txid, "begin_rejected"); goto done; }

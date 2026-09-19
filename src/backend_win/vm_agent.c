@@ -610,7 +610,17 @@ void vm_agent_start(VmInstance *instance)
 void vm_agent_stop(VmInstance *instance)
 {
     AgentConn *conn = find_conn(instance);
-    if (!conn) return;
+    if (!conn) {
+        if (instance) {
+            instance->agent_online = FALSE;
+            instance->idd_ready = FALSE;
+            instance->guest_caps[0] = '\0';
+            instance->guest_version[0] = '\0';
+            instance->graphics_version[0] = '\0';
+            instance->guest_updater_supported = FALSE;
+        }
+        return;
+    }
 
     conn->stop = TRUE;
 
@@ -631,6 +641,10 @@ void vm_agent_stop(VmInstance *instance)
 
     instance->agent_online = FALSE;
     instance->idd_ready = FALSE;
+    instance->guest_caps[0] = '\0';
+    instance->guest_version[0] = '\0';
+    instance->graphics_version[0] = '\0';
+    instance->guest_updater_supported = FALSE;
     free_conn(conn);
     notify_agent_status(instance);
 }

@@ -103,7 +103,46 @@ function Get-AsbVersion([string]$repoRoot) {
     return [pscustomobject]@{ Short = ($p[0..2] -join '.'); Full = ($p -join '.') }
 }
 
-function Get-ReleaseLinuxTrust([string]$repoRoot) {
+function Get-RequestedReleaseKey([string]$repoRoot) {
+    $root = Join-Path $repoRoot 'release\resources\linux'
+    $keyPath = Join-Path $root 'updater\trusted-public-key.hex'
+    $key = if ($PublicKeyHex) { $PublicKeyHex } elseif ($env:ASB_RELEASE_PUBLIC_KEY_HEX) { $env:ASB_RELEASE_PUBLIC_KEY_HEX } elseif (Test-Path $keyPath) { (Get-Content $keyPath -Raw).Trim() } else { '' }
+    if ($key -notmatch '^[0-9a-fA-F]{64}$' -or $key -match '^0+$') { throw 'A non-test ASB_RELEASE_PUBLIC_KEY_HEX is required to build Linux release artifacts.' }
+    $key = $key.ToLowerInvariant()
+    $knownTestKey = 'd75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a'
+    if ($key -eq $knownTestKey) { throw 'The RFC 8032 test public key cannot be a release trust anchor.' }
+    return $key
+}
+
+function Write-LinuxShaSidecar([string]$artifact, [string]$sidecar) {
+    $hash = (Get-FileHash $artifact -Algorithm SHA256).Hash.ToLowerInvariant()
+    Set-Content -Path $sidecar -Value "$hash  $(Split-Path $artifact -Leaf)" -Encoding utf8
+    return $hash
+}
+
+function Write-ReleaseTrust([string]$repoRoot, [string]$key) {
+    $root = Join-Path $repoRoot 'release\resources\linux'
+    $updater = Join-Path $root 'updater\appsandbox-guest-updater'
+    $verifier = Join-Path $root 'updater\appsandbox-guest-bundle-verifier.exe'
+    $graphics = Join-Path $root 'wsl-mesa.tar.zst'
+    $runtime = (Get-Content (Join-Path $root 'guest-runtime.version') -Raw).Trim()
+    $obj = [ordered]@{
+        schema = 1
+        public_key_hex = $key.ToLowerInvariant()
+        guest_runtime_version = $runtime
+        updater_sha256 = (Get-FileHash $updater -Algorithm SHA256).Hash.ToLowerInvariant()
+        verifier_sha256 = (Get-FileHash $verifier -Algorithm SHA256).Hash.ToLowerInvariant()
+        bootstrap_updater_sha256 = $null
+        bundle_verifier_sha256 = $null
+        graphics_artifact_sha256 = (Get-FileHash $graphics -Algorithm SHA256).Hash.ToLowerInvariant()
+        graphics_production_4k60 = $true
+    }
+    $obj.bootstrap_updater_sha256 = $obj.updater_sha256
+    $obj.bundle_verifier_sha256 = $obj.verifier_sha256
+    $obj | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $root 'updater\release-trust.json') -Encoding utf8
+}
+
+function Get-ReleaseLinuxTrust([string]$repoRoot, [string]$ExpectedKey = '') {
     $root = Join-Path $repoRoot 'release\resources\linux'
     $updater = Join-Path $root 'updater\appsandbox-guest-updater'
     $verifier = Join-Path $root 'updater\appsandbox-guest-bundle-verifier.exe'
@@ -118,35 +157,77 @@ function Get-ReleaseLinuxTrust([string]$repoRoot) {
         'updater\appsandbox-guest-bundle-verifier.exe.sha256',
         'systemd', 'agent-src', 'asb_drm-src', 'dxgkrnl-src',
         'modprobe.d-asb_drm.conf', '50-appsandbox-gpu', 'org.gnome.Shell-no-gpu.conf', 'appsandbox-gpu',
-        'wsl-mesa.tar.zst'
+        'wsl-mesa.tar.zst', 'wsl-mesa.BUILDINFO', 'offline_legacy_bootstrap.py',
+        'bootstrap-runtime', 'updater\release-trust.json'
     )
     $missing = @($required | Where-Object { -not (Test-Path (Join-Path $root $_)) })
     if ($missing.Count) { throw "Guest Update release tree is incomplete: $($missing -join ', ')" }
-    $key = (Get-Content (Join-Path $root 'updater\trusted-public-key.hex') -Raw).Trim()
+    $key = (Get-Content (Join-Path $root 'updater\trusted-public-key.hex') -Raw).Trim().ToLowerInvariant()
     if ($key -notmatch '^[0-9a-fA-F]{64}$' -or $key -match '^0+$') { throw 'trusted-public-key.hex is missing or malformed.' }
+    if ($ExpectedKey -and $key -ne $ExpectedKey.ToLowerInvariant()) { throw 'Linux release trust key does not match PublicKeyHex.' }
+    $trust = Get-Content (Join-Path $root 'updater\release-trust.json') -Raw | ConvertFrom-Json
+    if ($trust.schema -ne 1 -or $trust.public_key_hex.ToLowerInvariant() -ne $key -or
+        $trust.graphics_production_4k60 -ne $true) { throw 'release-trust.json is malformed or not production graphics.' }
+    $buildInfo = Get-Content (Join-Path $root 'wsl-mesa.BUILDINFO') -Raw
+    if ($buildInfo -notmatch '(?m)^production-4k60:\s*true\s*$' -or
+        $buildInfo -notmatch '(?m)^mesa-source-commit:\s*[0-9a-f]{40}\s*$' -or
+        $buildInfo -notmatch '(?m)^mesa-patchset-version:\s*[^\s]+\s*$') {
+        throw 'The Linux graphics artifact is not a production Mesa/Mutter 4K60 build.'
+    }
     function Read-Sidecar([string]$artifact, [string]$sidecar) {
         $actual = (Get-FileHash $artifact -Algorithm SHA256).Hash.ToLowerInvariant()
         $declared = ((Get-Content $sidecar -Raw) -split '\s+')[0].ToLowerInvariant()
         if ($declared -notmatch '^[0-9a-f]{64}$' -or $declared -ne $actual) { throw "SHA256 sidecar mismatch: $sidecar" }
         return $actual
     }
+    $updaterHash = Read-Sidecar $updater (Join-Path $root 'updater\appsandbox-guest-updater.sha256')
+    $verifierHash = Read-Sidecar $verifier (Join-Path $root 'updater\appsandbox-guest-bundle-verifier.exe.sha256')
+    $graphicsHash = (Get-FileHash (Join-Path $root 'wsl-mesa.tar.zst') -Algorithm SHA256).Hash.ToLowerInvariant()
+    $declaredGraphics = (($buildInfo -split "`r?`n") | Where-Object { $_ -match '^artifact-sha256:' } | ForEach-Object { ($_ -split ':', 2)[1].Trim().ToLowerInvariant() } | Select-Object -First 1)
+    if ($declaredGraphics -notmatch '^[0-9a-f]{64}$' -or $declaredGraphics -ne $graphicsHash) { throw 'Mesa artifact hash does not match BUILDINFO.' }
+    if ($trust.updater_sha256.ToLowerInvariant() -ne $updaterHash -or
+        $trust.verifier_sha256.ToLowerInvariant() -ne $verifierHash -or
+        $trust.bootstrap_updater_sha256.ToLowerInvariant() -ne $updaterHash -or
+        $trust.bundle_verifier_sha256.ToLowerInvariant() -ne $verifierHash -or
+        $trust.graphics_artifact_sha256.ToLowerInvariant() -ne $graphicsHash) {
+        throw 'release-trust.json does not match the final Linux artifacts.'
+    }
+    $runtime = (Get-Content (Join-Path $root 'guest-runtime.version') -Raw).Trim()
+    if ($trust.guest_runtime_version -ne $runtime) { throw 'release-trust runtime version mismatch.' }
     return [pscustomobject]@{
-        Updater = Read-Sidecar $updater (Join-Path $root 'updater\appsandbox-guest-updater.sha256')
-        Verifier = Read-Sidecar $verifier (Join-Path $root 'updater\appsandbox-guest-bundle-verifier.exe.sha256')
+        Updater = $updaterHash
+        Verifier = $verifierHash
+        Graphics = $graphicsHash
+        PublicKey = $key
+        Root = $root
+        Trust = $trust
     }
 }
 
 function Ensure-LinuxReleaseTree([string]$repoRoot) {
     $root = Join-Path $repoRoot 'release\resources\linux'
     $keyPath = Join-Path $root 'updater\trusted-public-key.hex'
-    $key = if ($PublicKeyHex) { $PublicKeyHex } elseif ($env:ASB_RELEASE_PUBLIC_KEY_HEX) { $env:ASB_RELEASE_PUBLIC_KEY_HEX } elseif (Test-Path $keyPath) { (Get-Content $keyPath -Raw).Trim() } else { '' }
-    if ($key -notmatch '^[0-9a-fA-F]{64}$' -or $key -match '^0+$') { throw 'A non-test ASB_RELEASE_PUBLIC_KEY_HEX is required to build Linux release artifacts.' }
-    if ((Test-Path (Join-Path $root 'updater\appsandbox-guest-updater')) -and
-        (Test-Path (Join-Path $root 'updater\appsandbox-guest-bundle-verifier.exe'))) { return }
+    $key = Get-RequestedReleaseKey $repoRoot
+    $existingKey = if (Test-Path $keyPath) { (Get-Content $keyPath -Raw).Trim().ToLowerInvariant() } else { '' }
+    $required = @(
+        'guest-runtime.version', 'wsl-mesa.tar.zst', 'wsl-mesa.BUILDINFO',
+        'offline_legacy_bootstrap.py', 'bootstrap-runtime', 'updater\release-trust.json',
+        'updater\appsandbox-guest-updater',
+        'updater\appsandbox-guest-bundle-verifier.exe'
+    )
+    $haveComplete = $true
+    foreach ($relative in $required) {
+        if (-not (Test-Path (Join-Path $root $relative))) {
+            $haveComplete = $false
+            break
+        }
+    }
+    if ($haveComplete -and $existingKey -eq $key) { return }
+    if ($NoBuild) { throw '-NoBuild refuses to reuse incomplete Linux artifacts or artifacts bound to a different public key.' }
     $wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
     if (-not $wsl) { throw 'Linux release artifacts are missing and wsl.exe is unavailable.' }
     New-Item -ItemType Directory -Force -Path (Split-Path $keyPath) | Out-Null
-    Set-Content -NoNewline -Path $keyPath -Value $key
+    Set-Content -NoNewline -Path $keyPath -Value $key -Encoding utf8
     $drive = $repoRoot.Substring(0, 1).ToLowerInvariant()
     $wslRepo = '/mnt/' + $drive + $repoRoot.Substring(2).Replace('\', '/')
     & $wsl.Source -- make -C ("$wslRepo/tools/linux") ("PUBLIC_KEY_HEX=$key")
@@ -156,6 +237,20 @@ function Ensure-LinuxReleaseTree([string]$repoRoot) {
     robocopy $dist $root /E | Out-Null
     if ($LASTEXITCODE -ge 8) { throw "Copying Linux release artifacts failed (exit $LASTEXITCODE)." }
     $global:LASTEXITCODE = 0
+}
+
+function Sign-LinuxVerifierBeforeHostBuild([string]$repoRoot, [object]$cert, [string]$signTool, [string]$timestampUrl, [string]$key) {
+    $root = Join-Path $repoRoot 'release\resources\linux'
+    $verifier = Join-Path $root 'updater\appsandbox-guest-bundle-verifier.exe'
+    $sig = Get-AuthenticodeSignature -LiteralPath $verifier
+    if (-not ($sig.SignerCertificate -and $sig.SignerCertificate.Thumbprint -eq $cert.Thumbprint)) {
+        & $signTool sign /sha1 $cert.Thumbprint /fd SHA256 /tr $timestampUrl /td SHA256 /v $verifier
+        if ($LASTEXITCODE -ne 0) { throw "EV-signing the Host bundle verifier failed (exit $LASTEXITCODE)." }
+        & $signTool verify /pa $verifier | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw 'EV signature verification failed for the Host bundle verifier.' }
+    }
+    Write-LinuxShaSidecar $verifier (Join-Path $root 'updater\appsandbox-guest-bundle-verifier.exe.sha256') | Out-Null
+    Write-ReleaseTrust $repoRoot $key
 }
 
 # A smart-card cert stays in the store with HasPrivateKey=$true even after the YubiKey is unplugged,
@@ -293,32 +388,82 @@ function Test-DriverSigned([string]$dir, [string]$name, [string]$wantVer) {
     return ((Test-MsSignedCat $cat) -and ((Get-InfVersion $inf) -eq $wantVer))
 }
 
+function Test-AsciiInFile([string]$path, [string]$value) {
+    if (-not (Test-Path $path)) { return $false }
+    $haystack = [IO.File]::ReadAllBytes($path)
+    $needle = [Text.Encoding]::ASCII.GetBytes($value)
+    if ($needle.Length -eq 0 -or $needle.Length -gt $haystack.Length) { return $false }
+    for ($i = 0; $i -le $haystack.Length - $needle.Length; $i++) {
+        $match = $true
+        for ($j = 0; $j -lt $needle.Length; $j++) {
+            if ($haystack[$i + $j] -ne $needle[$j]) { $match = $false; break }
+        }
+        if ($match) { return $true }
+    }
+    return $false
+}
+
+function Assert-HostTrustMetadata([string]$binDir, [object]$trust, [string]$key) {
+    $metadataPath = Join-Path $binDir 'appsandbox-linux-trust.json'
+    if (-not (Test-Path $metadataPath)) { throw "Host trust metadata is missing: $metadataPath" }
+    $metadata = Get-Content $metadataPath -Raw | ConvertFrom-Json
+    if ($metadata.schema -ne 1 -or $metadata.public_key_hex.ToLowerInvariant() -ne $key.ToLowerInvariant() -or
+        $metadata.bootstrap_updater_sha256.ToLowerInvariant() -ne $trust.Updater -or
+        $metadata.bundle_verifier_sha256.ToLowerInvariant() -ne $trust.Verifier) {
+        throw 'Host embedded trust metadata does not match release-trust.json.'
+    }
+    $core = Join-Path $binDir 'appsandbox_core.dll'
+    foreach ($value in @($key.ToLowerInvariant(), $trust.Updater, $trust.Verifier)) {
+        if (-not (Test-AsciiInFile $core $value)) {
+            throw "Host binary is not embedded with the expected Linux trust value: $value"
+        }
+    }
+}
+
 # Resolve the version from Directory.Build.props (single source). $asb.Full (X.X.X.X) gates the
 # driver cache/reuse so we never reuse or ship MS-signed drivers built for an older version.
 $asb = Get-AsbVersion $repo
 if (-not $asb) { throw "Could not read the version from Directory.Build.props under $repo." }
 if (-not $Version) { $Version = $asb.Short }
 Write-Host "Release version: $Version  (DriverVer $($asb.Full), source: Directory.Build.props)"
+$releaseKey = Get-RequestedReleaseKey $repo
 Ensure-LinuxReleaseTree $repo
-$linuxTrust = Get-ReleaseLinuxTrust $repo
+
+# The verifier is itself a PE release artifact. If EV signing is available, it
+# must happen before its SHA is passed to MSBuild; otherwise the Host would pin
+# bytes different from the bytes packaged below.
+$ev = $null
+$signtool = $null
+if (-not $NoBuild) {
+    $ev = Get-EvCert
+    if ($ev) {
+        $signtool = Find-SignTool
+        Sign-LinuxVerifierBeforeHostBuild $repo $ev $signtool $tsUrl $releaseKey
+    }
+}
+$linuxTrust = Get-ReleaseLinuxTrust $repo $releaseKey
 
 # ------------------------------------------------------------------- 1. build
 
 if (-not $NoBuild) {
     $msbuild = Find-MSBuild
     Write-Host "Building $Configuration|$Platform ..."
-    & $msbuild $sln /t:Build /p:Configuration=$Configuration /p:Platform=$Platform /p:AsbBootstrapUpdaterSha256=$linuxTrust.Updater /p:AsbBundleVerifierSha256=$linuxTrust.Verifier /m /v:minimal /nologo
+    & $msbuild $sln /t:Build /p:Configuration=$Configuration /p:Platform=$Platform /p:AsbBootstrapUpdaterSha256=$linuxTrust.Updater /p:AsbBundleVerifierSha256=$linuxTrust.Verifier /p:AsbReleasePublicKeyHex=$releaseKey /m /v:minimal /nologo
     if ($LASTEXITCODE -ne 0) { throw "Build failed (exit $LASTEXITCODE)." }
 } else {
     Write-Host "-NoBuild: packaging existing $bin"
 }
 if (-not (Test-Path $bin)) { throw "Output dir not found: $bin" }
 
+# This check is deliberately before any packaging/signing side effects. It is
+# the -NoBuild guard against pairing an old Host with a new trust manifest.
+Assert-HostTrustMetadata $bin $linuxTrust $releaseKey
+
 if ($BuildOnly) { Write-Host "-BuildOnly: build complete; skipping signing + packaging."; return }
 
 # ---------------------------------------------------------------- 2. YubiKey gate
 
-$ev = Get-EvCert
+$ev = if ($ev) { $ev } else { Get-EvCert }
 if (-not $ev) {
     Write-Host ""
     Write-Host "================================================================"
@@ -330,7 +475,7 @@ if (-not $ev) {
     return
 }
 Write-Host ("EV YubiKey present: {0} [{1}]" -f $ev.Subject, $ev.Thumbprint)
-$signtool = Find-SignTool
+$signtool = if ($signtool) { $signtool } else { Find-SignTool }
 
 # --------------------------------------- 3. EV-sign ALL binaries: app + drivers (1 PIN)
 # ONE signtool call over every PE we build - app .exe/.dll AND the driver .sys/.dll in
@@ -407,6 +552,27 @@ if (-not $SkipDrivers) {
     # Clean up the signing intermediates so they are neither shipped in the zip nor left behind.
     Remove-Item (Join-Path $bin '_attest') -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item $signedDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# Final release tripwire: re-read the trust manifest after all resource work,
+# then compare the exact files that will enter the ZIP and the Host metadata.
+$linuxTrust = Get-ReleaseLinuxTrust $repo $releaseKey
+Assert-HostTrustMetadata $bin $linuxTrust $releaseKey
+$packagedLinux = Join-Path $bin 'resources\linux'
+$packagedUpdater = Join-Path $packagedLinux 'updater\appsandbox-guest-updater'
+$packagedVerifier = Join-Path $packagedLinux 'updater\appsandbox-guest-bundle-verifier.exe'
+if ((Get-FileHash $packagedUpdater -Algorithm SHA256).Hash.ToLowerInvariant() -ne $linuxTrust.Updater -or
+    (Get-FileHash $packagedVerifier -Algorithm SHA256).Hash.ToLowerInvariant() -ne $linuxTrust.Verifier) {
+    throw 'The packaged Linux resources do not match the Host-pinned release hashes.'
+}
+if ($ev -and -not (Test-OurEvSigned $packagedVerifier $ev.Thumbprint)) {
+    throw 'The packaged Host bundle verifier is not EV-signed by the release certificate.'
+}
+$packagedTrust = Get-Content (Join-Path $packagedLinux 'updater\release-trust.json') -Raw | ConvertFrom-Json
+if ($packagedTrust.public_key_hex.ToLowerInvariant() -ne $releaseKey -or
+    $packagedTrust.verifier_sha256.ToLowerInvariant() -ne $linuxTrust.Verifier -or
+    $packagedTrust.bundle_verifier_sha256.ToLowerInvariant() -ne $linuxTrust.Verifier) {
+    throw 'The packaged release-trust.json is stale or bound to a different key.'
 }
 
 # --------------------------------------------------- 5. stage + zip (explicit allowlist)

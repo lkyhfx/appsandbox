@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the isolated Mutter/Mesa native-D3D12 experiment.
+# Run the AppSandbox Mutter/Mesa native-D3D12 validation session.
 #
 # This script intentionally refuses to claim real-desktop success unless a
 # visible dynamic Wayland test client is supplied.  The test client must paint
@@ -9,8 +9,8 @@
 #   away from the three diagnostic points.
 #
 # The compositor side is expected to be patched with
-# mutter-d3d12-share-probe.patch and the Mesa d3d12 hook described by that
-# patch.  appsandbox-display is never stopped or reconfigured.
+# mutter-appsandbox-display.patch and the Mesa d3d12 hook described by that
+# patch. The production feature flag uses the fixed AppSandbox socket.
 set -uo pipefail
 
 out=${1:-gpu-mutter-d3d12-share-probe-results}
@@ -21,7 +21,7 @@ client_log="$out/mutter-client.log"
 runner_log="$out/runner.log"
 decode_log="$out/decode.log"
 stream="$out/mutter.hevc"
-socket_path="${ASB_MUTTER_SOCKET:-$out/mutter-d3d12.sock}"
+socket_path="/run/appsandbox/display-d3d12.sock"
 consumer_bin=${MUTTER_CONSUMER_BIN:-./d3d12-mutter-consumer}
 runner=${GPU_RUNNER:-appsandbox-gpu}
 d3d12_libdir=${D3D12_LIBDIR:-/opt/appsandbox/wsl-deps}
@@ -53,6 +53,11 @@ if [[ -n "$mesa_probe_prefix" ]]; then
 elif [[ -d "$d3d12_libdir" ]]; then
     export LD_LIBRARY_PATH="$d3d12_libdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
+mkdir -p "$(dirname "$socket_path")" || {
+    printf 'BLOCKED stage=mutter-socket-directory reason=unwritable:%s\n' \
+        "$(dirname "$socket_path")" | tee "$runner_log"
+    exit 2
+}
 rm -f "$socket_path" "$stream"
 : >"$client_log"
 
@@ -96,13 +101,9 @@ set +e
 timeout -k 5s 180s dbus-run-session -- env \
     XDG_RUNTIME_DIR="$runtime" \
     WAYLAND_DISPLAY="$wayland_display" \
-    ASB_MUTTER_D3D12_SHARE_SOCKET="$socket_path" \
-    ASB_MUTTER_D3D12_SHARE_WIDTH=3840 \
-    ASB_MUTTER_D3D12_SHARE_HEIGHT=2160 \
-    ASB_MUTTER_D3D12_SHARE_FRAMES=3600 \
-    ASB_MUTTER_D3D12_SHARE_EXPECTED_PATTERN=frame-rgba \
-    ASB_MUTTER_SESSION_LOG="$mutter_log" \
-    ASB_MUTTER_CLIENT_LOG="$client_log" \
+    ASB_D3D12_DISPLAY=1 \
+    ASB_SESSION_LOG="$mutter_log" \
+    ASB_CLIENT_LOG="$client_log" \
     ASB_PATTERN_CLIENT_FRAMES="${ASB_PATTERN_CLIENT_FRAMES:-3600}" \
     MUTTER_TEST_CLIENT_CMD="$MUTTER_TEST_CLIENT_CMD" \
     bash -c '
@@ -110,27 +111,27 @@ timeout -k 5s 180s dbus-run-session -- env \
         gnome_shell=${GNOME_SHELL_BIN:-gnome-shell}
         "$gnome_shell" --headless --no-x11 \
             --virtual-monitor=3840x2160 --wayland-display="$WAYLAND_DISPLAY" \
-            >"$ASB_MUTTER_SESSION_LOG" 2>&1 &
+            >"$ASB_SESSION_LOG" 2>&1 &
         shell_pid=$!
         for _ in $(seq 1 200); do
             [[ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]] && break
             sleep 0.1
         done
         if [[ ! -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]]; then
-            printf "FAIL stage=mutter-wayland-display\n" >>"$ASB_MUTTER_SESSION_LOG"
+            printf "FAIL stage=mutter-wayland-display\n" >>"$ASB_SESSION_LOG"
             kill "$shell_pid" 2>/dev/null || true
             wait "$shell_pid" 2>/dev/null || true
             exit 1
         fi
-        printf "client_cmd=%s\\n" "$MUTTER_TEST_CLIENT_CMD" >>"$ASB_MUTTER_SESSION_LOG"
+        printf "client_cmd=%s\\n" "$MUTTER_TEST_CLIENT_CMD" >>"$ASB_SESSION_LOG"
         # The caller supplies the client command; it must stay visible for the
         # duration of the 3600-frame capture and must not use screenshots or
         # framebuffer readback as its source.
-        bash -c "$MUTTER_TEST_CLIENT_CMD" >"$ASB_MUTTER_CLIENT_LOG" 2>&1 &
+        bash -c "$MUTTER_TEST_CLIENT_CMD" >"$ASB_CLIENT_LOG" 2>&1 &
         client_pid=$!
         wait "$client_pid"
         client_status=$?
-        printf "client_exit=%d\\n" "$client_status" >>"$ASB_MUTTER_CLIENT_LOG"
+        printf "client_exit=%d\\n" "$client_status" >>"$ASB_CLIENT_LOG"
         kill "$shell_pid" 2>/dev/null || true
         wait "$shell_pid" 2>/dev/null || true
         if [[ "$client_status" -ne 0 ]]; then

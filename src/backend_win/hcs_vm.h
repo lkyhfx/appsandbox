@@ -38,6 +38,7 @@ typedef void *HCS_OPERATION;
 #define ASB_UPDATE_COMMITTED  6
 #define ASB_UPDATE_ROLLED_BACK 7
 #define ASB_UPDATE_FAILED     8
+#define ASB_UPDATE_LEGACY_MIGRATION 9
 
 /* Configuration for creating a new VM */
 typedef struct {
@@ -180,9 +181,16 @@ ASB_API void hcs_close_vm(VmInstance *instance);
 /* Close an HCS handle synchronously (safe to call during atexit). */
 void hcs_close_handle_sync(HCS_SYSTEM handle);
 
+/* Unregister callbacks and close a VM handle synchronously before its VHDX is
+   attached elsewhere.  Offline migration must not race close_vm_thread. */
+void hcs_close_vm_sync(VmInstance *instance);
+
 /* Try to open an existing HCS compute system by name.
    If found and running, populates instance->handle and returns TRUE. */
 BOOL hcs_try_open_vm(VmInstance *instance);
+
+/* Open an existing, stopped compute system without recreating its VHDX. */
+BOOL hcs_open_stopped_vm(VmInstance *instance);
 
 /* Check if a VM is running via HCS enumeration (does not require opening). */
 BOOL hcs_is_running_by_enum(const wchar_t *vm_name);

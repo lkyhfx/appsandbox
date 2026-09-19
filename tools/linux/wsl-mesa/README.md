@@ -91,7 +91,6 @@ source commit, LLVM/Mesa build inputs, and artifact digest must be recorded in
 the signed manifest. Kernel modules and the host's proprietary graphics stack
 are excluded from this userspace artifact.
 
-The production D3D12 share hook discovers the fixed
-`/run/appsandbox/display-d3d12.sock` endpoint when the encoder service is
-present; no per-session `ASB_MUTTER_D3D12_SHARE_SOCKET` export is required.
-The optional variable remains available only as a diagnostic socket override.
+The production D3D12 share hook uses the fixed
+`/run/appsandbox/display-d3d12.sock` endpoint only when the compositor service
+sets `ASB_D3D12_DISPLAY=1`; ordinary Mesa sessions do not enter this path.

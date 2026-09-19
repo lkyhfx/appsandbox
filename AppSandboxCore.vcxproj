@@ -65,7 +65,7 @@
   </ImportGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
     <ClCompile>
-      <PreprocessorDefinitions>ASB_BOOTSTRAP_UPDATER_SHA256=&quot;$(AsbBootstrapUpdaterSha256)&quot;;ASB_BUNDLE_VERIFIER_SHA256=&quot;$(AsbBundleVerifierSha256)&quot;;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>ASB_BOOTSTRAP_UPDATER_SHA256=&quot;$(AsbBootstrapUpdaterSha256)&quot;;ASB_BUNDLE_VERIFIER_SHA256=&quot;$(AsbBundleVerifierSha256)&quot;;ASB_RELEASE_PUBLIC_KEY_HEX=&quot;$(AsbReleasePublicKeyHex)&quot;;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
   </ItemDefinitionGroup>
   <ImportGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="PropertySheets">
@@ -209,6 +209,12 @@
     <ClInclude Include="src\backend_win\vm_ssh_proxy.h" />
     <ClInclude Include="src\backend_win\vm_clipboard.h" />
   </ItemGroup>
+  <Target Name="WriteLinuxTrustMetadata" AfterTargets="Build"
+          Condition="'$(Configuration)'=='Release' And '$(AsbBootstrapUpdaterSha256)'!='' And '$(AsbBundleVerifierSha256)'!='' And '$(AsbReleasePublicKeyHex)'!=''">
+    <WriteLinesToFile File="$(OutDir)appsandbox-linux-trust.json"
+      Lines="{&quot;schema&quot;:1,&quot;public_key_hex&quot;:&quot;$(AsbReleasePublicKeyHex)&quot;,&quot;bootstrap_updater_sha256&quot;:&quot;$(AsbBootstrapUpdaterSha256)&quot;,&quot;bundle_verifier_sha256&quot;:&quot;$(AsbBundleVerifierSha256)&quot;}"
+      Overwrite="true" Encoding="UTF-8" />
+  </Target>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>

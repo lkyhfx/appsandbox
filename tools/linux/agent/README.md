@@ -407,9 +407,10 @@ The validated behavior is represented by these implementation/probe sources:
 - `d3d12-video-encode-probe.cpp` — D3D12 Video Processor + HEVC encode gate.
 - `d3d12-mutter-consumer.cpp` — isolated Mutter encoder consumer.
 - `gpu-mutter-d3d12-share-probe.sh` — real compositor end-to-end gate.
-- `../wsl-mesa/patches/0002-d3d12-mutter-native-share-probe.patch` — Mesa
+- `../wsl-mesa/patches/0002-d3d12-mutter-appsandbox-share.patch` — Mesa
   D3D12 publisher prototype.
-- `mutter-d3d12-share-probe.patch` — isolated Mutter post-paint probe hook.
+- `mutter-appsandbox-display.patch` — deterministic AppSandbox Mutter
+  post-paint hook (`ASB_D3D12_DISPLAY=1`).
 
 These are validation artifacts, not all of them should be promoted unchanged
 into production. The productionization steps are defined in

@@ -9,6 +9,8 @@ asb_drm-src/
 dxgkrnl-src/
 systemd/
 guest-runtime.version
+offline_legacy_bootstrap.py
+bootstrap-runtime/
 updater/
   appsandbox-guest-updater
   appsandbox-guest-updater.sha256
@@ -17,11 +19,13 @@ updater/
   trusted-public-key.hex
   appsandbox-guest-bundle-verifier.exe
   appsandbox-guest-bundle-verifier.exe.sha256
+  release-trust.json
 modprobe.d-asb_drm.conf
 50-appsandbox-gpu
 org.gnome.Shell-no-gpu.conf
 appsandbox-gpu
-wsl-mesa.tar.zst                         (optional GPU release)
+wsl-mesa.BUILDINFO
+wsl-mesa.tar.zst
 ```
 
 `tools/linux/Makefile install-agents` emits this layout under `dist/`; copy
@@ -32,8 +36,11 @@ The updater and the Host verifier are built with the same `PUBLIC_KEY_HEX`
 supplied by the release pipeline. The verifier is built from
 `updater/host/main.go` with `GOOS=windows GOARCH=amd64`; its `.exe` is never
 accepted unless the generated sidecar matches the bytes that were packaged.
-There is no repository fallback key and the private signing key must remain
-outside both the repository and the guest image.
+The final `release-trust.json` binds that public key to the exact updater,
+verifier, graphics artifact, and guest runtime version. There is no repository
+fallback key and the private signing key must remain outside both the repository
+and the guest image. The graphics `BUILDINFO` must identify a real production
+Mesa/Mutter 4K60 build; legacy/probe-only artifacts are rejected.
 
 The same release pipeline must compile the Host with
 `ASB_BOOTSTRAP_UPDATER_SHA256` and `ASB_BUNDLE_VERIFIER_SHA256` set to the
@@ -59,4 +66,7 @@ payload checks after transfer.
 
 The old `--prefetch-repo --branch` flow is developer-only. Production VM
 creation consumes this exact Host release tree and fails closed if a required
-artifact is absent.
+artifact is absent. A legacy guest is first stopped and migrated offline by
+`offline_legacy_bootstrap.py`; the new control agent is installed under
+`bootstrap-runtime/`, while the original runtime is preserved at
+`releases/legacy-original` for rollback.

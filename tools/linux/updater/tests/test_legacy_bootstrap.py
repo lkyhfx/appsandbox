@@ -37,7 +37,19 @@ class LegacyBootstrapTests(unittest.TestCase):
                              "version=0.0.0\ngraphics_version=1.2.3\ncommit=legacy-bootstrap\n")
             self.assertEqual((release / "graphics/legacy-mesa/legacy.txt").read_text(), "old-mesa")
             self.assertTrue((root / "opt/appsandbox/guest/current").is_symlink())
+            current = root / "opt/appsandbox/guest/current"
+            bootstrap = root / "opt/appsandbox/guest/releases/bootstrap-0.0.0"
+            self.assertEqual(os.readlink(root / "opt/appsandbox/guest/current"),
+                             "releases/bootstrap-0.0.0")
+            self.assertEqual(os.readlink(root / "opt/appsandbox/guest/previous"),
+                             "releases/legacy-original")
+            self.assertNotEqual((current / "bin/appsandbox-agent").read_bytes(),
+                                b"old-agent")
+            self.assertEqual((bootstrap / "libexec/appsandbox-guest-updater").read_bytes(),
+                             b"updater")
             self.assertTrue((root / "usr/local/bin/appsandbox-agent").is_symlink())
+            self.assertEqual(os.readlink(root / "usr/local/libexec/appsandbox-guest-updater"),
+                             "/opt/appsandbox/guest/current/libexec/appsandbox-guest-updater")
             self.assertTrue((root / "etc/systemd/system/multi-user.target.wants/appsandbox-guest-updater.service").is_symlink())
 
     def test_failure_keeps_legacy_files_untouched(self):

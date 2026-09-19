@@ -44,14 +44,23 @@ constexpr UINT kFrameRateNumerator = 60;
 constexpr UINT kFrameRateDenominator = 1;
 constexpr UINT64 kBitstreamCapacity = 8ULL * 1024ULL * 1024ULL;
 
-/* Standalone diagnostics keep their historical 4K/3600 validation workload. The
- * production encoder overwrites these dimensions from Mutter's resource
- * bundle before constructing any D3D12 video objects. */
-static std::uint32_t kWidth = 3840;
-static std::uint32_t kHeight = 2160;
+/* Dimensions belong to one encoder session. They are copied from Mutter's
+ * ResourceBundleMessage for production and never stored in mutable globals. */
+struct EncodeDimensions {
+    std::uint32_t width;
+    std::uint32_t height;
+};
+
+static constexpr EncodeDimensions kDiagnosticDimensions = {3840, 2160};
+
+static const char *stage_prefix(bool production)
+{
+    return production ? "APPSANDBOX" : "PASS";
+}
 
 static void publish_production_health(bool production, std::uint32_t width,
                                       std::uint32_t height, bool ready,
+                                      bool gpu_copy, std::uint64_t frames_encoded,
                                       std::uint64_t encode_failures = 0)
 {
     if (!production)
@@ -70,7 +79,7 @@ static void publish_production_health(bool production, std::uint32_t width,
            << "timestamp=" << static_cast<long long>(std::time(nullptr)) << "\n"
            << "encoder_initialized=" << (ready ? 1 : 0) << "\n"
            << "native_d3d12_shared=" << (ready ? 1 : 0) << "\n"
-           << "gpu_copy=" << (ready ? 1 : 0) << "\n"
+           << "gpu_copy=" << (gpu_copy ? 1 : 0) << "\n"
            << "cpu_copy=0\n"
            << "cpu_conversion=0\n"
            << "framebuffer_mmap=0\n"
@@ -78,7 +87,9 @@ static void publish_production_health(bool production, std::uint32_t width,
            << "gpu_cpu_gpu=0\n"
            << "stale_frames=0\n"
            << "mismatches=0\n"
-           << "encode_failures=" << (encode_failures ? 1 : 0) << "\n"
+           << "encode_failures=" << encode_failures << "\n"
+           << "ready=" << (ready ? 1 : 0) << "\n"
+           << "frames_encoded=" << frames_encoded << "\n"
            << "resolution=" << width << "x" << height << "@60\n";
     health.close();
     if (health)
@@ -437,7 +448,9 @@ static bool find_hevc_configuration(ID3D12VideoDevice3 *video_device,
 }
 
 static bool probe_codec(ID3D12VideoDevice3 *video_device,
-                        D3D12_VIDEO_ENCODER_CODEC codec)
+                        D3D12_VIDEO_ENCODER_CODEC codec,
+                        const EncodeDimensions &dimensions,
+                        bool production)
 {
     D3D12_VIDEO_ENCODER_PROFILE_H264 h264_profile_value = {};
     D3D12_VIDEO_ENCODER_PROFILE_HEVC hevc_profile_value = {};
@@ -457,7 +470,7 @@ static bool probe_codec(ID3D12VideoDevice3 *video_device,
                              &codec_query, "d3d12-video-codec-query"))
         return false;
     std::printf("%s stage=d3d12-video-codec codec=%s supported=%u\n",
-                codec_query.IsSupported ? "PASS" : "BLOCKED",
+                codec_query.IsSupported ? stage_prefix(production) : "BLOCKED",
                 codec == D3D12_VIDEO_ENCODER_CODEC_H264 ? "H264" : "HEVC",
                 codec_query.IsSupported ? 1U : 0U);
     if (!codec_query.IsSupported)
@@ -494,7 +507,7 @@ static bool probe_codec(ID3D12VideoDevice3 *video_device,
                              "d3d12-video-profile-level-query"))
         return false;
     std::printf("%s stage=d3d12-video-profile codec=%s supported=%u\n",
-                profile_query.IsSupported ? "PASS" : "BLOCKED",
+                profile_query.IsSupported ? stage_prefix(production) : "BLOCKED",
                 codec == D3D12_VIDEO_ENCODER_CODEC_H264 ? "H264" : "HEVC",
                 profile_query.IsSupported ? 1U : 0U);
     if (!profile_query.IsSupported)
@@ -504,8 +517,9 @@ static bool probe_codec(ID3D12VideoDevice3 *video_device,
         HevcConfiguration config = {};
         if (!find_hevc_configuration(video_device, profile, &config))
             return false;
-        std::printf("PASS stage=d3d12-video-codec-configuration codec=HEVC "
+        std::printf("%s stage=d3d12-video-codec-configuration codec=HEVC "
                     "flags=0x%08x cu=%u..%u tu=%u..%u hierarchy=%u/%u\n",
+                    stage_prefix(production),
                     static_cast<unsigned>(config.reported.SupportFlags),
                     static_cast<unsigned>(config.requested.MinLumaCodingUnitSize),
                     static_cast<unsigned>(config.requested.MaxLumaCodingUnitSize),
@@ -571,14 +585,14 @@ static bool probe_codec(ID3D12VideoDevice3 *video_device,
         return false;
     const bool resolution_ok =
         resolution.IsSupported &&
-        resolution.MinResolutionSupported.Width <= kWidth &&
-        resolution.MinResolutionSupported.Height <= kHeight &&
-        resolution.MaxResolutionSupported.Width >= kWidth &&
-        resolution.MaxResolutionSupported.Height >= kHeight &&
+        resolution.MinResolutionSupported.Width <= dimensions.width &&
+        resolution.MinResolutionSupported.Height <= dimensions.height &&
+        resolution.MaxResolutionSupported.Width >= dimensions.width &&
+        resolution.MaxResolutionSupported.Height >= dimensions.height &&
         (resolution.ResolutionWidthMultipleRequirement == 0 ||
-         kWidth % resolution.ResolutionWidthMultipleRequirement == 0) &&
+         dimensions.width % resolution.ResolutionWidthMultipleRequirement == 0) &&
         (resolution.ResolutionHeightMultipleRequirement == 0 ||
-         kHeight % resolution.ResolutionHeightMultipleRequirement == 0);
+         dimensions.height % resolution.ResolutionHeightMultipleRequirement == 0);
     std::printf("%s stage=d3d12-video-4k-resolution codec=%s supported=%u "
                 "min=%ux%u max=%ux%u multiples=%ux%u ratios=%u\n",
                 resolution_ok ? "PASS" : "BLOCKED",
@@ -611,7 +625,9 @@ struct EncoderSetup {
     UINT64 bitstream_alignment = 1;
 };
 
-static bool initialize_encoder(DeviceContext *context, EncoderSetup *setup)
+static bool initialize_encoder(DeviceContext *context, EncoderSetup *setup,
+                               const EncodeDimensions &dimensions,
+                               bool production)
 {
     if (FAILED(context->device.As(&setup->video_device))) {
         std::fputs("BLOCKED stage=d3d12-video-device-interface\n", stderr);
@@ -642,7 +658,8 @@ static bool initialize_encoder(DeviceContext *context, EncoderSetup *setup)
     setup->rate_control.TargetFrameRate.Numerator = kFrameRateNumerator;
     setup->rate_control.TargetFrameRate.Denominator = kFrameRateDenominator;
 
-    D3D12_VIDEO_ENCODER_PICTURE_RESOLUTION_DESC resolution = {kWidth, kHeight};
+    D3D12_VIDEO_ENCODER_PICTURE_RESOLUTION_DESC resolution = {
+        dimensions.width, dimensions.height};
     D3D12_FEATURE_DATA_VIDEO_ENCODER_RESOLUTION_SUPPORT_LIMITS limits = {};
     D3D12_VIDEO_ENCODER_PROFILE_HEVC suggested_profile_value = {};
     D3D12_VIDEO_ENCODER_LEVEL_TIER_CONSTRAINTS_HEVC suggested_level_value = {};
@@ -673,7 +690,8 @@ static bool initialize_encoder(DeviceContext *context, EncoderSetup *setup)
         support.ValidationFlags == D3D12_VIDEO_ENCODER_VALIDATION_FLAG_NONE;
     std::printf("%s stage=d3d12-video-60fps-configuration codec=HEVC "
                 "supported=%u validation=0x%08x support_flags=0x%08x\n",
-                support_ok ? "PASS" : "BLOCKED", support_ok ? 1U : 0U,
+                support_ok ? stage_prefix(production) : "BLOCKED",
+                support_ok ? 1U : 0U,
                 static_cast<unsigned>(support.ValidationFlags),
                 static_cast<unsigned>(support.SupportFlags));
     if (!support_ok)
@@ -715,9 +733,10 @@ static bool initialize_encoder(DeviceContext *context, EncoderSetup *setup)
         sizeof(D3D12_VIDEO_ENCODER_OUTPUT_METADATA));
     setup->bitstream_alignment = std::max<UINT64>(
         requirements.CompressedBitstreamBufferAccessAlignment, 1);
-    std::printf("PASS stage=d3d12-video-objects-constructed codec=HEVC "
+    std::printf("%s stage=d3d12-video-objects-constructed codec=HEVC "
                 "encoder=1 heap=1 resolution=%ux%u input=NV12 fps=60/1\n",
-                kWidth, kHeight);
+                stage_prefix(production),
+                dimensions.width, dimensions.height);
     return true;
 }
 
@@ -761,7 +780,9 @@ struct EncodeSlot {
 
 static bool make_process_setup(DeviceContext *context,
                                std::uint32_t source_format,
-                               ProcessSetup *setup)
+                               ProcessSetup *setup,
+                               const EncodeDimensions &dimensions,
+                               bool production)
 {
     DXGI_FORMAT input_format = DXGI_FORMAT_UNKNOWN;
     const char *input_name = nullptr;
@@ -792,8 +813,10 @@ static bool make_process_setup(DeviceContext *context,
     setup->input_desc.SourceAspectRatio = {1, 1};
     setup->input_desc.DestinationAspectRatio = {1, 1};
     setup->input_desc.FrameRate = {kFrameRateNumerator, kFrameRateDenominator};
-    setup->input_desc.SourceSizeRange = {kWidth, kHeight, kWidth, kHeight};
-    setup->input_desc.DestinationSizeRange = {kWidth, kHeight, kWidth, kHeight};
+    setup->input_desc.SourceSizeRange = {dimensions.width, dimensions.height,
+                                         dimensions.width, dimensions.height};
+    setup->input_desc.DestinationSizeRange = {dimensions.width, dimensions.height,
+                                              dimensions.width, dimensions.height};
     setup->input_desc.StereoFormat = D3D12_VIDEO_FRAME_STEREO_FORMAT_NONE;
     setup->input_desc.FieldType = D3D12_VIDEO_FIELD_TYPE_NONE;
     setup->input_desc.DeinterlaceMode = D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_NONE;
@@ -810,8 +833,8 @@ static bool make_process_setup(DeviceContext *context,
         return false;
     D3D12_FEATURE_DATA_VIDEO_PROCESS_SUPPORT support = {};
     support.NodeIndex = kNodeIndex;
-    support.InputSample.Width = kWidth;
-    support.InputSample.Height = kHeight;
+    support.InputSample.Width = dimensions.width;
+    support.InputSample.Height = dimensions.height;
     support.InputSample.Format.Format = setup->input_desc.Format;
     support.InputSample.Format.ColorSpace = setup->input_desc.ColorSpace;
     support.InputFieldType = setup->input_desc.FieldType;
@@ -827,17 +850,19 @@ static bool make_process_setup(DeviceContext *context,
     if ((support.SupportFlags & D3D12_VIDEO_PROCESS_SUPPORT_FLAG_SUPPORTED) == 0) {
         std::fprintf(stderr, "BLOCKED stage=%s input=%s output=NV12 "
                              "resolution=%ux%u fps=60/1\n",
-                     support_stage, input_name, kWidth, kHeight);
+                     support_stage, input_name, dimensions.width, dimensions.height);
         return false;
     }
-    std::printf("PASS stage=%s input=%s output=NV12 resolution=%ux%u fps=60/1\n",
-                support_stage, input_name, kWidth, kHeight);
+    std::printf("%s stage=%s input=%s output=NV12 resolution=%ux%u fps=60/1\n",
+                stage_prefix(production),
+                support_stage, input_name, dimensions.width, dimensions.height);
     if (!hr_ok(video_device->CreateVideoProcessor(
                    0, &setup->output_desc, 1, &setup->input_desc,
                    IID_PPV_ARGS(&setup->processor)),
                "d3d12-video-create-processor"))
         return false;
-    std::printf("PASS stage=%s support=1 cpu_conversion=0\n", conversion_stage);
+    std::printf("%s stage=%s support=1 cpu_conversion=0\n",
+                stage_prefix(production), conversion_stage);
     return true;
 }
 
@@ -874,6 +899,7 @@ static UINT64 align_up(UINT64 value, UINT64 alignment)
 }
 
 static bool collect_encoded_slot(EncodeSlot *slot, std::ostream *stream,
+                                 const EncodeDimensions &dimensions,
                                  UINT64 bitstream_capacity,
                                  UINT64 metadata_size,
                                  std::uint64_t *encoded_frames,
@@ -914,9 +940,10 @@ static bool collect_encoded_slot(EncodeSlot *slot, std::ostream *stream,
         const auto *bytes = static_cast<const std::uint8_t *>(input_ptr) +
                             slot->input_footprint.Offset;
         const std::array<std::pair<UINT, UINT>, 3> points = {
-            std::make_pair(kWidth / 4 + 64U, kHeight / 4 + 64U),
-            std::make_pair(kWidth / 2, kHeight / 2),
-            std::make_pair(kWidth * 3 / 4 - 64U, kHeight * 3 / 4 - 64U)};
+            std::make_pair(dimensions.width / 4 + 64U, dimensions.height / 4 + 64U),
+            std::make_pair(dimensions.width / 2, dimensions.height / 2),
+            std::make_pair(dimensions.width * 3 / 4 - 64U,
+                           dimensions.height * 3 / 4 - 64U)};
         bool frame_ok = true;
         std::array<std::array<std::uint8_t, 4>, 3> actual_pixels = {};
         for (std::size_t point_index = 0; point_index < points.size();
@@ -992,7 +1019,8 @@ static bool collect_encoded_slot(EncodeSlot *slot, std::ostream *stream,
 
 class EncodedPacketStreamBuf final : public std::streambuf {
 public:
-    explicit EncodedPacketStreamBuf(int fd) : fd_(fd) {}
+    EncodedPacketStreamBuf(int fd, EncodeDimensions dimensions)
+        : fd_(fd), dimensions_(dimensions) {}
 
 protected:
     std::streamsize xsputn(const char *data, std::streamsize count) override
@@ -1006,8 +1034,8 @@ protected:
             config.header_size = sizeof(config);
             config.generation = 1;
             config.codec = ASB_DISPLAY_CODEC_HEVC;
-            config.width = kWidth;
-            config.height = kHeight;
+            config.width = dimensions_.width;
+            config.height = dimensions_.height;
             config.fps_num = kFrameRateNumerator;
             config.fps_den = kFrameRateDenominator;
             config.flags = ASB_DISPLAY_VIDEO_FLAG_DISCONTINUITY;
@@ -1056,19 +1084,23 @@ private:
     }
 
     int fd_;
+    EncodeDimensions dimensions_;
     bool configured_ = false;
     std::uint64_t frame_seq_ = 0;
 };
 
 static bool encode_consumer_main(int control_fd)
 {
+    const bool production_session = std::getenv("ASB_D3D12_ENCODED_FD") != nullptr;
+    if (production_session)
+        ::unlink("/run/appsandbox/display-d3d12.health");
     DeviceContext context;
     if (!create_device("encoder-device", &context))
         return false;
     ResourceBundleMessage bundle = {};
     std::vector<int> received_fds;
     std::size_t bundle_size = 0;
-    const bool production_session = std::getenv("ASB_D3D12_ENCODED_FD") != nullptr;
+    const EncodeDimensions diagnostic_dimensions = kDiagnosticDimensions;
     if (!receive_packet(control_fd, &bundle, sizeof(bundle), &bundle_size,
                         &received_fds, kSocketTimeoutMs) ||
         bundle_size != sizeof(bundle) || bundle.magic != kProtocolMagic ||
@@ -1076,7 +1108,8 @@ static bool encode_consumer_main(int control_fd)
         bundle.height == 0 || bundle.width > ASB_DISPLAY_MAX_WIDTH ||
         bundle.height > ASB_DISPLAY_MAX_HEIGHT || (bundle.width & 1) ||
         (bundle.height & 1) || bundle.slots != kSlotCount ||
-        (!production_session && (bundle.width != kWidth || bundle.height != kHeight ||
+        (!production_session && (bundle.width != diagnostic_dimensions.width ||
+                                 bundle.height != diagnostic_dimensions.height ||
                                  bundle.frames != kFrameCount)) ||
         (production_session && bundle.frames != 0 && bundle.frames < kSlotCount) ||
         received_fds.size() != kMaxTransferFds) {
@@ -1084,10 +1117,7 @@ static bool encode_consumer_main(int control_fd)
         std::fputs("FAIL stage=cross-process-resource-fd-transfer\n", stderr);
         return false;
     }
-    if (production_session) {
-        kWidth = bundle.width;
-        kHeight = bundle.height;
-    }
+    const EncodeDimensions dimensions = {bundle.width, bundle.height};
 
     if (bundle.synthetic_source == 0) {
         if (bundle.format != kDxgiFormatR8G8B8A8Unorm &&
@@ -1107,11 +1137,13 @@ static bool encode_consumer_main(int control_fd)
         }
         const char *format_name =
             bundle.format == kDxgiFormatR8G8B8A8Unorm ? "RGBA8" : "BGRA8";
-        std::printf("PASS stage=mutter-real-render-target synthetic_source=0 "
+        std::printf("%s stage=mutter-real-render-target synthetic_source=0 "
                     "width=%u height=%u format=%s dxgi_format=%u\n",
+                    stage_prefix(production_session),
                     bundle.width, bundle.height, format_name, bundle.format);
-        std::printf("PASS stage=mutter-shared-resource "
+        std::printf("%s stage=mutter-shared-resource "
                     "format=%s native_d3d12_shared=1 gpu_copy=%u cpu_copy=0\n",
+                    stage_prefix(production_session),
                     format_name, bundle.gpu_copy);
     }
     if (bundle.format != kDxgiFormatR8G8B8A8Unorm &&
@@ -1146,16 +1178,19 @@ static bool encode_consumer_main(int control_fd)
         return false;
     const char *format_name =
         bundle.format == kDxgiFormatR8G8B8A8Unorm ? "RGBA8" : "BGRA8";
-    std::printf("PASS stage=cross-process-open-shared-resource format=%s "
+    std::printf("%s stage=cross-process-open-shared-resource format=%s "
                 "dxgi_format=%u slots=3 consumer_device=independent\n",
+                stage_prefix(production_session),
                 format_name, bundle.format);
-    std::puts("PASS stage=resource-transport-fd-close side=consumer count=3");
+    std::printf("%s stage=resource-transport-fd-close side=consumer count=3\n",
+                stage_prefix(production_session));
 
     EncoderSetup encoder;
-    if (!initialize_encoder(&context, &encoder))
+    if (!initialize_encoder(&context, &encoder, dimensions, production_session))
         return false;
     ProcessSetup process;
-    if (!make_process_setup(&context, bundle.format, &process))
+    if (!make_process_setup(&context, bundle.format, &process, dimensions,
+                            production_session))
         return false;
 
     D3D12_COMMAND_QUEUE_DESC queue_desc = {};
@@ -1195,7 +1230,7 @@ static bool encode_consumer_main(int control_fd)
         return false;
 
     const D3D12_RESOURCE_DESC nv12_desc = {
-        D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, kWidth, kHeight, 1, 1,
+        D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, dimensions.width, dimensions.height, 1, 1,
         DXGI_FORMAT_NV12, {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN,
         D3D12_RESOURCE_FLAG_NONE};
     const UINT64 metadata_size = align_up(
@@ -1279,10 +1314,12 @@ static bool encode_consumer_main(int control_fd)
         kProtocolMagic, kConsumerReady, 0, kSlotCount, kSlotCount};
     if (!send_packet(control_fd, &ready, sizeof(ready), done_transfer_fds))
         return false;
-    std::puts("PASS stage=consumer-done-eventfd slots=3 "
-              "set_event_on_completion=1 scm_rights=1");
-    std::printf("PASS stage=consumer-gpu-operation %s_to_nv12=GPU-only "
+    std::printf("%s stage=consumer-done-eventfd slots=3 "
+                "set_event_on_completion=1 scm_rights=1\n",
+                stage_prefix(production_session));
+    std::printf("%s stage=consumer-gpu-operation %s_to_nv12=GPU-only "
                 "d3d12_encode=GPU-only cpu_framebuffer_copy=0\n",
+                stage_prefix(production_session),
                 bundle.format == kDxgiFormatR8G8B8A8Unorm ? "rgba" : "bgra");
 
     const char *packet_fd_text = std::getenv("ASB_D3D12_ENCODED_FD");
@@ -1298,7 +1335,8 @@ static bool encode_consumer_main(int control_fd)
         long parsed = std::strtol(packet_fd_text, &end, 10);
         if (!end || *end || parsed < 0 || parsed > std::numeric_limits<int>::max())
             return false;
-        packet_buffer = std::make_unique<EncodedPacketStreamBuf>(static_cast<int>(parsed));
+        packet_buffer = std::make_unique<EncodedPacketStreamBuf>(static_cast<int>(parsed),
+                                                                  dimensions);
         packet_stream = std::make_unique<std::ostream>(packet_buffer.get());
         stream = packet_stream.get();
         stream_path = "seqpacket";
@@ -1317,10 +1355,9 @@ static bool encode_consumer_main(int control_fd)
                   static_cast<std::streamsize>(sequence_headers.size()));
     if (!*stream)
         return false;
-    publish_production_health(production_session, bundle.width, bundle.height,
-                              true);
-    std::printf("PASS stage=hevc-sequence-headers vps=1 sps=1 pps=1 bytes=%zu "
+    std::printf("%s stage=hevc-sequence-headers vps=1 sps=1 pps=1 bytes=%zu "
                 "host_generated=1 framebuffer_bytes=0\n",
+                stage_prefix(production_session),
                 sequence_headers.size());
     std::vector<std::uint64_t> wake_latencies;
     std::vector<std::uint64_t> conversion_times;
@@ -1355,7 +1392,7 @@ static bool encode_consumer_main(int control_fd)
         close_fd_vector(&unexpected_fds);
         EncodeSlot &slot = slots[info.slot];
         if (frame >= kSlotCount) {
-            if (!collect_encoded_slot(&slot, stream, bitstream_size,
+            if (!collect_encoded_slot(&slot, stream, dimensions, bitstream_size,
                                       metadata_size, &encoded_frames,
                                       &encoded_bytes, &encode_failures,
                                       &timeouts, &mismatches,
@@ -1364,8 +1401,15 @@ static bool encode_consumer_main(int control_fd)
                                       &total_pipeline_times,
                                       &slot_recycle_times))
                 return false;
+            /* This is the first point at which a completed GPU encode/readback
+             * proves that the session rendered an actual frame. */
+            publish_production_health(
+                production_session, bundle.width, bundle.height,
+                encoded_frames > 0 && encode_failures == 0, bundle.gpu_copy != 0,
+                encoded_frames, encode_failures);
             if (!reuse_logged) {
-                std::puts("PASS stage=triple-buffer-reuse slots=3");
+                std::printf("%s stage=triple-buffer-reuse slots=3\n",
+                            stage_prefix(production_session));
                 reuse_logged = true;
             }
         }
@@ -1399,8 +1443,8 @@ static bool encode_consumer_main(int control_fd)
         process_input.InputStream[0].pTexture2D = slot.texture.Get();
         process_input.InputStream[0].Subresource = 0;
         process_input.Transform.SourceRectangle = {0, 0,
-                                                   static_cast<LONG>(kWidth),
-                                                   static_cast<LONG>(kHeight)};
+                                                   static_cast<LONG>(dimensions.width),
+                                                   static_cast<LONG>(dimensions.height)};
         process_input.Transform.DestinationRectangle = process_input.Transform.SourceRectangle;
         process_input.Transform.Orientation = D3D12_VIDEO_PROCESS_ORIENTATION_DEFAULT;
         process_input.RateInfo.OutputIndex = 0;
@@ -1467,7 +1511,7 @@ static bool encode_consumer_main(int control_fd)
         // must remain clear for the initial EncodeFrame call.
         sequence.Flags = D3D12_VIDEO_ENCODER_SEQUENCE_CONTROL_FLAG_NONE;
         sequence.RateControl = encoder.rate_control;
-        sequence.PictureTargetResolution = {kWidth, kHeight};
+        sequence.PictureTargetResolution = {dimensions.width, dimensions.height};
         sequence.SelectedLayoutMode =
             D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_FULL_FRAME;
         sequence.CodecGopSequence = encoder.gop;
@@ -1492,7 +1536,8 @@ static bool encode_consumer_main(int control_fd)
         resolve_input.EncoderCodec = kEncodeCodec;
         resolve_input.EncoderProfile = encoder.profile;
         resolve_input.EncoderInputFormat = DXGI_FORMAT_NV12;
-        resolve_input.EncodedPictureEffectiveResolution = {kWidth, kHeight};
+        resolve_input.EncodedPictureEffectiveResolution = {dimensions.width,
+                                                           dimensions.height};
         resolve_input.HWLayoutMetadata = output.EncoderOutputMetadata;
         D3D12_VIDEO_ENCODER_RESOLVE_METADATA_OUTPUT_ARGUMENTS resolve_output = {};
         resolve_output.ResolvedLayoutMetadata.pBuffer = slot.metadata_resolved.Get();
@@ -1613,7 +1658,7 @@ static bool encode_consumer_main(int control_fd)
         slot.nv12_first_use = false;
     }
     for (EncodeSlot &slot : slots) {
-        if (!collect_encoded_slot(&slot, stream, bitstream_size, metadata_size,
+        if (!collect_encoded_slot(&slot, stream, dimensions, bitstream_size, metadata_size,
                                   &encoded_frames, &encoded_bytes,
                                   &encode_failures, &timeouts, &mismatches,
                                   &diagnostic_checks,
@@ -1622,6 +1667,10 @@ static bool encode_consumer_main(int control_fd)
                                   &slot_recycle_times))
             return false;
     }
+    publish_production_health(
+        production_session, dimensions.width, dimensions.height,
+        encoded_frames > 0 && encode_failures == 0, bundle.gpu_copy != 0,
+        encoded_frames, encode_failures);
     if (file_stream)
         file_stream->close();
     const std::uint64_t consumer_end_ns = monotonic_ns();
@@ -1680,7 +1729,8 @@ static bool encode_consumer_main(int control_fd)
                     diagnostic_checks == kFrameCount / kDiagnosticInterval &&
                     fps_ok;
     publish_production_health(production_session, bundle.width, bundle.height,
-                              ok, encode_failures);
+                              ok, bundle.gpu_copy != 0, encoded_frames,
+                              encode_failures);
     std::printf("%s stage=diagnostic-frame-sequence mismatches=%llu checks=%llu\n",
                 mismatches == 0 ? "PASS" : "FAIL",
                 static_cast<unsigned long long>(mismatches),
@@ -1794,12 +1844,14 @@ static void encode_exec_role(const char *self, const char *role, int control_fd)
         return 3;
     }
     std::puts("PASS stage=d3d12-video-device-interface version=3");
-    if (!probe_codec(video_device.Get(), D3D12_VIDEO_ENCODER_CODEC_H264) ||
-        !probe_codec(video_device.Get(), D3D12_VIDEO_ENCODER_CODEC_HEVC))
+    if (!probe_codec(video_device.Get(), D3D12_VIDEO_ENCODER_CODEC_H264,
+                     kDiagnosticDimensions, false) ||
+        !probe_codec(video_device.Get(), D3D12_VIDEO_ENCODER_CODEC_HEVC,
+                     kDiagnosticDimensions, false))
         return 1;
     std::puts("codec_matrix h264=1 hevc=1");
     EncoderSetup setup;
-    if (!initialize_encoder(&context, &setup))
+    if (!initialize_encoder(&context, &setup, kDiagnosticDimensions, false))
         return 3;
     std::puts("PASS d3d12-video-encode-capability codec=HEVC "
               "resolution=3840x2160 input=NV12 fps=60/1");

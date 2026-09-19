@@ -92,19 +92,19 @@ tar xzf C:\path\to\asb-linux.tar.gz -C release\resources\linux\
 `tar.exe` ships with Windows 10+; if it isn't on your PATH the Git for
 Windows / 7-Zip / WinRAR equivalents all handle `.tar.gz` fine.
 
-## Isolated Mutter compositor-output probe
+## Mutter compositor-output integration and validation
 
-The Mutter experiment is opt-in and does not modify or stop the production
-`appsandbox-display` path. It uses the existing validated consumer stages,
-but replaces the synthetic producer with an isolated Mutter/Mesa producer:
+The production Mutter hook is opt-in and does not modify or stop ordinary
+GNOME/Mutter sessions. It uses the validated consumer stages and the real
+Mutter/Mesa render target:
 
-1. Apply `wsl-mesa/patches/0002-d3d12-mutter-native-share-probe.patch` to the
-   isolated Mesa d3d12 build. The hook observes the real Gallium D3D12
+1. Apply `wsl-mesa/patches/0002-d3d12-mutter-appsandbox-share.patch` to the
+   Mesa d3d12 build. The hook observes the real Gallium D3D12
    framebuffer and records a GPU-only copy into a three-slot native shared
    BGRA8 ring.
-2. Apply `agent/mutter-d3d12-share-probe.patch` to the isolated Mutter build.
-   The hook is enabled only when
-   `ASB_MUTTER_D3D12_SHARE_SOCKET` is set.
+2. Apply `agent/mutter-appsandbox-display.patch` to the Mutter build. The
+   hook is enabled only when `ASB_D3D12_DISPLAY=1` is set by the AppSandbox
+   compositor unit.
 3. Build the socket-facing consumer:
 
    ```bash
