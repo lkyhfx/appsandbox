@@ -2325,6 +2325,7 @@ static bool encode_consumer_main(
                     "sequence_header_chroma_format_idc=%llu\n"
                     "guest_bitstream_generated=%u\n"
                     "guest_sequence_header_444=%u\n"
+                    "guest_encode_failures=%llu\n"
                     "frames=%llu\n"
                     "fps=%.2f\n"
                     "encode_failures=%llu\n"
@@ -2338,6 +2339,7 @@ static bool encode_consumer_main(
                     (encoded_frames == kFrameCount && encode_failures == 0 &&
                      hevc444_stream_structure_ok) ? 1U : 0U,
                     hevc444_sequence_header_ok ? 1U : 0U,
+                    static_cast<unsigned long long>(encode_failures),
                     static_cast<unsigned long long>(encoded_frames),
                     consumer_fps,
                     static_cast<unsigned long long>(encode_failures),

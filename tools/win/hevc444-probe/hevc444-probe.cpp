@@ -63,6 +63,17 @@ static const char *dxgi_format_name(DXGI_FORMAT format)
     }
 }
 
+static const char *dxgi_format_reason_name(DXGI_FORMAT format)
+{
+    switch (format) {
+    case DXGI_FORMAT_NV12: return "nv12";
+    case DXGI_FORMAT_P010: return "p010";
+    case DXGI_FORMAT_AYUV: return "ayuv";
+    case DXGI_FORMAT_Y410: return "y410";
+    default: return "other";
+    }
+}
+
 static std::string guid_string(const GUID &guid)
 {
     wchar_t text[64] = {};
@@ -102,6 +113,13 @@ static bool create_d3d11_context(UINT requested_adapter, D3D11Context *result)
         if (FAILED(adapter->GetDesc1(&desc)))
             continue;
         const bool software = (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
+        if (software && requested_adapter != std::numeric_limits<UINT>::max() &&
+            index == requested_adapter) {
+            std::fprintf(stderr,
+                         "BLOCKED stage=adapter reason=software index=%u\n",
+                         index);
+            continue;
+        }
         if ((requested_adapter != std::numeric_limits<UINT>::max() &&
              index != requested_adapter) ||
             (requested_adapter == std::numeric_limits<UINT>::max() && software))
@@ -316,6 +334,11 @@ static void print_mf_output_type(UINT index, IMFMediaType *type,
 static bool configure_mf_input(IMFTransform *transform,
                                const HevcAnnexBStream &stream)
 {
+    if (stream.sequence_header.size() > std::numeric_limits<UINT>::max()) {
+        std::fputs("BLOCKED stage=mf-hevc-input-type "
+                   "reason=sequence-header-too-large\n", stderr);
+        return false;
+    }
     ComPtr<IMFMediaType> input;
     HRESULT hr = MFCreateMediaType(&input);
     if (SUCCEEDED(hr)) hr = input->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
@@ -421,7 +444,8 @@ static bool inspect_mf_output(IMFSample *sample, MfResult *result,
     if (SUCCEEDED(hr)) hr = dxgi_buffer->GetSubresourceIndex(&output_subresource);
     ComPtr<ID3D11Texture2D> output_texture;
     if (SUCCEEDED(hr)) hr = dxgi_buffer->GetResource(
-        IID_ID3D11Texture2D, &output_texture);
+        __uuidof(ID3D11Texture2D),
+        reinterpret_cast<void **>(output_texture.GetAddressOf()));
     if (FAILED(hr) || !output_texture) {
         std::fprintf(stderr,
                      "BLOCKED stage=mf-hevc444-actual-decode "
@@ -434,7 +458,7 @@ static bool inspect_mf_output(IMFSample *sample, MfResult *result,
         std::fprintf(stderr,
                      "BLOCKED stage=mf-hevc444-actual-decode "
                      "reason=decoder-returned-%s decoder=%s\n",
-                     dxgi_format_name(desc.Format), prefix);
+                     dxgi_format_reason_name(desc.Format), prefix);
         return false;
     }
     *texture = output_texture;

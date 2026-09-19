@@ -288,8 +288,9 @@ The workload reports `cpu_conversion=0`, `framebuffer_mmap=0`, and
 pixels back to the CPU. `guest_sequence_header_444=1` only proves that the
 guest-owned VPS/SPS/PPS has `chroma_format_idc=3` and the expected dimensions;
 `guest_bitstream_generated=1` proves that the requested encode workload wrote
-frames without encode failures. Neither is a decoder result. The Windows host
-probe below owns actual decodability.
+frames without encode failures; `guest_encode_failures=0` reports that count
+explicitly. Neither is a decoder result. The Windows host probe below owns
+actual decodability.
 
 There are four distinct evidence levels:
 

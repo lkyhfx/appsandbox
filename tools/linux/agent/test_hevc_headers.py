@@ -112,6 +112,7 @@ int main() {
         self.assertNotIn("stage=hevc444-bitstream", source)
         self.assertIn("guest_sequence_header_444", source)
         self.assertIn("guest_bitstream_generated", source)
+        self.assertIn("guest_encode_failures", source)
 
     def test_probe_mode_cannot_switch_production_to_444(self):
         source = Path(__file__).with_name("d3d12-video-encode-probe.cpp").read_text()
