@@ -3144,8 +3144,29 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
 
     case WM_DPICHANGED:
-        if (d && d->fullscreen_toolbar_visible)
-            idd_layout_fullscreen_toolbar(d);
+        if (d) {
+            RECT *suggested = (RECT *)lp;
+            if (d->fullscreen) {
+                HMONITOR monitor = MonitorFromRect(suggested, MONITOR_DEFAULTTONEAREST);
+                MONITORINFO mi = { sizeof(mi) };
+                if (monitor && GetMonitorInfoW(monitor, &mi)) {
+                    SetWindowPos(hwnd, NULL,
+                                 mi.rcMonitor.left, mi.rcMonitor.top,
+                                 mi.rcMonitor.right - mi.rcMonitor.left,
+                                 mi.rcMonitor.bottom - mi.rcMonitor.top,
+                                 SWP_NOZORDER | SWP_NOACTIVATE |
+                                 SWP_NOOWNERZORDER);
+                }
+            } else if (suggested) {
+                SetWindowPos(hwnd, NULL,
+                             suggested->left, suggested->top,
+                             suggested->right - suggested->left,
+                             suggested->bottom - suggested->top,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            if (d->fullscreen_toolbar_visible)
+                idd_layout_fullscreen_toolbar(d);
+        }
         return 0;
 
     case WM_SIZE:
@@ -3343,10 +3364,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_MOUSEMOVE:
         if (d) {
-            if (d->fullscreen &&
-                (int)(short)HIWORD(lp) <=
-                    (int)idd_dip_to_px(d->hwnd, TOOLBAR_HOTZONE_DIP))
-                idd_show_fullscreen_toolbar(d);
+            POINT screen_pt;
             if (!d->tracking && d->render_hwnd) {
                 TRACKMOUSEEVENT tme;
                 tme.cbSize = sizeof(tme);
@@ -3356,6 +3374,23 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 TrackMouseEvent(&tme);
                 d->tracking = TRUE;
             }
+            if (d->fullscreen &&
+                (int)(short)HIWORD(lp) <=
+                    (int)idd_dip_to_px(d->hwnd, TOOLBAR_HOTZONE_DIP))
+                idd_show_fullscreen_toolbar(d);
+
+            /* While the host overlay is active, the whole top interaction
+               strip belongs to the host. Do not leak absolute motion into
+               the guest after relative capture has been suspended. Keeping
+               mouse_in false also blocks guest button and wheel forwarding. */
+            if (d->fullscreen_toolbar_visible &&
+                GetCursorPos(&screen_pt) &&
+                idd_point_in_fullscreen_toolbar_region(d, screen_pt)) {
+                d->mouse_in = FALSE;
+                SetCursor(LoadCursorW(NULL, IDC_ARROW));
+                return 0;
+            }
+
             d->mouse_in = TRUE;
             if (!d->relative_mouse && !d->cursor_visible)
                 idd_update_relative_mouse(d);
@@ -3380,6 +3415,14 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_SETCURSOR:
         if (LOWORD(lp) == HTCLIENT) {
+            if (d && d->fullscreen_toolbar_visible) {
+                POINT pt;
+                if (GetCursorPos(&pt) &&
+                    idd_point_in_fullscreen_toolbar_region(d, pt)) {
+                    SetCursor(LoadCursorW(NULL, IDC_ARROW));
+                    return TRUE;
+                }
+            }
             if (d && (!d->cursor_visible || d->mouse_sync_pending))
                 SetCursor(NULL);
             else if (d && d->guest_cursor)
