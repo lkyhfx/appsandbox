@@ -132,7 +132,7 @@ d3d12-cross-process-share-probe: d3d12-cross-process-share-probe.cpp
 # the default invocation runs the cross-process 4K60 shared-texture workload.
 # --capability-444 and --workload-444 are diagnostic-only HEVC Main 4:4:4
 # gates; they do not change the default NV12 path.
-d3d12-video-encode-probe: d3d12-video-encode-probe.cpp
+d3d12-video-encode-probe: d3d12-video-encode-probe.cpp hevc444_probe_codec.h
 	$(CXX) -std=c++17 $(CXXFLAGS) -D_GNU_SOURCE -D_WIN32_WINNT=0x0A00 \
 	       -I../../../src/core -O2 -Wall -Wextra -Werror -Wno-unknown-pragmas -o $@ $< \
 	       $(LDFLAGS) -L$(D3D12_LIBDIR) \

@@ -35,6 +35,7 @@
 #include <unistd.h>
 
 #include "display_protocol.h"
+#include "hevc444_probe_codec.h"
 
 namespace {
 
@@ -112,20 +113,6 @@ static constexpr std::uint8_t kHevcSequenceHeaders[] = {
     0x6E, 0xAE, 0x46, 0xC2, 0xF0, 0x16, 0x80, 0x80, 0x00, 0x00, 0x03,
     0x00, 0x80, 0x00, 0x00, 0x1E, 0x04, 0x00, 0x00, 0x00, 0x01, 0x44,
     0x01, 0xC0, 0x71, 0x83, 0x12};
-
-/* This is a real Main 4:4:4 8-bit VPS/SPS/PPS set emitted by x265 with
- * repeat-headers enabled.  It is deliberately separate from the existing
- * Main 4:2:0 template; the SPS below has chroma_format_idc == 3.  Only the
- * SPS dimensions are rewritten by hevc_dynamic_sps(). */
-static constexpr std::uint8_t kHevc444SequenceHeaders[] = {
-    0x00, 0x00, 0x00, 0x01, 0x40, 0x01, 0x0C, 0x01, 0xFF, 0xFF, 0x04,
-    0x08, 0x00, 0x00, 0x03, 0x00, 0x9E, 0x28, 0x00, 0x00, 0x03, 0x00,
-    0x00, 0x99, 0xBA, 0x02, 0x40, 0x00, 0x00, 0x00, 0x01, 0x42, 0x01,
-    0x01, 0x04, 0x08, 0x00, 0x00, 0x03, 0x00, 0x9E, 0x28, 0x00, 0x00,
-    0x03, 0x00, 0x00, 0x99, 0x90, 0x00, 0x3C, 0x04, 0x00, 0x43, 0x8B,
-    0x2D, 0xD4, 0x92, 0x65, 0x78, 0x0B, 0x40, 0x40, 0x00, 0x00, 0x03,
-    0x00, 0x40, 0x00, 0x00, 0x0F, 0x02, 0x00, 0x00, 0x00, 0x01, 0x44,
-    0x01, 0xC1, 0x72, 0x86, 0x0C, 0x06, 0x24};
 
 struct HevcBitReader {
     const std::vector<std::uint8_t> &bytes;
@@ -302,11 +289,10 @@ static std::vector<std::uint8_t> hevc_dynamic_sps(
 }
 
 static std::vector<std::uint8_t> dynamic_hevc_sequence_headers(
-    std::uint32_t width, std::uint32_t height, bool hevc444 = false)
+    std::uint32_t width, std::uint32_t height)
 {
-    const auto *data = hevc444 ? kHevc444SequenceHeaders : kHevcSequenceHeaders;
-    const std::size_t size = hevc444 ? sizeof(kHevc444SequenceHeaders)
-                                     : sizeof(kHevcSequenceHeaders);
+    const auto *data = kHevcSequenceHeaders;
+    const std::size_t size = sizeof(kHevcSequenceHeaders);
     std::vector<std::uint8_t> result;
     bool have_vps = false, have_sps = false, have_pps = false;
     std::size_t begin = 0;
@@ -357,10 +343,11 @@ struct HevcBitstreamInfo {
     std::uint64_t chroma_format_idc = 0;
     std::uint32_t width = 0;
     std::uint32_t height = 0;
+    appsandbox_hevc444_probe::ParsedConfig parsed = {};
 };
 
-static bool parse_hevc_sps(const std::vector<std::uint8_t> &bitstream,
-                           HevcBitstreamInfo *info)
+[[maybe_unused]] static bool parse_hevc_sps(
+    const std::vector<std::uint8_t> &bitstream, HevcBitstreamInfo *info)
 {
     for (std::size_t i = 0; i + 3 < bitstream.size();) {
         std::size_t start = i;
@@ -448,19 +435,33 @@ static bool verify_hevc444_sequence_header(const char *path,
     }
     const std::vector<std::uint8_t> bytes(
         (std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-    if (!parse_hevc_sps(bytes, info)) {
-        std::fputs("BLOCKED stage=hevc444-sequence-header reason=sps-not-found\n",
+    if (!info ||
+        !appsandbox_hevc444_probe::parse_hevc444_sequence_headers(
+            bytes, &info->parsed)) {
+        std::fputs("BLOCKED stage=hevc444-sequence-header reason=parameter-set-parse-failed\n",
                    stderr);
         return false;
     }
-    const bool valid = info->chroma_format_idc == 3 &&
+    info->chroma_format_idc = info->parsed.chroma_format_idc;
+    info->width = info->parsed.width;
+    info->height = info->parsed.height;
+    const bool valid = info->parsed.profile_idc == 4 &&
+                       info->parsed.chroma_format_idc == 3 &&
+                       info->parsed.bit_depth_luma_minus8 == 0 &&
+                       info->parsed.bit_depth_chroma_minus8 == 0 &&
                        info->width == dimensions.width &&
                        info->height == dimensions.height;
-    std::printf("%s stage=hevc444-sequence-header chroma_format_idc=%llu width=%u "
-                "height=%u\n",
+    std::printf("%s stage=hevc444-sequence-header profile_idc=%u level_idc=%u "
+                "chroma_format_idc=%llu bit_depth=%u/%u width=%u height=%u "
+                "configuration_flags=0x%08x picture_flags=0x%08x\n",
                 valid ? "PASS" : "BLOCKED",
+                info->parsed.profile_idc, info->parsed.level_idc,
                 static_cast<unsigned long long>(info->chroma_format_idc),
-                info->width, info->height);
+                info->parsed.bit_depth_luma_minus8 + 8,
+                info->parsed.bit_depth_chroma_minus8 + 8,
+                info->width, info->height,
+                static_cast<unsigned>(info->parsed.configuration_flags),
+                static_cast<unsigned>(info->parsed.picture_flags));
     return valid;
 }
 
@@ -537,11 +538,224 @@ struct Hevc444PictureDefaults {
     std::array<CHAR, 6> cr_qp_offset_list = {};
 };
 
+struct Hevc444SequenceConfig {
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    D3D12_VIDEO_ENCODER_PROFILE_HEVC profile =
+        D3D12_VIDEO_ENCODER_PROFILE_HEVC_MAIN_444;
+    D3D12_VIDEO_ENCODER_LEVEL_TIER_CONSTRAINTS_HEVC level = {};
+    D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC configuration = {};
+    Hevc444PictureDefaults picture = {};
+    bool chroma_format_444 = true;
+    std::uint8_t bit_depth_luma_minus8 = 0;
+    std::uint8_t bit_depth_chroma_minus8 = 0;
+};
+
+static std::uint32_t hevc_profile_idc(
+    D3D12_VIDEO_ENCODER_PROFILE_HEVC profile)
+{
+    const std::uint32_t value = static_cast<std::uint32_t>(profile);
+    return value == 5 ? 4 : (value == 6 ? 5 : (value == 7 ? 6 : 4));
+}
+
+static std::uint32_t hevc_level_idc(
+    D3D12_VIDEO_ENCODER_LEVELS_HEVC level)
+{
+    static constexpr std::uint32_t values[] = {
+        30, 60, 63, 90, 93, 120, 123, 150, 153, 156, 180, 183, 186};
+    const std::uint32_t value = static_cast<std::uint32_t>(level);
+    return value < sizeof(values) / sizeof(values[0]) ? values[value] : 153;
+}
+
+static bool hevc444_sequence_config_matches(
+    const Hevc444SequenceConfig &expected, const HevcBitstreamInfo &actual)
+{
+    const auto &parsed = actual.parsed;
+    if (parsed.profile_idc != hevc_profile_idc(expected.profile) ||
+        parsed.level_idc != hevc_level_idc(expected.level.Level) ||
+        parsed.chroma_format_idc != (expected.chroma_format_444 ? 3U : 1U) ||
+        parsed.separate_colour_plane !=
+            ((expected.configuration.ConfigurationFlags &
+              D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_FLAG_SEPARATE_COLOUR_PLANE) !=
+             0) ||
+        parsed.bit_depth_luma_minus8 != expected.bit_depth_luma_minus8 ||
+        parsed.bit_depth_chroma_minus8 != expected.bit_depth_chroma_minus8 ||
+        parsed.width != expected.width || parsed.height != expected.height ||
+        parsed.configuration_flags !=
+            static_cast<std::uint32_t>(expected.configuration.ConfigurationFlags) ||
+        parsed.picture_flags != static_cast<std::uint32_t>(expected.picture.flags) ||
+        parsed.min_luma_coding_unit_size !=
+            static_cast<std::uint8_t>(expected.configuration.MinLumaCodingUnitSize) ||
+        parsed.max_luma_coding_unit_size !=
+            static_cast<std::uint8_t>(expected.configuration.MaxLumaCodingUnitSize) ||
+        parsed.min_luma_transform_unit_size !=
+            static_cast<std::uint8_t>(expected.configuration.MinLumaTransformUnitSize) ||
+        parsed.max_luma_transform_unit_size !=
+            static_cast<std::uint8_t>(expected.configuration.MaxLumaTransformUnitSize) ||
+        parsed.max_transform_hierarchy_depth_inter !=
+            expected.configuration.max_transform_hierarchy_depth_inter ||
+        parsed.max_transform_hierarchy_depth_intra !=
+            expected.configuration.max_transform_hierarchy_depth_intra)
+        return false;
+
+    const auto &picture = expected.picture;
+    if (parsed.diff_cu_chroma_qp_offset_depth !=
+            picture.diff_cu_chroma_qp_offset_depth ||
+        parsed.log2_sao_offset_scale_luma != picture.log2_sao_offset_scale_luma ||
+        parsed.log2_sao_offset_scale_chroma != picture.log2_sao_offset_scale_chroma)
+        return false;
+    if ((expected.configuration.ConfigurationFlags &
+         D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_FLAG_ENABLE_TRANSFORM_SKIPPING) &&
+        parsed.log2_max_transform_skip_block_size_minus2 !=
+            picture.log2_max_transform_skip_block_size_minus2)
+        return false;
+    if ((picture.flags &
+         D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CHROMA_QP_OFFSET_LIST) !=
+        0) {
+        if (parsed.chroma_qp_offset_list_len_minus1 !=
+                picture.chroma_qp_offset_list_len_minus1)
+            return false;
+        const unsigned count = picture.chroma_qp_offset_list_len_minus1 + 1;
+        for (unsigned i = 0; i < count; ++i) {
+            if (parsed.cb_qp_offset_list[i] != picture.cb_qp_offset_list[i] ||
+                parsed.cr_qp_offset_list[i] != picture.cr_qp_offset_list[i])
+                return false;
+        }
+    } else if (parsed.picture_flags &
+               appsandbox_hevc444_probe::kPictureChromaQpOffsetList) {
+        return false;
+    }
+    return true;
+}
+
+static bool apply_required_hevc444_configuration_flags(
+    const D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC1 &support,
+    D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_FLAGS *config_flags,
+    Hevc444PictureDefaults *picture_defaults)
+{
+    if (!config_flags || !picture_defaults)
+        return false;
+
+    std::uint32_t configuration = 0;
+    std::uint32_t picture = static_cast<std::uint32_t>(picture_defaults->flags);
+    const std::uint32_t flags = static_cast<std::uint32_t>(support.SupportFlags);
+    const std::uint32_t flags1 = static_cast<std::uint32_t>(support.SupportFlags1);
+    /* SupportFlags also carries the non-required *_SUPPORT bits. The mapper
+     * below deliberately examines every current *_REQUIRED bit explicitly. */
+    if ((flags1 & ~0x3fu) != 0)
+        return false;
+    const auto required = [&](std::uint32_t mask) { return (flags & mask) != 0; };
+    const auto required1 = [&](std::uint32_t mask) { return (flags1 & mask) != 0; };
+    const auto set_configuration = [&](std::uint32_t required_bit,
+                                       std::uint32_t configuration_bit) {
+        if (required(required_bit))
+            configuration |= configuration_bit;
+    };
+
+    set_configuration(
+        D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC_FLAG_ASYMETRIC_MOTION_PARTITION_REQUIRED,
+        D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_FLAG_USE_ASYMETRIC_MOTION_PARTITION);
+    set_configuration(
+        D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC_FLAG_TRANSFORM_SKIP_ROTATION_ENABLED_REQUIRED,
+        D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_FLAG_TRANSFORM_SKIP_ROTATION);
+    set_configuration(
+        D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC_FLAG_TRANSFORM_SKIP_CONTEXT_ENABLED_REQUIRED,
+        D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_FLAG_TRANSFORM_SKIP_CONTEXT);
+    set_configuration(
+        D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC_FLAG_IMPLICIT_RDPCM_ENABLED_REQUIRED,
+        D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_FLAG_IMPLICIT_RDPCM);
+    set_configuration(
+        D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC_FLAG_EXPLICIT_RDPCM_ENABLED_REQUIRED,
+        D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_FLAG_EXPLICIT_RDPCM);
+    set_configuration(
+        D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC_FLAG_EXTENDED_PRECISION_PROCESSING_REQUIRED,
+        D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_FLAG_EXTENDED_PRECISION_PROCESSING);
+    set_configuration(
+        D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC_FLAG_INTRA_SMOOTHING_DISABLED_REQUIRED,
+        D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_FLAG_INTRA_SMOOTHING_DISABLED);
+    set_configuration(
+        D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC_FLAG_HIGH_PRECISION_OFFSETS_ENABLED_REQUIRED,
+        D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_FLAG_HIGH_PRECISION_OFFSETS);
+    set_configuration(
+        D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC_FLAG_PERSISTENT_RICE_ADAPTATION_ENABLED_REQUIRED,
+        D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_FLAG_PERSISTENT_RICE_ADAPTATION);
+    set_configuration(
+        D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC_FLAG_CABAC_BYPASS_ALIGNMENT_ENABLED_REQUIRED,
+        D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_FLAG_CABAC_BYPASS_ALIGNMENT);
+    if (required1(
+            D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC_FLAG1_SEPARATE_COLOUR_PLANE_REQUIRED))
+        configuration |= D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_FLAG_SEPARATE_COLOUR_PLANE;
+    if (required1(
+            D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC_FLAG1_TEMPORAL_MVP_ENABLED_REQUIRED))
+        configuration |= D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_FLAG_TEMPORAL_MVP_ENABLED;
+    if (required1(
+            D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC_FLAG1_STRONG_INTRA_SMOOTHING_ENABLED_REQUIRED))
+        configuration |= D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_FLAG_STRONG_INTRA_SMOOTHING_ENABLED;
+
+    if (required(
+            D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC_FLAG_CROSS_COMPONENT_PREDICTION_ENABLED_FLAG_REQUIRED))
+        picture |= D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CROSS_COMPONENT_PREDICTION;
+    if (required(
+            D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC_FLAG_CHROMA_QP_OFFSET_LIST_ENABLED_FLAG_REQUIRED))
+        picture |= D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CHROMA_QP_OFFSET_LIST;
+
+    *config_flags = static_cast<D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_FLAGS>(configuration);
+    picture_defaults->flags =
+        static_cast<D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAGS>(picture);
+    return true;
+}
+
+static bool build_hevc444_sequence_headers(
+    const Hevc444SequenceConfig &config, std::vector<std::uint8_t> *out)
+{
+    if (!out || config.profile != D3D12_VIDEO_ENCODER_PROFILE_HEVC_MAIN_444 ||
+        !config.chroma_format_444)
+        return false;
+    appsandbox_hevc444_probe::SequenceConfig portable = {};
+    portable.width = config.width;
+    portable.height = config.height;
+    portable.profile = static_cast<std::uint32_t>(config.profile);
+    portable.level = static_cast<std::uint32_t>(config.level.Level);
+    portable.configuration_flags =
+        static_cast<std::uint32_t>(config.configuration.ConfigurationFlags);
+    portable.min_luma_coding_unit_size =
+        static_cast<std::uint8_t>(config.configuration.MinLumaCodingUnitSize);
+    portable.max_luma_coding_unit_size =
+        static_cast<std::uint8_t>(config.configuration.MaxLumaCodingUnitSize);
+    portable.min_luma_transform_unit_size =
+        static_cast<std::uint8_t>(config.configuration.MinLumaTransformUnitSize);
+    portable.max_luma_transform_unit_size =
+        static_cast<std::uint8_t>(config.configuration.MaxLumaTransformUnitSize);
+    portable.max_transform_hierarchy_depth_inter =
+        config.configuration.max_transform_hierarchy_depth_inter;
+    portable.max_transform_hierarchy_depth_intra =
+        config.configuration.max_transform_hierarchy_depth_intra;
+    portable.picture.flags = static_cast<std::uint32_t>(config.picture.flags);
+    portable.picture.diff_cu_chroma_qp_offset_depth =
+        config.picture.diff_cu_chroma_qp_offset_depth;
+    portable.picture.log2_sao_offset_scale_luma =
+        config.picture.log2_sao_offset_scale_luma;
+    portable.picture.log2_sao_offset_scale_chroma =
+        config.picture.log2_sao_offset_scale_chroma;
+    portable.picture.log2_max_transform_skip_block_size_minus2 =
+        config.picture.log2_max_transform_skip_block_size_minus2;
+    portable.picture.chroma_qp_offset_list_len_minus1 =
+        config.picture.chroma_qp_offset_list_len_minus1;
+    for (std::size_t i = 0; i != portable.picture.cb_qp_offset_list.size(); ++i) {
+        portable.picture.cb_qp_offset_list[i] = config.picture.cb_qp_offset_list[i];
+        portable.picture.cr_qp_offset_list[i] = config.picture.cr_qp_offset_list[i];
+    }
+    portable.bit_depth_luma_minus8 = config.bit_depth_luma_minus8;
+    portable.bit_depth_chroma_minus8 = config.bit_depth_chroma_minus8;
+    return appsandbox_hevc444_probe::build_hevc444_sequence_headers(portable, out);
+}
+
 struct HevcConfiguration {
     D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC requested = {};
     D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC reported = {};
     D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC1 reported1 = {};
     Hevc444PictureDefaults picture_defaults = {};
+    bool required_flags_applied = false;
 };
 
 static bool choose_first_allowed(UINT mask, unsigned max_value, UCHAR *value)
@@ -602,17 +816,6 @@ static bool choose_hevc444_picture_defaults(
             return false;
     }
 
-    const auto required = support.SupportFlags;
-    if ((required &
-         D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC_FLAG_CROSS_COMPONENT_PREDICTION_ENABLED_FLAG_REQUIRED) !=
-        0)
-        out->flags |=
-            D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CROSS_COMPONENT_PREDICTION;
-    if ((required &
-         D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC_FLAG_CHROMA_QP_OFFSET_LIST_ENABLED_FLAG_REQUIRED) !=
-        0)
-        out->flags |=
-            D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAG_CHROMA_QP_OFFSET_LIST;
     return true;
 }
 
@@ -765,29 +968,32 @@ static bool find_hevc444_configuration(
                                 (candidate.SupportFlags &
                                  D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC_FLAG_ASYMETRIC_MOTION_PARTITION_REQUIRED) !=
                                 0;
-                            if (asymmetric_required && retry == 0) {
-                                candidate.SupportFlags =
-                                    D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC_FLAG_ASYMETRIC_MOTION_PARTITION_SUPPORT |
-                                    D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC_FLAG_ASYMETRIC_MOTION_PARTITION_REQUIRED;
-                                continue;
-                            }
+                             if (asymmetric_required && retry == 0) {
+                                 candidate.SupportFlags = static_cast<
+                                     D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC_FLAGS>(
+                                     candidate.SupportFlags |
+                                     D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC_FLAG_ASYMETRIC_MOTION_PARTITION_SUPPORT |
+                                     D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC_FLAG_ASYMETRIC_MOTION_PARTITION_REQUIRED);
+                                 continue;
+                             }
 
                             Hevc444PictureDefaults defaults = {};
                             if (!choose_hevc444_picture_defaults(candidate,
                                                                   &defaults)) {
                                 continue;
                             }
-                            const bool separate_plane_required =
-                                (candidate.SupportFlags1 &
-                                 D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC_FLAG1_SEPARATE_COLOUR_PLANE_REQUIRED) !=
-                                0;
-                            found->requested.ConfigurationFlags =
-                                (asymmetric_required
-                                     ? D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_FLAG_USE_ASYMETRIC_MOTION_PARTITION
-                                     : D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_FLAG_NONE) |
-                                (separate_plane_required
-                                     ? D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_FLAG_SEPARATE_COLOUR_PLANE
-                                     : D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_FLAG_NONE);
+                            D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_FLAGS configuration_flags =
+                                D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_FLAG_NONE;
+                            if (!apply_required_hevc444_configuration_flags(
+                                    candidate, &configuration_flags, &defaults)) {
+                                std::fputs(
+                                    "BLOCKED stage=hevc444-sequence-config "
+                                    "reason=required-feature-not-implemented "
+                                    "feature=hevc444-required-flag\n",
+                                    stderr);
+                                return false;
+                            }
+                            found->requested.ConfigurationFlags = configuration_flags;
                             found->requested.MinLumaCodingUnitSize =
                                 candidate.MinLumaCodingUnitSize;
                             found->requested.MaxLumaCodingUnitSize =
@@ -816,6 +1022,7 @@ static bool find_hevc444_configuration(
                                 candidate.max_transform_hierarchy_depth_intra;
                             found->reported1 = candidate;
                             found->picture_defaults = defaults;
+                            found->required_flags_applied = true;
                             std::printf("PASS stage=hevc444-codec-config-support "
                                         "flags=0x%08x flags1=0x%08x "
                                         "picture_defaults=%u,%u,%u,%u,%u\n",
@@ -1083,6 +1290,8 @@ struct EncoderSetup {
     D3D12_VIDEO_ENCODER_LEVEL_SETTING level = {};
     D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC configuration = {};
     Hevc444PictureDefaults hevc444_picture_defaults = {};
+    Hevc444SequenceConfig hevc444_sequence_config = {};
+    bool hevc444_required_flags_applied = false;
     D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION configuration_union = {};
     D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE_HEVC gop_value = {};
     D3D12_VIDEO_ENCODER_SEQUENCE_GOP_STRUCTURE gop = {};
@@ -1118,6 +1327,19 @@ static bool initialize_encoder(DeviceContext *context, EncoderSetup *setup,
     }
     setup->configuration = config.requested;
     setup->hevc444_picture_defaults = config.picture_defaults;
+    setup->hevc444_required_flags_applied =
+        !hevc444 || config.required_flags_applied;
+    if (hevc444) {
+        setup->hevc444_sequence_config.width = dimensions.width;
+        setup->hevc444_sequence_config.height = dimensions.height;
+        setup->hevc444_sequence_config.profile = setup->profile_value;
+        setup->hevc444_sequence_config.level = setup->level_value;
+        setup->hevc444_sequence_config.configuration = setup->configuration;
+        setup->hevc444_sequence_config.picture = config.picture_defaults;
+        setup->hevc444_sequence_config.chroma_format_444 = true;
+        setup->hevc444_sequence_config.bit_depth_luma_minus8 = 0;
+        setup->hevc444_sequence_config.bit_depth_chroma_minus8 = 0;
+    }
     setup->configuration_union.DataSize = sizeof(setup->configuration);
     setup->configuration_union.pHEVCConfig = &setup->configuration;
     setup->gop_value.GOPLength = 1;
@@ -1852,11 +2074,20 @@ static bool encode_consumer_main(
     }
     if (!*stream)
         return false;
-    const std::vector<std::uint8_t> sequence_headers =
-        dynamic_hevc_sequence_headers(bundle.width, bundle.height,
-                                      hevc444_session);
-    if (sequence_headers.empty()) {
-        std::fputs("FAIL stage=hevc-sequence-headers reason=invalid-template\n", stderr);
+    std::vector<std::uint8_t> sequence_headers;
+    const bool sequence_headers_ok = hevc444_session
+        ? build_hevc444_sequence_headers(encoder.hevc444_sequence_config,
+                                          &sequence_headers)
+        : !(sequence_headers = dynamic_hevc_sequence_headers(
+                bundle.width, bundle.height)).empty();
+    if (!sequence_headers_ok || sequence_headers.empty()) {
+        if (hevc444_session)
+            std::fputs("BLOCKED stage=hevc444-sequence-config "
+                       "reason=required-feature-not-implemented "
+                       "feature=hevc444-sequence-header-syntax\n", stderr);
+        else
+            std::fputs("FAIL stage=hevc-sequence-headers reason=invalid-template\n",
+                       stderr);
         return false;
     }
     stream->write(reinterpret_cast<const char *>(sequence_headers.data()),
@@ -2212,8 +2443,19 @@ static bool encode_consumer_main(
     const bool hevc444_sequence_header_ok =
         !hevc444_session ||
         verify_hevc444_sequence_header(stream_path, dimensions, &hevc444_bitstream);
+    const bool hevc444_runtime_config_match =
+        !hevc444_session ||
+        (hevc444_sequence_header_ok &&
+         hevc444_sequence_config_matches(encoder.hevc444_sequence_config,
+                                          hevc444_bitstream));
     const bool hevc444_stream_structure_ok =
         !hevc444_session || verify_hevc444_stream_structure(stream_path);
+    if (hevc444_session) {
+        std::printf("%s stage=hevc444-sequence-header-consistency "
+                    "runtime_config_match=%u\n",
+                    hevc444_runtime_config_match ? "PASS" : "BLOCKED",
+                    hevc444_runtime_config_match ? 1U : 0U);
+    }
     const std::uint64_t consumer_end_ns = monotonic_ns();
     const double consumer_elapsed_seconds =
         static_cast<double>(consumer_end_ns - consumer_start_ns) / 1000000000.0;
@@ -2273,6 +2515,7 @@ static bool encode_consumer_main(
                          ? diagnostic_checks == 0
                          : diagnostic_checks == kFrameCount / kDiagnosticInterval) &&
                     fps_ok && hevc444_sequence_header_ok &&
+                    hevc444_runtime_config_match &&
                     hevc444_stream_structure_ok;
     publish_production_health(production_session, bundle.width, bundle.height,
                               ok, bundle.gpu_copy != 0, encoded_frames,
@@ -2318,11 +2561,13 @@ static bool encode_consumer_main(
                     "rgba_to_ayuv=1\n"
                     "bgra_to_ayuv=1\n"
                     "hevc444_codec_config=1\n"
+                    "hevc444_required_flags_applied=%u\n"
                     "hevc444_picture_control=1\n"
                     "hevc444_encoder_create=1\n"
                     "hevc444_4k60_config=1\n"
                     "hevc444_4k60_sustained=%u\n"
                     "sequence_header_chroma_format_idc=%llu\n"
+                    "sequence_header_runtime_config_match=%u\n"
                     "guest_bitstream_generated=%u\n"
                     "guest_sequence_header_444=%u\n"
                     "guest_encode_failures=%llu\n"
@@ -2334,8 +2579,10 @@ static bool encode_consumer_main(
                     "cpu_memcpy_framebuffer=0\n"
                     "gpu_cpu_gpu=0\n"
                     "chroma_format_idc=%llu\n",
+                    encoder.hevc444_required_flags_applied ? 1U : 0U,
                     ok ? 1U : 0U,
                     static_cast<unsigned long long>(hevc444_bitstream.chroma_format_idc),
+                    hevc444_runtime_config_match ? 1U : 0U,
                     (encoded_frames == kFrameCount && encode_failures == 0 &&
                      hevc444_stream_structure_ok) ? 1U : 0U,
                     hevc444_sequence_header_ok ? 1U : 0U,
@@ -2490,13 +2737,18 @@ static int capability_444_main()
                 "hevc444_picture_control=%u\n"
                 "hevc444_encoder_create=%u\n"
                 "hevc444_4k60_config=%u\n"
+                "hevc444_required_flags_applied=%u\n"
                 "hevc444_4k60_sustained=not-run\n"
-                "sequence_header_chroma_format_idc=3\n"
+                "sequence_header_chroma_format_idc=not-run\n"
+                "sequence_header_runtime_config_match=not-run\n"
+                "guest_sequence_header_444=not-run\n"
                 "guest_bitstream_generated=0\n",
                 profile_ok ? 1U : 0U, ayuv_input_ok ? 1U : 0U,
-                rgba_ok ? 1U : 0U, bgra_ok ? 1U : 0U,
-                codec_config_ok ? 1U : 0U, encoder_ok ? 1U : 0U,
-                encoder_ok ? 1U : 0U, encoder_ok ? 1U : 0U);
+                 rgba_ok ? 1U : 0U, bgra_ok ? 1U : 0U,
+                 codec_config_ok ? 1U : 0U, encoder_ok ? 1U : 0U,
+                 encoder_ok ? 1U : 0U,
+                 encoder_ok ? 1U : 0U,
+                 setup.hevc444_required_flags_applied ? 1U : 0U);
     return encoder_ok ? 0 : 1;
 }
 

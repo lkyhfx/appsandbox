@@ -1,0 +1,32 @@
+name: HEVC444 probe checks
+
+on:
+  push:
+    paths:
+      - "tools/linux/agent/**"
+      - "tools/win/hevc444-probe/**"
+      - ".github/workflows/hevc444-probe.yml"
+  pull_request:
+    paths:
+      - "tools/linux/agent/**"
+      - "tools/win/hevc444-probe/**"
+      - ".github/workflows/hevc444-probe.yml"
+
+jobs:
+  cpu-only:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run CPU-only HEVC parser and builder tests
+        run: python3 tools/linux/agent/test_hevc_headers.py
+
+  windows-compile-only:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Build the standalone Windows probe
+        shell: pwsh
+        run: >-
+          msbuild tools\win\hevc444-probe\hevc444-probe.vcxproj
+          /t:Build /p:Configuration=Release /p:Platform=x64 /m

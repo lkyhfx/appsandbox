@@ -26,6 +26,8 @@
 #include <string>
 #include <vector>
 
+#include "hevc_access_unit_probe.h"
+
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -176,33 +178,13 @@ static bool create_d3d11_context(UINT requested_adapter, D3D11Context *result)
 }
 
 struct HevcAnnexBStream {
-    std::vector<std::uint8_t> bytes;
     std::vector<std::uint8_t> sequence_header;
+    HevcAccessUnit first_irap;
     bool has_vps = false;
     bool has_sps = false;
     bool has_pps = false;
-    bool has_idr_or_i = false;
+    bool first_irap_found = false;
 };
-
-static bool find_start_code(const std::vector<std::uint8_t> &bytes,
-                            std::size_t begin, std::size_t *offset,
-                            std::size_t *length)
-{
-    for (std::size_t i = begin; i + 3 <= bytes.size(); ++i) {
-        if (bytes[i] == 0 && bytes[i + 1] == 0 && bytes[i + 2] == 1) {
-            *offset = i;
-            *length = 3;
-            return true;
-        }
-        if (i + 4 <= bytes.size() && bytes[i] == 0 && bytes[i + 1] == 0 &&
-            bytes[i + 2] == 0 && bytes[i + 3] == 1) {
-            *offset = i;
-            *length = 4;
-            return true;
-        }
-    }
-    return false;
-}
 
 static bool parse_hevc_annex_b(const std::vector<std::uint8_t> &bytes,
                                HevcAnnexBStream *stream)
@@ -210,46 +192,34 @@ static bool parse_hevc_annex_b(const std::vector<std::uint8_t> &bytes,
     if (!stream)
         return false;
     *stream = {};
-    stream->bytes = bytes;
-    std::size_t start = 0;
-    std::size_t prefix = 0;
-    if (!find_start_code(bytes, 0, &start, &prefix))
+    std::vector<hevc_access_unit_probe::Nal> nals;
+    if (!hevc_access_unit_probe::split(bytes, &nals))
         return false;
-    while (start < bytes.size()) {
-        const std::size_t nal_begin = start + prefix;
-        if (nal_begin + 2 > bytes.size())
-            return false;
-        std::size_t next = 0;
-        std::size_t next_prefix = 0;
-        const bool has_next = find_start_code(bytes, nal_begin, &next,
-                                              &next_prefix);
-        const std::size_t nal_end = has_next ? next : bytes.size();
-        if (nal_end <= nal_begin)
-            return false;
-        const unsigned type = (bytes[nal_begin] >> 1) & 0x3f;
-        if (type == 32 || type == 33 || type == 34) {
-            if ((type == 32 && stream->has_vps) ||
-                (type == 33 && stream->has_sps) ||
-                (type == 34 && stream->has_pps)) {
-                /* Keep the first parameter set in MF_MT_MPEG_SEQUENCE_HEADER. */
-            } else {
-                stream->sequence_header.insert(
-                    stream->sequence_header.end(), bytes.begin() + start,
-                    bytes.begin() + nal_end);
-            }
-            if (type == 32) stream->has_vps = true;
-            if (type == 33) stream->has_sps = true;
-            if (type == 34) stream->has_pps = true;
-        } else if (type >= 16 && type <= 23) {
-            stream->has_idr_or_i = true;
+
+    std::vector<std::uint8_t> vps;
+    std::vector<std::uint8_t> sps;
+    std::vector<std::uint8_t> pps;
+    for (const auto &nal : nals) {
+        if (nal.type == 32 && vps.empty()) {
+            vps = nal.bytes;
+            stream->has_vps = true;
+        } else if (nal.type == 33 && sps.empty()) {
+            sps = nal.bytes;
+            stream->has_sps = true;
+        } else if (nal.type == 34 && pps.empty()) {
+            pps = nal.bytes;
+            stream->has_pps = true;
         }
-        if (!has_next)
-            break;
-        start = next;
-        prefix = next_prefix;
     }
-    return stream->has_vps && stream->has_sps && stream->has_pps &&
-           stream->has_idr_or_i && !stream->sequence_header.empty();
+    if (!stream->has_vps || !stream->has_sps || !stream->has_pps)
+        return false;
+    stream->sequence_header.insert(stream->sequence_header.end(), vps.begin(), vps.end());
+    stream->sequence_header.insert(stream->sequence_header.end(), sps.begin(), sps.end());
+    stream->sequence_header.insert(stream->sequence_header.end(), pps.begin(), pps.end());
+    stream->first_irap_found =
+        hevc_access_unit_probe::extract_first_irap_access_unit(bytes,
+                                                               &stream->first_irap);
+    return stream->first_irap_found && !stream->sequence_header.empty();
 }
 
 static bool read_stream_file(const std::wstring &path,
@@ -365,12 +335,13 @@ static bool configure_mf_input(IMFTransform *transform,
 static bool make_input_sample(const HevcAnnexBStream &stream,
                               IMFSample **sample)
 {
-    if (!sample || stream.bytes.empty() ||
-        stream.bytes.size() > std::numeric_limits<DWORD>::max())
+    if (!sample || !stream.first_irap_found || stream.first_irap.bytes.empty() ||
+        stream.first_irap.bytes.size() > std::numeric_limits<DWORD>::max())
         return false;
     *sample = nullptr;
     ComPtr<IMFMediaBuffer> buffer;
-    HRESULT hr = MFCreateMemoryBuffer(static_cast<DWORD>(stream.bytes.size()),
+    HRESULT hr = MFCreateMemoryBuffer(
+        static_cast<DWORD>(stream.first_irap.bytes.size()),
                                       &buffer);
     if (SUCCEEDED(hr)) {
         BYTE *destination = nullptr;
@@ -378,9 +349,11 @@ static bool make_input_sample(const HevcAnnexBStream &stream,
         DWORD current_length = 0;
         hr = buffer->Lock(&destination, &max_length, &current_length);
         if (SUCCEEDED(hr)) {
-            std::memcpy(destination, stream.bytes.data(), stream.bytes.size());
+            std::memcpy(destination, stream.first_irap.bytes.data(),
+                        stream.first_irap.bytes.size());
             buffer->Unlock();
-            hr = buffer->SetCurrentLength(static_cast<DWORD>(stream.bytes.size()));
+            hr = buffer->SetCurrentLength(
+                static_cast<DWORD>(stream.first_irap.bytes.size()));
         }
     }
     ComPtr<IMFSample> created;
@@ -389,6 +362,7 @@ static bool make_input_sample(const HevcAnnexBStream &stream,
     if (SUCCEEDED(hr)) hr = created->SetSampleTime(0);
     if (SUCCEEDED(hr)) hr = created->SetSampleDuration(
         10000000LL / kFpsNumerator);
+    if (SUCCEEDED(hr)) hr = created->SetUINT32(MFSampleExtension_CleanPoint, TRUE);
     if (FAILED(hr))
         return false;
     *sample = created.Detach();
@@ -935,14 +909,20 @@ int wmain(int argc, wchar_t **argv)
         return 1;
     HevcAnnexBStream stream;
     if (!parse_hevc_annex_b(stream_bytes, &stream)) {
-        std::fputs("BLOCKED stage=stream-parse reason=missing-vps-sps-pps-or-idr\n",
+        std::fputs("BLOCKED stage=stream-parse reason=missing-vps-sps-pps-or-irap\n",
                    stderr);
         return 1;
     }
     std::printf("guest_stream_vps=%u\n", stream.has_vps ? 1U : 0U);
     std::printf("guest_stream_sps=%u\n", stream.has_sps ? 1U : 0U);
     std::printf("guest_stream_pps=%u\n", stream.has_pps ? 1U : 0U);
-    std::printf("guest_stream_idr_or_i=%u\n", stream.has_idr_or_i ? 1U : 0U);
+    std::printf("guest_first_irap_found=%u\n",
+                stream.first_irap_found ? 1U : 0U);
+    std::printf("guest_first_irap_bytes=%zu\n",
+                stream.first_irap.bytes.size());
+    std::printf("guest_first_irap_nal_count=%zu\n",
+                stream.first_irap.nal_count);
+    std::printf("guest_first_irap_clean_point=1\n");
 
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(hr)) {

@@ -108,9 +108,9 @@ consumer_exit=0
 
 This closes the synthetic/architecture feasibility phase only. The current
 production Mutter integration remains blocked by the real-target first-copy
-`DXGI_ERROR_DEVICE_HUNG`; the five-mode producer isolation probe is the next
-acceptance gate. Do not use the historical 3600-frame result as production
-validation.
+`DXGI_ERROR_DEVICE_HUNG`; the three-mode post-flush producer isolation probe
+is the next acceptance gate. Do not use the historical 3600-frame result as
+production validation.
 
 ## What "zero-copy" means here
 
@@ -281,6 +281,13 @@ writes the diagnostic stream to:
 
 ```text
 /tmp/appsandbox-hevc444-probe.hevc
+
+For the 4:4:4 workload, VPS/SPS/PPS are built from the runtime HEVC1
+configuration and HEVC1 picture-control values. The probe reparses those
+headers and compares profile/level, SPS/PPS flags, CU/TU limits, and picture
+control values before reporting `sequence_header_runtime_config_match=1`; the
+capability-only mode deliberately reports the sequence-header fields as
+`not-run`.
 ```
 
 The workload reports `cpu_conversion=0`, `framebuffer_mmap=0`, and
@@ -317,6 +324,21 @@ path is `UNAVAILABLE` when MF does not pass. A `BLOCKED` result is a runtime
 capability fact, not a request to enable a fallback or change the production
 display protocol.
 
+The Windows probe parses Annex-B NAL units into the first complete IRAP access
+unit (including prefix SEI and all slices up to the next picture). It supplies
+only that AU as the first MF sample, with time `0`, duration `1/60`, and a clean
+point marker; the full 3600-frame guest file is never submitted as one sample.
+
+The probe-only CPU regression tests run with:
+
+```sh
+python3 tools/linux/agent/test_hevc_headers.py
+```
+
+The matching Windows CI job builds only
+`tools/win/hevc444-probe/hevc444-probe.vcxproj` in Release/x64. It does not run
+the hardware probe.
+
 ### 7. Current real Mutter output gate is blocked
 
 The isolated Mutter/Mesa integration reaches the real compositor render target:
@@ -350,10 +372,21 @@ PASS: zero CPU framebuffer-copy conditions
 PASS: 3840x2160 / 3600-frame decode
 ```
 
-### 8. Producer `CopyResource` isolation probe
+### 8. Historical producer `CopyResource` isolation probe
 
-Run the five one-frame modes against a real Mutter session after rebuilding the
-Mesa patch:
+The original five-mode result is retained as historical evidence:
+
+```text
+ring-only                 PASS: producer fence; consumer OpenSharedHandle
+barrier-only              PASS: producer fence; removed_reason=0x00000000
+local-copy                FAIL: completion timeout; Mutter session timed out
+shared-copy-no-consumer   FAIL: completion timeout; Mutter session timed out
+shared-copy-consumer      FAIL: completion timeout; consumer ready timed out
+```
+
+The historical modes are not the post-flush acceptance matrix. The updated
+runner accepts only the following three one-frame modes, each in a fresh Mutter
+session:
 
 ```sh
 make d3d12-mutter-consumer
@@ -361,10 +394,31 @@ MUTTER_TEST_CLIENT_CMD='...' \
   ./gpu-mutter-d3d12-isolation-probe.sh gpu-mutter-d3d12-isolation-results
 ```
 
-The Mesa hook selects one mode with `ASB_D3D12_COPY_PROBE` and, after the
-current command list is submitted, signals a diagnostic fence on the same
-`screen->cmdqueue`, waits for completion, and immediately logs
-`GetDeviceRemovedReason()`:
+```text
+postflush-local-copy                 PASS|FAIL
+postflush-shared-copy-no-consumer    PASS|FAIL
+postflush-shared-copy-consumer      PASS|FAIL
+```
+
+The Mesa hook prepares the real framebuffer before `d3d12_flush_cmdlist()` and
+submits an independent `D3D12_COMMAND_LIST_TYPE_DIRECT` capture list on the
+same device and `screen->cmdqueue` after Mesa's compositor list is submitted.
+The capture list uses direct D3D12 barriers, keeps an explicit COM reference to
+the source, and signals a bounded diagnostic capture fence. It does not call
+Mesa's resource-state tracker or write capture work to `ctx->cmdlist`.
+
+`postflush-local-copy` uses a non-shared DEFAULT destination and does not
+require a consumer socket. `postflush-shared-copy-no-consumer` uses a shared
+destination but does not open it in another process. Only
+`postflush-shared-copy-consumer` starts the existing consumer and exercises the
+ready/consumer-done slot ownership protocol.
+
+The post-flush logs include source resource description and heap properties,
+allocator/list reset and close status, queue signal HRESULT, capture completion,
+and `GetDeviceRemovedReason()`. Unknown `ASB_D3D12_COPY_PROBE` values and
+unknown `ASB_ISOLATION_MODES` values fail closed.
+
+The historical five-mode output remains:
 
 ```text
 ring-only                 shared ring + consumer OpenSharedHandle; no source operation
@@ -525,8 +579,9 @@ The validated behavior is represented by these implementation/probe sources:
 - `d3d12-video-encode-probe.cpp` — D3D12 Video Processor + HEVC encode gate.
 - `d3d12-mutter-consumer.cpp` — isolated Mutter encoder consumer.
 - `gpu-mutter-d3d12-share-probe.sh` — real compositor end-to-end gate.
-- `gpu-mutter-d3d12-isolation-probe.sh` — five one-frame real-target producer
-  isolation modes with a post-submit diagnostic fence.
+- `gpu-mutter-d3d12-isolation-probe.sh` — three one-frame post-flush
+  real-target producer isolation modes with an independent capture fence; the
+  README retains the original five-mode result as historical evidence.
 - `../wsl-mesa/patches/0002-d3d12-mutter-appsandbox-share.patch` — Mesa
   D3D12 publisher prototype.
 - `mutter-appsandbox-display.patch` — deterministic AppSandbox Mutter

@@ -2,8 +2,9 @@
 # One-frame isolation probe for the real Mutter framebuffer path.
 #
 # Each mode starts a fresh headless Mutter session and asks the patched Mesa
-# producer to do exactly one diagnostic operation.  The producer submits a
-# fence on the same D3D12 queue, waits for it, and logs
+# producer to do exactly one post-flush diagnostic operation.  The producer
+# submits an independent capture list and fence on the same D3D12 queue, waits
+# for it, and logs
 # GetDeviceRemovedReason() immediately afterwards.
 set -uo pipefail
 
@@ -20,11 +21,6 @@ if [[ -z "${MUTTER_TEST_CLIENT_CMD:-}" ]]; then
     printf 'BLOCKED stage=copy-isolation reason=MUTTER_TEST_CLIENT_CMD-not-set\n'
     exit 2
 fi
-if [[ ! -x "$consumer_bin" ]]; then
-    printf 'BLOCKED stage=copy-isolation reason=missing-consumer:%s\n' "$consumer_bin"
-    exit 2
-fi
-
 if [[ -n "$mesa_probe_prefix" ]]; then
     export LD_LIBRARY_PATH="$mesa_probe_prefix/lib/x86_64-linux-gnu:$d3d12_libdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     export LIBGL_DRIVERS_PATH="$mesa_probe_prefix/lib/x86_64-linux-gnu/dri"
@@ -43,20 +39,50 @@ mkdir -p "$(dirname "$socket_path")" || {
 }
 
 needs_consumer() {
-    [[ "$1" == ring-only || "$1" == shared-copy-consumer ]]
+    [[ "$1" == postflush-shared-copy-consumer ]]
+}
+
+valid_mode() {
+    case "$1" in
+        postflush-local-copy|postflush-shared-copy-no-consumer|postflush-shared-copy-consumer)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
 }
 
 status=0
 if [[ -n "${ASB_ISOLATION_MODES:-}" ]]; then
     read -r -a modes <<<"$ASB_ISOLATION_MODES"
 else
-    modes=(ring-only barrier-only local-copy shared-copy-no-consumer shared-copy-consumer)
+    modes=(postflush-local-copy postflush-shared-copy-no-consumer postflush-shared-copy-consumer)
 fi
 if [[ "${#modes[@]}" -eq 0 ]]; then
     printf 'BLOCKED stage=copy-isolation reason=no-modes\n'
     exit 2
 fi
+for mode in "${modes[@]}"; do
+    if ! valid_mode "$mode"; then
+        printf 'BLOCKED stage=copy-isolation reason=invalid-mode:%s\n' "$mode"
+        exit 2
+    fi
+done
+requires_consumer=0
+for mode in "${modes[@]}"; do
+    if needs_consumer "$mode"; then
+        requires_consumer=1
+        break
+    fi
+done
+if [[ "$requires_consumer" -eq 1 ]] &&
+   [[ ! -x "$consumer_bin" ]]; then
+    printf 'BLOCKED stage=copy-isolation reason=missing-consumer:%s\n' "$consumer_bin"
+    exit 2
+fi
 mode_count=${#modes[@]}
+declare -A mode_status=()
 for mode in "${modes[@]}"; do
     mode_dir="$out/$mode"
     mkdir -p "$mode_dir"
@@ -79,6 +105,7 @@ for mode in "${modes[@]}"; do
     }
     trap cleanup_mode EXIT INT TERM
     rm -f "$socket_path"
+    : >"$consumer_log"
     : >"$client_log"
 
     if needs_consumer "$mode"; then
@@ -93,6 +120,7 @@ for mode in "${modes[@]}"; do
         done
         if [[ ! -S "$socket_path" ]]; then
             printf 'FAIL mode=%s stage=consumer-listener\n' "$mode" | tee "$runner_log"
+            mode_status["$mode"]='FAIL'
             status=1
             cleanup_mode
             trap - EXIT INT TERM
@@ -155,23 +183,40 @@ for mode in "${modes[@]}"; do
     cat "$runner_log"
     cat "$mutter_log" 2>/dev/null || true
     cat "$consumer_log" 2>/dev/null || true
-    if grep -Eq "ASB_D3D12 copy_probe mode=${mode} status=pass .*signal_hr=0x00000000 completion=pass removed_reason=0x00000000" \
-        "$runner_log" "$mutter_log" "$consumer_log" 2>/dev/null; then
+    if grep -Eq "ASB_D3D12 postflush_probe mode=${mode} mesa_flush=pass" \
+           "$runner_log" "$mutter_log" "$consumer_log" 2>/dev/null &&
+       grep -Eq "ASB_D3D12 postflush_probe mode=${mode} capture_submit=pass" \
+           "$runner_log" "$mutter_log" "$consumer_log" 2>/dev/null &&
+       grep -Eq "ASB_D3D12 postflush_probe mode=${mode} capture_completion=pass .*removed_reason=0x00000000" \
+           "$runner_log" "$mutter_log" "$consumer_log" 2>/dev/null; then
         if needs_consumer "$mode" &&
+           ! grep -Eq "ASB_D3D12 postflush_probe mode=${mode} .*consumer_ready=pass" \
+               "$runner_log" "$mutter_log" "$consumer_log" 2>/dev/null; then
+            printf 'FAIL mode=%s stage=consumer-ready\n' "$mode"
+            mode_status["$mode"]='FAIL'
+            status=1
+        elif needs_consumer "$mode" &&
            ! grep -Eq 'stage=cross-process-open-shared-resource .*slots=3' "$consumer_log"; then
             printf 'FAIL mode=%s stage=consumer-open-shared-resource\n' "$mode"
+            mode_status["$mode"]='FAIL'
             status=1
         else
             printf 'PASS mode=%s one_frame=1\n' "$mode"
+            mode_status["$mode"]='PASS'
         fi
     else
         printf 'FAIL mode=%s stage=device-removed-reason mutter_exit=%d\n' \
             "$mode" "$mutter_status"
         status=1
+        mode_status["$mode"]='FAIL'
     fi
 
     cleanup_mode
     trap - EXIT INT TERM
+done
+
+for mode in "${modes[@]}"; do
+    printf '%s %s\n' "$mode" "${mode_status[$mode]:-FAIL}"
 done
 
 if [[ "$status" -eq 0 ]]; then
