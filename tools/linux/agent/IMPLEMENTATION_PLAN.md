@@ -823,3 +823,24 @@ without test probes or test clients:
 
 At that point the probe architecture described in
 [README.md](./README.md) has become the production display path.
+
+## Guest Runtime Update Boundary
+
+The normal signed Guest Runtime Bundle includes the agent/display daemons,
+D3D12 helper, GNOME/systemd integration, patched Mesa/Mutter artifacts, and
+the `asb_drm` mode configuration. It intentionally excludes `dxgkrnl.ko`,
+`asb_drm.ko`, the guest kernel, and arbitrary OS packages.
+
+`appsandbox-guest-updater` is installed outside the release tree. It verifies
+the detached Ed25519 signature, schema/protocol and Ubuntu tuple, every file
+hash/size/mode, and archive safety before activating
+`/opt/appsandbox/guest/releases/<version>-<txid>`. Mesa is separately staged
+under `/opt/wsl-mesa/releases` and switched atomically. The host state machine
+is `src/backend_win/vm_guest_update.c`; `vm_agent.c` carries only metadata and
+fixed verbs.
+
+For reboot-required updates, state is persisted before reboot and the local
+watchdog performs post-boot health checks. Rollback is guest-authoritative and
+does not depend on the new agent or host being reachable. Health is lightweight
+and machine-readable; the historical 3600-frame test remains a validation
+test, not an every-update gate.

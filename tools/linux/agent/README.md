@@ -38,6 +38,44 @@ D3D12 Video Encode
 valid 3840x2160 stream
 ```
 
+## Secure Guest Runtime Update
+
+The agent is not self-updating. New VMs install the independent
+`appsandbox-guest-updater` and its transport/watchdog units. The updater owns
+the signed bundle, staging, atomic activation, reboot recovery, and local
+rollback; `appsandbox-agent` exposes only bounded fixed update commands.
+
+Bundle layout:
+
+```text
+manifest.json
+manifest.sig
+payload/bin/...
+payload/libexec/...
+payload/systemd/...
+payload/gnome/...
+payload/graphics/wsl-mesa.tar.zst
+payload/config/asb_drm.conf
+```
+
+Schema 1 manifests contain `version`, `commit`, `arch`, `os`, protocol range,
+minimum updater, `graphics_version`, `reboot_required`, and one
+`path/sha256/size/mode/component` record per payload file. Ed25519 verification,
+path/type checks, hash validation, and size limits happen in the guest. The
+line-oriented control channel never carries bundle bytes.
+
+`current` and `previous` select versioned runtime directories. Mesa uses the
+equivalent `/opt/wsl-mesa/releases` layout. The watchdog checks agent/display
+health and can restore both pointers if the target agent or display service
+fails, even when the host cannot reconnect. The validated 4K60 path remains
+Mutter final target -> GPU-only CopyResource -> 3-slot shared D3D12 ring ->
+independent consumer -> GPU-only RGBA8/NV12 -> D3D12 HEVC. `dxgkrnl.ko` and
+`asb_drm.ko` are intentionally outside normal Guest Runtime updates.
+
+The checked-in Mesa tarball is explicitly marked `production-4k60: false` in
+its `BUILDINFO`; it is a legacy provisioning artifact and must be rebuilt from
+the production patchset before a signed 4K60 bundle is shipped.
+
 The final real-Mutter run validated:
 
 ```text

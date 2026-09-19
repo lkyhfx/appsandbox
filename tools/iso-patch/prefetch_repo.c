@@ -324,6 +324,26 @@ int do_prefetch_repo(const wchar_t *branch, const wchar_t *out_dir)
         log_msg(L"prefetch-repo: staged asb_drm-src/ (%d files)", c);
     }
 
+    /* updater-src/: independent bootstrap/update authority. Keep this
+       separate from agent-src so the guest can install the updater before
+       the first agent release is activated. */
+    {
+        wchar_t updater_src[MAX_PATH], updater_dst[MAX_PATH], s[MAX_PATH], d[MAX_PATH];
+        const wchar_t *files[] = {
+            L"appsandbox-guest-updater.c", L"Makefile",
+            L"appsandbox-guest-updater.service", L"appsandbox-guest-update-watch.service"
+        };
+        swprintf_s(updater_src, MAX_PATH, L"%s\\tools\\linux\\updater", extracted_root);
+        swprintf_s(updater_dst, MAX_PATH, L"%s\\updater-src", out_dir);
+        u_mkdir_p(updater_dst);
+        for (int i = 0; i < (int)(sizeof(files) / sizeof(files[0])); i++) {
+            swprintf_s(s, MAX_PATH, L"%s\\%s", updater_src, files[i]);
+            swprintf_s(d, MAX_PATH, L"%s\\%s", updater_dst, files[i]);
+            if (u_cp_file(s, d) != 0) return -1;
+        }
+        log_msg(L"prefetch-repo: staged updater-src/");
+    }
+
     /* dxgkrnl-src/: contents of tools/linux/dxgkrnl/src/ */
     {
         wchar_t s[MAX_PATH], d[MAX_PATH];
@@ -350,6 +370,16 @@ int do_prefetch_repo(const wchar_t *branch, const wchar_t *out_dir)
                 L"%s\\tools\\linux\\agent\\systemd\\%s", extracted_root, units[i]);
             swprintf_s(d, MAX_PATH, L"%s\\%s", systemd_dst, units[i]);
             u_cp_file(s, d);
+        }
+        {
+            const wchar_t *updater_units[] = {
+                L"appsandbox-guest-updater.service", L"appsandbox-guest-update-watch.service"
+            };
+            for (int i = 0; i < (int)(sizeof(updater_units) / sizeof(updater_units[0])); i++) {
+                swprintf_s(s, MAX_PATH, L"%s\\tools\\linux\\updater\\%s", extracted_root, updater_units[i]);
+                swprintf_s(d, MAX_PATH, L"%s\\%s", systemd_dst, updater_units[i]);
+                u_cp_file(s, d);
+            }
         }
         /* asb-evict-simpledrm: rename from systemd-asb-evict-simpledrm.service */
         swprintf_s(s, MAX_PATH,

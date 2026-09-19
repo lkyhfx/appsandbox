@@ -33,12 +33,12 @@ KVER  := $(shell uname -r)
 ARCH  := $(shell uname -m)
 DISTDIR := $(CURDIR)/dist
 
-.PHONY: all compile agents modules dxgkrnl asb_drm install-agents install-modules \
+.PHONY: all compile agents updater modules dxgkrnl asb_drm install-agents install-modules \
         clean distclean copy-help
 
 all: compile install-agents install-modules copy-help
 
-compile: agents modules
+compile: agents updater modules
 
 # ---- userspace daemons ------------------------------------------------------
 
@@ -54,7 +54,10 @@ agents:
 		echo "  D3D12 helper skipped (DirectX-Headers/runtime unavailable)"; \
 	fi
 
-install-agents: agents
+updater:
+	$(MAKE) -C updater
+
+install-agents: agents updater
 	@install -d $(DISTDIR)
 	@for bin in appsandbox-agent appsandbox-audio appsandbox-clipboard \
 	            appsandbox-display appsandbox-input; do \
@@ -68,6 +71,10 @@ install-agents: agents
 		install -m 0755 agent/appsandbox-display-d3d12 $(DISTDIR)/libexec/; \
 		echo "  installed $(DISTDIR)/libexec/appsandbox-display-d3d12"; \
 	fi
+	install -d $(DISTDIR)/libexec
+	install -m 0755 updater/appsandbox-guest-updater $(DISTDIR)/libexec/
+	install -m 0644 updater/appsandbox-guest-updater.service $(DISTDIR)/
+	install -m 0644 updater/appsandbox-guest-update-watch.service $(DISTDIR)/
 	install -d $(DISTDIR)/gnome/appsandbox-pointer@appsandbox
 	install -m 0644 agent/gnome/appsandbox-pointer@appsandbox/*.json agent/gnome/appsandbox-pointer@appsandbox/*.js $(DISTDIR)/gnome/appsandbox-pointer@appsandbox/
 

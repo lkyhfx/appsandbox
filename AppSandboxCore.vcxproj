@@ -100,7 +100,7 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>virtdisk.lib;setupapi.lib;cfgmgr32.lib;ole32.lib;oleaut32.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>virtdisk.lib;setupapi.lib;cfgmgr32.lib;ole32.lib;oleaut32.lib;ws2_32.lib;bcrypt.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <ImportLibrary>$(OutDir)appsandbox_core.lib</ImportLibrary>
     </Link>
   </ItemDefinitionGroup>
@@ -118,7 +118,7 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>virtdisk.lib;setupapi.lib;cfgmgr32.lib;ole32.lib;oleaut32.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>virtdisk.lib;setupapi.lib;cfgmgr32.lib;ole32.lib;oleaut32.lib;ws2_32.lib;bcrypt.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <ImportLibrary>$(OutDir)appsandbox_core.lib</ImportLibrary>
     </Link>
   </ItemDefinitionGroup>
@@ -140,7 +140,7 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>virtdisk.lib;setupapi.lib;cfgmgr32.lib;ole32.lib;oleaut32.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>virtdisk.lib;setupapi.lib;cfgmgr32.lib;ole32.lib;oleaut32.lib;ws2_32.lib;bcrypt.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <ImportLibrary>$(OutDir)appsandbox_core.lib</ImportLibrary>
     </Link>
   </ItemDefinitionGroup>
@@ -162,7 +162,7 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>virtdisk.lib;setupapi.lib;cfgmgr32.lib;ole32.lib;oleaut32.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>virtdisk.lib;setupapi.lib;cfgmgr32.lib;ole32.lib;oleaut32.lib;ws2_32.lib;bcrypt.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <ImportLibrary>$(OutDir)appsandbox_core.lib</ImportLibrary>
     </Link>
   </ItemDefinitionGroup>
@@ -178,6 +178,7 @@
     <ClCompile Include="src\backend_win\snapshot.c" />
     <ClCompile Include="src\backend_win\vmms_cert.c" />
     <ClCompile Include="src\backend_win\vm_agent.c" />
+    <ClCompile Include="src\backend_win\vm_guest_update.c" />
     <ClCompile Include="src\backend_win\prereq.c" />
     <ClCompile Include="src\backend_win\vm_ssh_proxy.c" />
     <ClCompile Include="src\backend_win\vm_clipboard.c" />
@@ -198,6 +199,7 @@
     <ClInclude Include="src\backend_win\snapshot.h" />
     <ClInclude Include="src\backend_win\vmms_cert.h" />
     <ClInclude Include="src\backend_win\vm_agent.h" />
+    <ClInclude Include="src\backend_win\vm_guest_update.h" />
     <ClInclude Include="src\backend_win\prereq.h" />
     <ClInclude Include="src\backend_win\vm_ssh_proxy.h" />
     <ClInclude Include="src\backend_win\vm_clipboard.h" />

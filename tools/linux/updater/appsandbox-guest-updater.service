@@ -1,0 +1,21 @@
+[Unit]
+Description=AppSandbox guest update transport and rollback watchdog
+After=local-fs.target
+Before=appsandbox-agent.service
+Wants=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/appsandbox-guest-updater --daemon
+ExecStartPost=/bin/true
+Restart=always
+RestartSec=2
+User=root
+NoNewPrivileges=no
+PrivateTmp=true
+ProtectHome=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

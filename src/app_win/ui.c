@@ -14,6 +14,7 @@
 #include "vm_display.h"
 #include "vm_display_idd.h"
 #include "vm_agent.h"
+#include "vm_guest_update.h"
 #include "webview2_bridge.h"
 #include "prereq.h"
 #include <dwmapi.h>
@@ -278,6 +279,15 @@ static void jb_size_gb(JsonBuilder *jb, const wchar_t *key, ULONGLONG bytes)
     jb_string(jb, key, buf);
 }
 
+static void jb_ascii(JsonBuilder *jb, const wchar_t *key, const char *value)
+{
+    wchar_t wide[512];
+    int n = MultiByteToWideChar(CP_UTF8, 0, value ? value : "", -1,
+                                wide, ARRAYSIZE(wide));
+    if (n <= 0) wide[0] = L'\0';
+    jb_string(jb, key, wide);
+}
+
 static void build_vm_json(JsonBuilder *jb, int i)
 {
     wchar_t disk_directory[MAX_PATH];
@@ -312,6 +322,16 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_int(jb, L"sshState", (v->ssh_key_deployed && v->ssh_state == 2) ? 4 : v->ssh_state);
     jb_bool(jb, L"sshDeployKey", v->ssh_deploy_key);
     jb_bool(jb, L"sshKeyDeployed", v->ssh_key_deployed);
+    jb_bool(jb, L"guestUpdaterSupported", v->guest_updater_supported);
+    jb_ascii(jb, L"guestVersion", v->guest_version);
+    jb_ascii(jb, L"graphicsVersion", v->graphics_version);
+    jb_ascii(jb, L"guestCaps", v->guest_caps);
+    jb_int(jb, L"updateState", v->update_state);
+    jb_int(jb, L"updateProgress", v->update_progress);
+    jb_bool(jb, L"updateActive", v->update_active);
+    jb_bool(jb, L"updateRebootRequired", v->update_reboot_required);
+    jb_ascii(jb, L"updateTxid", v->update_txid);
+    jb_ascii(jb, L"updateError", v->update_error);
 
     /* Snapshot tree */
     {
@@ -1114,6 +1134,35 @@ static void on_webview2_message(const wchar_t *json)
         }
     } else if (wcscmp(action, L"connectIddVm") == 0) {
         int idx; if (json_get_int(json, L"vmIndex", &idx)) do_connect_vm(idx);
+    } else if (wcscmp(action, L"updateGuest") == 0) {
+        int idx;
+        if (json_get_int(json, L"vmIndex", &idx) && idx >= 0 && idx < asb_vm_count()) {
+            VmInstance *inst = asb_vm_instance(asb_vm_get(idx));
+            OPENFILENAMEW ofn;
+            wchar_t bundle[MAX_PATH] = {0};
+            if (!inst || _wcsicmp(inst->os_type, L"Linux") != 0 || !inst->guest_updater_supported ||
+                !inst->agent_online || inst->update_active) {
+                ui_show_alert(L"This Linux guest is offline, busy, or does not have the Guest Updater installed.");
+                return;
+            }
+            ZeroMemory(&ofn, sizeof(ofn));
+            ofn.lStructSize = sizeof(ofn);
+            ofn.hwndOwner = g_hwnd_main;
+            ofn.lpstrFilter = L"AppSandbox Guest Runtime (*.tar.zst)\0*.tar.zst\0All Files\0*.*\0";
+            ofn.lpstrFile = bundle;
+            ofn.nMaxFile = ARRAYSIZE(bundle);
+            ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_READONLY;
+            ofn.lpstrTitle = L"Select signed AppSandbox Guest Runtime Bundle";
+            if (GetOpenFileNameW(&ofn)) {
+                if (!vm_guest_update_start(inst, bundle))
+                    ui_show_alert(L"The guest update could not be started. Check the agent connection and bundle.");
+                send_vm_list();
+            }
+        }
+    } else if (wcscmp(action, L"cancelGuestUpdate") == 0) {
+        int idx;
+        if (json_get_int(json, L"vmIndex", &idx) && idx >= 0 && idx < asb_vm_count())
+            vm_guest_update_cancel(asb_vm_instance(asb_vm_get(idx)));
     } else if (wcscmp(action, L"sshConnect") == 0) {
         int idx;
         if (json_get_int(json, L"vmIndex", &idx) && idx >= 0 && idx < asb_vm_count()) {

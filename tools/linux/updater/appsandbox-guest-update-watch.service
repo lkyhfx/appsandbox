@@ -1,0 +1,17 @@
+[Unit]
+Description=AppSandbox guest update health watchdog
+After=local-fs.target appsandbox-guest-updater.service
+Wants=appsandbox-guest-updater.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/appsandbox-guest-updater --watch
+Restart=always
+RestartSec=2
+User=root
+ProtectHome=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

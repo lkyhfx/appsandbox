@@ -73,3 +73,20 @@ binaries are tied to glibc and libstdc++ ABIs, not kernel versions
 Run `build/build-mesa.sh` on a VM with the target codename installed.
 Takes ~30 min on a 6-core machine. The script handles deps, source
 fetch, meson configure, ninja build, and install.
+
+## Signed graphics updates
+
+Guest updates carry the graphics artifact inside the signed bundle. The
+updater verifies the bundle signature and every extracted file before placing
+the artifact under `/opt/wsl-mesa/releases/<graphics-version>-<transaction>`;
+`/opt/wsl-mesa/current` is then switched atomically. `/opt/wsl-mesa/previous`
+is retained for health-check rollback. The systemd-user environment generator
+and `appsandbox-gpu` intentionally resolve `current`, so applications never
+need to know the active release directory.
+
+The checked-in prebuilt tarball is a provisioning artifact, not proof of the
+new 4K60 path: its `BUILDINFO` date/source must be refreshed by a reproducible
+Mesa build before shipping a production bundle. The bundle's graphics version,
+source commit, LLVM/Mesa build inputs, and artifact digest must be recorded in
+the signed manifest. Kernel modules and the host's proprietary graphics stack
+are excluded from this userspace artifact.

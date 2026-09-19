@@ -7,3 +7,8 @@ llvm: 21
 gallium-drivers: llvmpipe,d3d12
 vulkan-drivers: swrast,microsoft-experimental
 icd-name: dzn_icd.x86_64.json
+mesa-source-commit: unavailable-legacy-prebuild
+appsandbox-graphics-version: legacy-probe-prebuilt-2026-05
+appsandbox-patchset-version: none-legacy-artifact
+artifact-sha256: 711dc2d8b137a67a39321a76e70efa5239b80679c8b760db4f8506b26e58671b
+production-4k60: false

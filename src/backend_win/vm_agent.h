@@ -41,6 +41,14 @@ ASB_API void vm_agent_set_hwnd(HWND hwnd);
 ASB_API BOOL vm_agent_send(VmInstance *instance, const char *command,
                            char *response, int response_max, DWORD timeout_ms);
 
+/* Same bounded command path, but returns any non-empty tagged response rather
+   than requiring the literal response "ok". Used by the fixed update verbs. */
+ASB_API BOOL vm_agent_request(VmInstance *instance, const char *command,
+                              char *response, int response_max, DWORD timeout_ms);
+
+/* Post an agent/update status notification to the registered UI window. */
+void vm_agent_notify_status(VmInstance *instance);
+
 BOOL vm_agent_shutdown(VmInstance *instance);
 BOOL vm_agent_restart(VmInstance *instance);
 BOOL vm_agent_ping(VmInstance *instance);

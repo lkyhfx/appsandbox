@@ -17,7 +17,9 @@
 # unchanged. Same VM image, same configuration, automatic per-boot
 # behavior.
 
-WSL_MESA=/opt/wsl-mesa
+# The updater atomically switches this symlink between signed, versioned
+# graphics releases.  The initial image creates it as /opt/wsl-mesa/current -> .
+WSL_MESA=/opt/wsl-mesa/current
 WSL_MESA_LIB="$WSL_MESA/lib/x86_64-linux-gnu"
 WSL_LIB=/usr/lib/wsl/lib
 

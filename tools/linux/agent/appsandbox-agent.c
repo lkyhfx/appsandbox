@@ -48,6 +48,8 @@
 #define HEARTBEAT_INTERVAL_SEC  5
 #define LINE_BUF_MAX            4096
 #define REPLY_MAX               256
+#define GUEST_UPDATER_PATH      "/usr/local/libexec/appsandbox-guest-updater"
+#define UPDATE_TXID_MAX         39
 
 /* ---- Global state for the currently-active client connection ---- */
 
@@ -100,6 +102,7 @@ static int send_line(int fd, const char *line)
 static int recv_line(int fd, char *buf, int max)
 {
     int pos = 0;
+    int overflow = 0;
     while (pos < max - 1) {
         char c;
         ssize_t n = read(fd, &c, 1);
@@ -112,8 +115,13 @@ static int recv_line(int fd, char *buf, int max)
         if (c == '\n') break;
         if (c != '\r') buf[pos++] = c;
     }
+    if (pos == max - 1) {
+        char c;
+        overflow = 1;
+        while (read(fd, &c, 1) == 1 && c != '\n') { }
+    }
     buf[pos] = '\0';
-    return pos;
+    return overflow ? -2 : pos;
 }
 
 /* ---- Subprocess helpers ---- */
@@ -444,6 +452,122 @@ static void send_reply(int fd, const char *tag, const char *msg)
     } else {
         send_line(fd, msg);
     }
+}
+
+/* ---- Fixed guest-update verbs ----------------------------------------- */
+
+static int update_token(const char *s, size_t min_len, size_t max_len, int hex_only)
+{
+    size_t i, n;
+    if (!s) return 0;
+    n = strlen(s);
+    if (n < min_len || n > max_len) return 0;
+    for (i = 0; i < n; i++) {
+        int ok = (s[i] >= 'a' && s[i] <= 'z') || (s[i] >= 'A' && s[i] <= 'Z') ||
+                 (s[i] >= '0' && s[i] <= '9') || s[i] == '-' || s[i] == '.';
+        if (hex_only) ok = (s[i] >= '0' && s[i] <= '9') ||
+                           (s[i] >= 'a' && s[i] <= 'f') || (s[i] >= 'A' && s[i] <= 'F');
+        if (!ok) return 0;
+    }
+    return 1;
+}
+
+/* Execute only the installed updater with a fixed verb and already-validated
+ * argv. The host cannot cause a shell command to run through this path. */
+static int updater_exec(char *const argv[], char *output, size_t output_cap)
+{
+    int p[2], status;
+    pid_t pid;
+    size_t used = 0;
+    if (!argv || !argv[0] || pipe(p) < 0) return -1;
+    pid = fork();
+    if (pid < 0) { close(p[0]); close(p[1]); return -1; }
+    if (pid == 0) {
+        dup2(p[1], STDOUT_FILENO);
+        close(p[0]); close(p[1]);
+        execv(GUEST_UPDATER_PATH, argv);
+        _exit(127);
+    }
+    close(p[1]);
+    if (output_cap) output[0] = '\0';
+    while (output_cap > 1 && used + 1 < output_cap) {
+        ssize_t n = read(p[0], output + used, output_cap - used - 1);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        used += (size_t)n;
+    }
+    close(p[0]);
+    if (waitpid(pid, &status, 0) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) return -1;
+    while (used && (output[used - 1] == '\n' || output[used - 1] == '\r' || output[used - 1] == ' '))
+        output[--used] = '\0';
+    return used ? 0 : -1;
+}
+
+static void send_guest_update_metadata(int fd)
+{
+    char version[96] = "unknown", graphics[96] = "unknown";
+    FILE *f;
+    if (access(GUEST_UPDATER_PATH, X_OK) != 0) {
+        send_line(fd, "guest_caps:none");
+        return;
+    }
+    f = fopen("/opt/appsandbox/guest/current/RELEASE", "r");
+    if (f) {
+        char line[160];
+        while (fgets(line, sizeof(line), f)) {
+            if (!strncmp(line, "version=", 8)) sscanf(line + 8, "%95[0-9A-Za-z.-]", version);
+            else if (!strncmp(line, "graphics_version=", 17))
+                sscanf(line + 17, "%95[0-9A-Za-z.-]", graphics);
+        }
+        fclose(f);
+    }
+    send_line(fd, "guest_caps:update-v1,graphics-v1,health-v1");
+    {
+        char line[128];
+        snprintf(line, sizeof(line), "guest_version:%s", version);
+        send_line(fd, line);
+        snprintf(line, sizeof(line), "graphics_version:%s", graphics);
+        send_line(fd, line);
+    }
+}
+
+static void handle_guest_update(int fd, const char *tag, const char *cmd)
+{
+    char copy[LINE_BUF_MAX], *save = NULL, *verb, *a, *b, *c;
+    char output[REPLY_MAX];
+    char *argv[6] = { (char *)GUEST_UPDATER_PATH, NULL, NULL, NULL, NULL, NULL };
+    if (strlen(cmd) >= sizeof(copy)) { send_reply(fd, tag, "error:command_too_long"); return; }
+    strcpy(copy, cmd);
+    verb = strtok_r(copy, " \t", &save);
+    a = strtok_r(NULL, " \t", &save);
+    b = strtok_r(NULL, " \t", &save);
+    c = strtok_r(NULL, " \t", &save);
+    if (strtok_r(NULL, " \t", &save) != NULL || !verb) {
+        send_reply(fd, tag, "error:bad_update_command"); return;
+    }
+    if (!strcmp(verb, "update_query") && !a) {
+        send_reply(fd, tag, access(GUEST_UPDATER_PATH, X_OK) == 0 ? "ok" : "error:unsupported");
+        return;
+    }
+    if (!strcmp(verb, "update_begin") && a && b && c &&
+        update_token(a, 8, UPDATE_TXID_MAX, 0) && update_token(b, 1, 12, 0) &&
+        update_token(c, 64, 64, 1)) {
+        argv[1] = "--begin"; argv[2] = a; argv[3] = b; argv[4] = c;
+    } else if ((!strcmp(verb, "update_apply") || !strcmp(verb, "update_status") ||
+                !strcmp(verb, "update_cancel")) && a && update_token(a, 8, UPDATE_TXID_MAX, 0)) {
+        argv[1] = !strcmp(verb, "update_apply") ? "--apply" :
+                  !strcmp(verb, "update_status") ? "--status" : "--cancel";
+        argv[2] = a;
+    } else if (!strcmp(verb, "update_rollback") && !a) {
+        argv[1] = "--rollback";
+    } else {
+        send_reply(fd, tag, "error:bad_update_command"); return;
+    }
+    if (updater_exec(argv, output, sizeof(output)) < 0) {
+        send_reply(fd, tag, "error:update_failed");
+        return;
+    }
+    send_reply(fd, tag, output);
 }
 
 /* ---- Heartbeat thread ---- */
@@ -1062,6 +1186,8 @@ static void handle_client(int fd)
         agent_log("hello: send failed");
         goto out;
     }
+    /* Keep the first line exactly "hello" for old hosts. */
+    send_guest_update_metadata(fd);
 
     if (pthread_create(&hb, NULL, heartbeat_thread, NULL) != 0) {
         agent_log("heartbeat: pthread_create failed: %s", strerror(errno));
@@ -1076,6 +1202,10 @@ static void handle_client(int fd)
         char *colon;
 
         n = recv_line(fd, line, sizeof(line));
+        if (n == -2) {
+            send_line(fd, "error:line_too_long");
+            break;
+        }
         if (n <= 0) break;
 
         /* Strip optional "<digits>:" sequence tag */
@@ -1130,6 +1260,9 @@ static void handle_client(int fd)
             int n_shares = atoi(cmd + 19);
             handle_gpu_query_response(fd, n_shares);
             /* No reply — host sends this fire-and-forget */
+        }
+        else if (!strncmp(cmd, "update_", 7)) {
+            handle_guest_update(fd, tag, cmd);
         }
         else if (strcmp(cmd, "gpu_none") == 0) {
             /* Host reports no GPU-PV assignment — nothing to do */

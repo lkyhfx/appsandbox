@@ -157,3 +157,29 @@ kernel from your build machine, `setup.sh` automatically falls back to the
 DKMS build path — it copies the source from `extras/dxgkrnl/src/` to
 `/usr/src/dxgkrnl-<ver>/` and runs `dkms install`. DKMS handles future
 kernel upgrades automatically. The committed `.ko` is just a fast path.
+
+## Secure Guest Runtime Update
+
+Linux VMs receive an independent `/usr/local/libexec/appsandbox-guest-updater`
+bootstrap during first boot. The existing agent connection remains the control
+plane, while bundles transfer over a separate binary Hyper-V/VSOCK stream on
+guest port 9. Only fixed verbs are accepted: `update_query`, `update_begin`,
+`update_apply`, `update_status`, `update_cancel`, and `update_rollback`.
+
+Bundles are `appsandbox-linux-guest-<version>-amd64.tar.zst` archives with
+`manifest.json`, detached Ed25519 `manifest.sig`, and `payload/`. The manifest
+binds every payload path, SHA-256, size, mode, and component, plus protocol,
+Ubuntu tuple, updater minimum, graphics version, and reboot requirement. The
+guest rejects invalid signatures, mismatches, unsupported tuples/protocols,
+downgrades, unsafe paths/files, oversized bundles, and truncated transfers.
+
+Runtime releases use `/opt/appsandbox/guest/releases/<version>-<txid>` with
+atomic `current`/`previous` pointers. Mesa is versioned under
+`/opt/wsl-mesa/releases` and selected by `/opt/wsl-mesa/current`. A local
+watchdog confirms service health after activation/reboot and rolls back without
+requiring the new agent or host connection. Normal updates include runtime,
+GNOME/systemd, Mesa/Mutter integration, and `asb_drm` configuration; they do
+not update `dxgkrnl.ko`, `asb_drm.ko`, the guest kernel, or OS packages.
+
+The first agent handshake line remains bare `hello`; optional version and
+capability metadata follows it for newer hosts.

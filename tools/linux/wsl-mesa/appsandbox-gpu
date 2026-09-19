@@ -19,7 +19,9 @@
 
 set -e
 
-WSL_MESA=/opt/wsl-mesa
+# The updater atomically switches this symlink between signed, versioned
+# graphics releases.  The initial image creates it as /opt/wsl-mesa/current -> .
+WSL_MESA=/opt/wsl-mesa/current
 WSL_MESA_LIB="$WSL_MESA/lib/x86_64-linux-gnu"
 WSL_MESA_VK_ICD="$WSL_MESA/share/vulkan/icd.d/dzn_icd.x86_64.json"
 WSL_LIB=/usr/lib/wsl/lib

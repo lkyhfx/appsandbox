@@ -27,6 +27,18 @@ typedef void *HCS_OPERATION;
 #define NET_EXTERNAL 2
 #define NET_INTERNAL 3
 
+/* Guest runtime update state exposed to the host UI. The updater owns the
+   durable state; these fields are a reconnect-safe host-side mirror only. */
+#define ASB_UPDATE_IDLE       0
+#define ASB_UPDATE_VERIFYING  1
+#define ASB_UPDATE_TRANSFERRING 2
+#define ASB_UPDATE_APPLYING   3
+#define ASB_UPDATE_REBOOTING  4
+#define ASB_UPDATE_HEALTH     5
+#define ASB_UPDATE_COMMITTED  6
+#define ASB_UPDATE_ROLLED_BACK 7
+#define ASB_UPDATE_FAILED     8
+
 /* Configuration for creating a new VM */
 typedef struct {
     wchar_t name[256];
@@ -111,6 +123,20 @@ typedef struct {
     BOOL        ssh_deploy_key;          /* TRUE = deploy the AppSandbox public key to the guest */
     volatile BOOL ssh_key_deployed;      /* TRUE once the guest agent has written authorized_keys */
     wchar_t     ssh_pubkey[512];         /* AppSandbox public-key line to deploy (ed25519) */
+
+    /* Optional metadata sent after the legacy bare "hello" line. */
+    char        guest_version[96];
+    char        graphics_version[96];
+    char        guest_caps[256];
+    volatile BOOL guest_updater_supported;
+
+    /* Host update state; durable transaction state remains in the guest. */
+    volatile int update_state;
+    volatile int update_progress;
+    volatile BOOL update_reboot_required;
+    volatile BOOL update_active;
+    char        update_txid[40];
+    char        update_error[160];
 } VmInstance;
 
 /* Initialize HCS - loads computecore.dll dynamically.

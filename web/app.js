@@ -928,7 +928,25 @@ function updateStatusCell(td, vm) {
     var label = '';
     var className = '';
 
-    if (vm.buildingVhdx) {
+    if (vm.updateActive || (vm.updateState >= 1 && vm.updateState <= 5)) {
+        needsSpinner = vm.updateState >= 1 && vm.updateState <= 5;
+        var pct = typeof vm.updateProgress === 'number' ? vm.updateProgress : 0;
+        var phase = vm.updateState === 1 ? 'Verifying Guest Update' :
+            vm.updateState === 2 ? 'Transferring Guest Update' :
+            vm.updateState === 3 ? 'Applying Guest Update' :
+            vm.updateState === 4 ? 'Rebooting for Guest Update' : 'Checking Guest Update';
+        label = phase + (needsSpinner ? ' (' + pct + '%) ' : '');
+        className = 'status-building';
+    } else if (vm.updateState === 6) {
+        className = 'status-running';
+        label = 'Guest Updated';
+    } else if (vm.updateState === 7) {
+        className = 'status-shutting-down';
+        label = 'Guest Update Rolled Back';
+    } else if (vm.updateState === 8) {
+        className = 'status-shutting-down';
+        label = 'Guest Update Failed';
+    } else if (vm.buildingVhdx) {
         needsSpinner = true;
         label = vm.vhdxStaging ? 'Staging files... ' : 'Building Disk (' + (vm.vhdxProgress || 0) + '%) ';
         className = 'status-building';
@@ -1005,6 +1023,19 @@ function buildRowCells(vm, i, statusTd) {
                 : 'In-VM agent is not connected'));
 
     var bld = vm.buildingVhdx;
+    var updateSupported = vm.osType === 'Linux' && vm.guestUpdaterSupported && vm.agentOnline;
+    var updateActive = !!vm.updateActive;
+    var updateTitle = !updateSupported
+        ? (vm.osType !== 'Linux' ? 'Guest updates are available for Linux VMs only' :
+            !vm.agentOnline ? 'Start the VM and wait for the guest agent' : 'Guest Updater is not installed')
+        : updateActive ? 'Cancel the active guest update' :
+            'Update Guest... Current: ' + (vm.guestVersion || 'unknown') +
+            ' | Graphics: ' + (vm.graphicsVersion || 'unknown');
+    var updateCell = makeIconCell('update', updateActive ? '\u2715' : '\u21BB',
+        updateSupported && !bld,
+        (function(idx, active) { return function() {
+            sendCmd(active ? 'cancelGuestUpdate' : 'updateGuest', {vmIndex: idx});
+        }; })(i, updateActive), '', updateTitle);
 
     var sshActive = vm.sshEnabled && (vm.sshState === 2 || vm.sshState === 4) && vm.running && !bld;
     var sshCell = makeIconCell('ssh', '>_', sshActive, (function(idx) { return function() { sendCmd('sshConnect', {vmIndex: idx}); }; })(i), !vm.sshEnabled ? 'hidden' : '');
@@ -1038,6 +1069,7 @@ function buildRowCells(vm, i, statusTd) {
         makeIconCell('start', '\u25B6\uFE0F', !vm.running && !bld, function() { onStartVm(i); }, '', 'Start the VM (boots from the selected snapshot/branch)'),
         makeIconCell('connect-idd', '\uD83D\uDCFA', vm.running && !bld, function() { sendCmd('connectIddVm', {vmIndex: i}); }, '', 'Open the VM display window (IDD virtual monitor)'),
         sshCell,
+        updateCell,
         makeIconCell('shutdown', '\u23FB', vm.running && !bld, function() { sendCmd('shutdownVm', {vmIndex: i}); }, '', 'Request a graceful shutdown from the guest OS'),
         makeIconCell('stop', '\u2715\uFE0F', vm.running && !bld, function() { onStopVm(i); }, '', 'Force power off the VM immediately (may lose unsaved guest data)'),
         makeIconCell('delete', '\uD83D\uDDD1\uFE0F', !bld, function() { onDeleteVm(i); }, vm.running ? 'running' : '', 'Delete this VM and its virtual disks'),
@@ -1057,7 +1089,7 @@ function renderVmTable() {
         tbody.innerHTML = '';
         var tr = document.createElement('tr');
         var td = document.createElement('td');
-        td.colSpan = hostBridge.isMac ? 16 : 17;
+        td.colSpan = hostBridge.isMac ? 17 : 18;
         td.className = 'empty-state';
         var btn = document.createElement('button');
         btn.className = 'primary empty-state-btn';
@@ -1107,6 +1139,8 @@ function renderVmTable() {
             vm.running, vm.buildingVhdx, vm.shuttingDown, vm.agentOnline,
             vm.installComplete, vm.isTemplate,
             vm.sshEnabled, vm.sshState, vm.sshPort,
+            vm.guestUpdaterSupported, vm.guestVersion, vm.graphicsVersion,
+            vm.updateState, vm.updateProgress, vm.updateActive, vm.updateRebootRequired, vm.updateError,
             vm.osType, vm.ramMb, vm.hddGb, vm.cpuCores,
             vm.gpuMode, vm.gpuId, vm.gpuName, vm.networkMode,
             selectedSnap.get(vm.name) || 'current',

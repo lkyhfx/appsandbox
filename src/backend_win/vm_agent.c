@@ -51,6 +51,8 @@ typedef struct AgentConn {
     /* Command synchronization */
     volatile BOOL  cmd_pending;
     HANDLE         cmd_done;     /* Event: signaled when response is ready */
+    CRITICAL_SECTION cmd_lock;  /* serializes host callers sharing the slot */
+    BOOL           cmd_lock_ready;
     char           cmd[64];
     char           rsp[256];
     unsigned int   cmd_seq;      /* Monotonic sequence ID for tagged commands */
@@ -80,6 +82,8 @@ static AgentConn *alloc_conn(VmInstance *vm)
             g_conns[i].vm_id = vm->unique_id;
             g_conns[i].sock = INVALID_SOCKET;
             g_conns[i].cmd_done = CreateEventW(NULL, FALSE, FALSE, NULL);
+            InitializeCriticalSection(&g_conns[i].cmd_lock);
+            g_conns[i].cmd_lock_ready = TRUE;
             return &g_conns[i];
         }
     }
@@ -90,6 +94,7 @@ static void free_conn(AgentConn *conn)
 {
     if (conn->cmd_done) CloseHandle(conn->cmd_done);
     if (conn->thread) CloseHandle(conn->thread);
+    if (conn->cmd_lock_ready) DeleteCriticalSection(&conn->cmd_lock);
     memset(conn, 0, sizeof(AgentConn));
     conn->sock = INVALID_SOCKET;
 }
@@ -204,6 +209,11 @@ static void notify_agent_status(VmInstance *vm)
         PostMessageW(g_agent_hwnd, WM_VM_AGENT_STATUS, 0, (LPARAM)vm);
 }
 
+void vm_agent_notify_status(VmInstance *vm)
+{
+    notify_agent_status(vm);
+}
+
 /* Fire-and-forget: ask the guest agent to write the AppSandbox public key into
    authorized_keys. The guest replies async (untagged) "ssh_key_deployed" or
    "ssh_key_failed" (handled in process_async_message). Sent once SSH is ready;
@@ -228,6 +238,26 @@ static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
 {
     if (strcmp(buf, "heartbeat") == 0) {
         vm->last_heartbeat = GetTickCount64();
+    } else if (strncmp(buf, "guest_version:", 14) == 0) {
+        strncpy_s(vm->guest_version, sizeof(vm->guest_version), buf + 14, _TRUNCATE);
+        vm->guest_updater_supported = vm->guest_caps[0] != '\0' &&
+                                      strstr(vm->guest_caps, "update-v1") != NULL;
+        notify_agent_status(vm);
+    } else if (strncmp(buf, "graphics_version:", 17) == 0) {
+        strncpy_s(vm->graphics_version, sizeof(vm->graphics_version), buf + 17, _TRUNCATE);
+        notify_agent_status(vm);
+    } else if (strncmp(buf, "guest_caps:", 11) == 0) {
+        strncpy_s(vm->guest_caps, sizeof(vm->guest_caps), buf + 11, _TRUNCATE);
+        vm->guest_updater_supported = strstr(vm->guest_caps, "update-v1") != NULL;
+        notify_agent_status(vm);
+    } else if (strncmp(buf, "update_progress:", 16) == 0) {
+        int pct = atoi(buf + 16);
+        if (pct >= 0 && pct <= 100) vm->update_progress = pct;
+        notify_agent_status(vm);
+    } else if (strncmp(buf, "update_error:", 13) == 0) {
+        strncpy_s(vm->update_error, sizeof(vm->update_error), buf + 13, _TRUNCATE);
+        vm->update_state = ASB_UPDATE_FAILED;
+        notify_agent_status(vm);
     } else if (strcmp(buf, "os_shutdown") == 0) {
         ui_log(L"Guest OS shutting down for \"%s\".", vm->name);
         vm->agent_online = FALSE;
@@ -605,21 +635,25 @@ void vm_agent_stop(VmInstance *instance)
     notify_agent_status(instance);
 }
 
-BOOL vm_agent_send(VmInstance *instance, const char *command,
-                   char *response, int response_max, DWORD timeout_ms)
+BOOL vm_agent_request(VmInstance *instance, const char *command,
+                      char *response, int response_max, DWORD timeout_ms)
 {
     AgentConn *conn = find_conn(instance);
-    BOOL ok;
 
     if (!conn || !instance->agent_online) {
         ui_log(L"Agent: not connected to \"%s\"", instance->name);
         return FALSE;
     }
+    if (!command || strlen(command) == 0 || strlen(command) >= sizeof(conn->cmd)) {
+        ui_log(L"Agent: rejected oversized or empty command for \"%s\"", instance->name);
+        return FALSE;
+    }
 
     /* Hand the command to the connection thread (it owns the socket and is the
-       sole sender). NOTE: this is a single slot per VM (conn->cmd), not a queue,
-       so concurrent callers for the SAME VM would clobber -- safe here because
-       per VM only one caller exists (shutdown). */
+       sole sender). The connection has one command slot rather than a queue;
+       serialize host callers so the update worker and UI cannot overwrite one
+       another's command or response. */
+    if (conn->cmd_lock_ready) EnterCriticalSection(&conn->cmd_lock);
     ResetEvent(conn->cmd_done);
     strcpy_s(conn->cmd, sizeof(conn->cmd), command);
     conn->cmd_pending = TRUE;
@@ -632,7 +666,10 @@ BOOL vm_agent_send(VmInstance *instance, const char *command,
        loop / the GUI thread. Delivery is confirmed by the HCS SystemExited
        monitor, not by this reply. */
     if (timeout_ms == 0)
+    {
+        if (conn->cmd_lock_ready) LeaveCriticalSection(&conn->cmd_lock);
         return TRUE;
+    }
 
     /* Otherwise wait up to timeout_ms for the agent's tagged reply (idd_connect
        expects a prompt "ok"). A real disconnect unblocks us: agent_thread_proc
@@ -640,15 +677,28 @@ BOOL vm_agent_send(VmInstance *instance, const char *command,
     if (WaitForSingleObject(conn->cmd_done, timeout_ms) != WAIT_OBJECT_0) {
         ui_log(L"Agent: command \"%S\" timed out", command);
         conn->cmd_pending = FALSE;
+        if (conn->cmd_lock_ready) LeaveCriticalSection(&conn->cmd_lock);
         return FALSE;
     }
 
     if (response && response_max > 0)
         strncpy_s(response, response_max, conn->rsp, _TRUNCATE);
 
-    ok = (strcmp(conn->rsp, "ok") == 0);
     ui_log(L"Agent: %S -> %S", command, conn->rsp);
-    return ok;
+    {
+        BOOL ok = conn->rsp[0] != '\0';
+        if (conn->cmd_lock_ready) LeaveCriticalSection(&conn->cmd_lock);
+        return ok;
+    }
+}
+
+BOOL vm_agent_send(VmInstance *instance, const char *command,
+                   char *response, int response_max, DWORD timeout_ms)
+{
+    char rsp[256] = "";
+    BOOL ok = vm_agent_request(instance, command, rsp, sizeof(rsp), timeout_ms);
+    if (response && response_max > 0) strncpy_s(response, response_max, rsp, _TRUNCATE);
+    return ok && strcmp(rsp, "ok") == 0;
 }
 
 BOOL vm_agent_shutdown(VmInstance *instance)
