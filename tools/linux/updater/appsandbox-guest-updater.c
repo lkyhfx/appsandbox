@@ -250,6 +250,33 @@ static int safe_relpath(const char *path)
     return 1;
 }
 
+/* Mesa installs relative library links, including links with one "..".
+ * Resolve the target lexically from the link's parent and keep it inside the
+ * private graphics staging tree.  Never follow a link while extracting. */
+static int safe_graphics_link(const char *link_path, const char *target)
+{
+    const char *p, *start;
+    int depth = 0;
+    if (!safe_relpath(link_path) || !target || !target[0] || target[0] == '/' ||
+        strlen(target) >= PATH_MAX) return 0;
+    for (p = link_path; *p; p++) if (*p == '/') depth++;
+    start = target;
+    for (p = target;; p++) {
+        size_t n;
+        if (*p != '/' && *p != '\0') continue;
+        n = (size_t)(p - start);
+        if (n == 1 && start[0] == '.') {
+            /* A leading "./" is harmless. */
+        } else if (n == 2 && start[0] == '.' && start[1] == '.') {
+            if (depth-- <= 0) return 0;
+        } else if (!safe_component(start, n)) return 0;
+        else depth++;
+        if (*p == '\0') break;
+        start = p + 1;
+    }
+    return 1;
+}
+
 static int join_path(char *out, size_t cap, const char *root, const char *rel)
 {
     if (!safe_relpath(rel)) return -1;
@@ -1209,7 +1236,7 @@ static int graphics_target(char *out, size_t cap)
 
 static int extract_graphics(const char *archive, const char *version, const char *txid)
 {
-    int zfd = -1, status, zeros = 0, fd = -1;
+    int zfd = -1, status, zeros = 0, entries = 0, fd = -1;
     pid_t zpid = 0;
     uint64_t uncompressed_total = 0;
     unsigned char block[512];
@@ -1227,6 +1254,7 @@ static int extract_graphics(const char *archive, const char *version, const char
         { int zero = 1; size_t i; for (i = 0; i < sizeof(block); i++) if (block[i]) { zero = 0; break; }
           if (zero) { if (++zeros == 2) break; continue; } }
         zeros = 0;
+        if (++entries > UPDATE_MAX_FILES) goto fail;
         type = block[156] ? block[156] : '0';
         if (tar_path(block, path, sizeof(path)) < 0 ||
             tar_octal(block + 124, 12, &size) < 0 || tar_octal(block + 100, 8, &mode) < 0 ||
@@ -1246,6 +1274,16 @@ static int extract_graphics(const char *archive, const char *version, const char
         if (type == '5') {
             if (size != 0) goto fail;
             if (mkdir_p(full, 0755) < 0) goto fail;
+            continue;
+        }
+        if (type == '2') {
+            char target[101];
+            size_t target_len = strnlen((const char *)block + 157, 100);
+            if (size != 0 || target_len == 100) goto fail;
+            memcpy(target, block + 157, target_len);
+            target[target_len] = '\0';
+            if (!safe_graphics_link(p, target) || ensure_parent(stage, p) < 0 ||
+                symlink(target, full) < 0 || fsync_parent(full) < 0) goto fail;
             continue;
         }
         if (type != '0' || ensure_parent(stage, p) < 0 ||
@@ -1801,10 +1839,11 @@ static int apply_update(const char *txid)
     char bundle[PATH_MAX], stage[PATH_MAX], stage_payload[PATH_MAX], release[PATH_MAX], release_payload[PATH_MAX];
     char old_target[PATH_MAX], old_graphics[PATH_MAX], os[64], release_file[PATH_MAX], config_file[PATH_MAX];
     char current_version[96] = {0};
-    if (!valid_id(txid) || read_state(&s) < 0 || strcmp(s.txid, txid) ||
-        (strcmp(s.state, "received") && strcmp(s.state, "receiving") &&
-         strcmp(s.state, "apply_requested"))) return -1;
+    if (!valid_id(txid)) return -1;
     lock = update_lock(); if (lock < 0) return -1;
+    if (read_state(&s) < 0 || strcmp(s.txid, txid) ||
+        (strcmp(s.state, "received") && strcmp(s.state, "receiving") &&
+         strcmp(s.state, "apply_requested"))) { close(lock); return -1; }
     snprintf(bundle, sizeof(bundle), "%s/%s.bundle", BUNDLE_ROOT, txid);
     snprintf(stage, sizeof(stage), "%s/%s", STAGING_ROOT, txid);
     files = calloc(UPDATE_MAX_FILES, sizeof(*files));
@@ -2018,14 +2057,19 @@ static int receive_stream(int fd)
     int out = -1, lock = -1, ok = -1;
     char header_sha[65];
     if (read_all(fd, &h, sizeof(h)) < 0 || memcmp(h.magic, "ASBUPD1", 7) ||
-        h.protocol != UPDATE_PROTOCOL || h.header_size != sizeof(h) || !valid_id(h.txid) ||
-        h.bundle_size == 0 || h.bundle_size > UPDATE_MAX_BUNDLE || read_state(&s) < 0 ||
-        strcmp(s.state, "receiving") || strcmp(s.txid, h.txid) || s.bundle_size != h.bundle_size) return -1;
+        h.protocol != UPDATE_PROTOCOL || h.header_size != sizeof(h) ||
+        h.txid[sizeof(h.txid) - 1] != '\0' || !valid_id(h.txid) ||
+        h.bundle_size == 0 || h.bundle_size > UPDATE_MAX_BUNDLE) return -1;
+    lock = update_lock(); if (lock < 0) return -1;
+    if (read_state(&s) < 0 || strcmp(s.state, "receiving") ||
+        strcmp(s.txid, h.txid) || s.bundle_size != h.bundle_size) {
+        close(lock);
+        return -1;
+    }
     hex_encode(h.sha256, sizeof(h.sha256), header_sha);
-    if (strcmp(s.sha256, header_sha) != 0) return -1;
+    if (strcmp(s.sha256, header_sha) != 0) { close(lock); return -1; }
     snprintf(part, sizeof(part), "%s/%s.bundle.part", BUNDLE_ROOT, h.txid);
     snprintf(final, sizeof(final), "%s/%s.bundle", BUNDLE_ROOT, h.txid);
-    lock = update_lock(); if (lock < 0) return -1;
     out = open(part, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (out < 0) goto done;
     {

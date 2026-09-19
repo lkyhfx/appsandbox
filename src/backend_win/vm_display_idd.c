@@ -120,6 +120,14 @@ typedef struct AudioFrameHeader {
 /* Timer for Present cadence when no frames arrive */
 #define IDT_PRESENT     2001
 #define PRESENT_MS      16   /* ~60 fps */
+#define IDT_FULLSCREEN_TOOLBAR 2002
+#define IDM_ENTER_FULLSCREEN 0x1030
+#define TOOLBAR_POLL_MS 100
+#define TOOLBAR_HIDE_MS 700
+#define TOOLBAR_HOTZONE_DIP 4
+#define TOOLBAR_HEIGHT_DIP 44
+#define TOOLBAR_WIDTH_DIP 176
+#define TOOLBAR_EDGE_MARGIN_DIP 8
 
 /* Debug log window */
 #define IDC_LOG_LIST      3001
@@ -189,6 +197,15 @@ struct VmDisplayIdd {
     HINSTANCE    hInstance;
     HWND         main_hwnd;
     HWND         hwnd;
+    BOOL         fullscreen;
+    WINDOWPLACEMENT windowed_placement;
+    LONG_PTR     windowed_style;
+    LONG_PTR     windowed_ex_style;
+    HWND         fullscreen_toolbar;
+    BOOL         fullscreen_toolbar_visible;
+    BOOL         fullscreen_toolbar_pressed;
+    BOOL         suppress_f11_up;
+    ULONGLONG    toolbar_leave_tick;
     volatile BOOL open;
     volatile BOOL stop;
 
@@ -294,6 +311,12 @@ static DWORD WINAPI     idd_recv_thread_proc(LPVOID param);
 static void idd_update_relative_mouse(VmDisplayIdd *d);
 static void idd_resume_absolute_mouse(VmDisplayIdd *d, const InputPacket *reply);
 static void idd_poll_mouse_position(VmDisplayIdd *d);
+static LRESULT CALLBACK idd_fullscreen_toolbar_proc(HWND hwnd, UINT msg,
+                                                     WPARAM wp, LPARAM lp);
+static void idd_register_fullscreen_toolbar_class(HINSTANCE hInst);
+static void idd_enter_fullscreen(VmDisplayIdd *d);
+static void idd_exit_fullscreen(VmDisplayIdd *d);
+static void idd_show_fullscreen_toolbar(VmDisplayIdd *d);
 static void window_to_vm_coords(HWND hwnd, int wx, int wy, UINT vm_w, UINT vm_h,
                                 UINT *vx, UINT *vy);
 
@@ -302,6 +325,7 @@ static void window_to_vm_coords(HWND hwnd, int wx, int wy, UINT vm_w, UINT vm_h,
 static const wchar_t *IDD_DISPLAY_CLASS = L"AppSandboxIddDisplay";
 static const wchar_t *IDD_RENDER_CLASS  = L"AppSandboxIddRender";
 static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
+static const wchar_t *IDD_TOOLBAR_CLASS = L"AppSandboxIddFullscreenToolbar";
 
 /* System menu command IDs — must be < 0xF000 and have low 4 bits clear */
 #define IDM_AUDIO_MUTE     0x1000
@@ -429,6 +453,93 @@ static LRESULT CALLBACK idd_render_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+/* Mouse-only host overlay.  This is intentionally not a standard BUTTON:
+   clicking it must not move keyboard focus away from the IDD window while
+   fullscreen input is being captured for the guest. */
+static LRESULT CALLBACK idd_fullscreen_toolbar_proc(HWND hwnd, UINT msg,
+                                                     WPARAM wp, LPARAM lp)
+{
+    VmDisplayIdd *d = (VmDisplayIdd *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+
+    if (msg == WM_NCCREATE) {
+        CREATESTRUCTW *cs = (CREATESTRUCTW *)lp;
+        d = (VmDisplayIdd *)cs->lpCreateParams;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)d);
+    }
+
+    switch (msg) {
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+
+    case WM_SETCURSOR:
+        SetCursor(LoadCursorW(NULL, IDC_ARROW));
+        return TRUE;
+
+    case WM_MOUSEMOVE:
+        if (d) {
+            d->toolbar_leave_tick = 0;
+            idd_show_fullscreen_toolbar(d);
+        }
+        SetCursor(LoadCursorW(NULL, IDC_ARROW));
+        return 0;
+
+    case WM_LBUTTONDOWN:
+        if (d) {
+            d->fullscreen_toolbar_pressed = TRUE;
+            SetCapture(hwnd);
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
+
+    case WM_LBUTTONUP:
+        if (d) {
+            POINT pt = { (int)(short)LOWORD(lp), (int)(short)HIWORD(lp) };
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            d->fullscreen_toolbar_pressed = FALSE;
+            if (GetCapture() == hwnd) ReleaseCapture();
+            InvalidateRect(hwnd, NULL, FALSE);
+            if (PtInRect(&rc, pt) && d->fullscreen)
+                idd_exit_fullscreen(d);
+        }
+        return 0;
+
+    case WM_CAPTURECHANGED:
+        if (d) {
+            d->fullscreen_toolbar_pressed = FALSE;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT:
+    {
+        PAINTSTRUCT ps;
+        RECT rc;
+        HBRUSH bg, border;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        GetClientRect(hwnd, &rc);
+        bg = CreateSolidBrush(d && d->fullscreen_toolbar_pressed
+                                  ? RGB(64, 64, 68) : RGB(45, 45, 48));
+        border = CreateSolidBrush(RGB(130, 130, 136));
+        FillRect(hdc, &rc, bg);
+        FrameRect(hdc, &rc, border);
+        DeleteObject(bg);
+        DeleteObject(border);
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, RGB(240, 240, 242));
+        DrawTextW(hdc, L"Exit Fullscreen", -1, &rc,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    }
+
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
 static void ensure_idd_class(HINSTANCE hInst)
 {
     WNDCLASSEXW wc;
@@ -469,10 +580,26 @@ static void ensure_idd_class(HINSTANCE hInst)
     wc.lpszClassName = IDD_LOG_CLASS;
     RegisterClassExW(&wc);
 
+    idd_register_fullscreen_toolbar_class(hInst);
     g_idd_class_registered = TRUE;
 }
 
 
+
+/* Mouse-only host overlay used by borderless fullscreen. */
+static void idd_register_fullscreen_toolbar_class(HINSTANCE hInst)
+{
+    WNDCLASSEXW wc;
+    ZeroMemory(&wc, sizeof(wc));
+    wc.cbSize        = sizeof(wc);
+    wc.style         = CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc   = idd_fullscreen_toolbar_proc;
+    wc.hInstance     = hInst;
+    wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
+    wc.hbrBackground = NULL;
+    wc.lpszClassName = IDD_TOOLBAR_CLASS;
+    RegisterClassExW(&wc);
+}
 
 /* ---- Debug log panel ---- */
 
@@ -571,6 +698,48 @@ static void idd_cancel_mouse_sync(VmDisplayIdd *d)
                   d->guest_cursor ? d->guest_cursor : LoadCursorW(NULL, IDC_ARROW));
 }
 
+static UINT idd_dip_to_px(HWND hwnd, int dip)
+{
+    UINT dpi = hwnd ? GetDpiForWindow(hwnd) : 96;
+    UINT px;
+    if (!dpi) dpi = 96;
+    px = (UINT)MulDiv(dip, (int)dpi, 96);
+    return px ? px : 1;
+}
+
+/* While the overlay is visible, keep the whole top strip out of relative
+   capture.  This lets the pointer travel from the render surface into the
+   toolbar even when the guest cursor is hidden. */
+static BOOL idd_point_in_fullscreen_toolbar_region(VmDisplayIdd *d, POINT pt)
+{
+    RECT rc;
+    int top;
+    if (!d->fullscreen || !d->fullscreen_toolbar_visible || !d->hwnd)
+        return FALSE;
+    if (!GetClientRect(d->hwnd, &rc) || !ScreenToClient(d->hwnd, &pt))
+        return FALSE;
+    top = (int)idd_dip_to_px(d->hwnd, TOOLBAR_HEIGHT_DIP + TOOLBAR_EDGE_MARGIN_DIP);
+    return pt.x >= 0 && pt.x < rc.right && pt.y >= 0 && pt.y <= top;
+}
+
+/* Temporarily release raw/relative capture without changing the user's
+   relative-mouse preference.  Used when the host overlay or fullscreen
+   transition needs the real cursor back. */
+static void idd_suspend_relative_mouse_capture(VmDisplayIdd *d)
+{
+    AcquireSRWLockExclusive(&g_mouse_capture_lock);
+    if (g_mouse_capture_hwnd == d->hwnd) {
+        RAWINPUTDEVICE mouse = { 0x01, 0x02, RIDEV_REMOVE, NULL };
+        RegisterRawInputDevices(&mouse, 1, sizeof(mouse));
+        ClipCursor(NULL);
+        g_mouse_capture_hwnd = NULL;
+    }
+    d->relative_mouse = FALSE;
+    d->raw_absolute_valid = FALSE;
+    ReleaseSRWLockExclusive(&g_mouse_capture_lock);
+    idd_cancel_mouse_sync(d);
+}
+
 static void idd_update_relative_mouse(VmDisplayIdd *d)
 {
     POINT pt = {0};
@@ -579,7 +748,8 @@ static void idd_update_relative_mouse(VmDisplayIdd *d)
                    d->input_socket != INVALID_SOCKET && d->input_focused &&
                    !d->input_menu_active && !d->input_sizing &&
                    GetForegroundWindow() == d->hwnd && !IsIconic(d->hwnd) &&
-                   GetCursorPos(&pt) && WindowFromPoint(pt) == d->render_hwnd;
+                   GetCursorPos(&pt) && WindowFromPoint(pt) == d->render_hwnd &&
+                   !idd_point_in_fullscreen_toolbar_region(d, pt);
     BOOL capture = active && !d->cursor_visible;
     BOOL sync_absolute = FALSE;
     if (!active || capture) idd_cancel_mouse_sync(d);
@@ -726,6 +896,11 @@ static BOOL idd_is_reserved_hotkey(DWORD vk, BOOL alt_down)
     }
 }
 
+static BOOL idd_capture_all_keys(const VmDisplayIdd *d)
+{
+    return d->fullscreen || d->transmit_hotkeys;
+}
+
 /* Forward a key event to the guest and track held state so a later focus
    change can release anything still down. Runs on the window thread only. */
 static void idd_forward_key(VmDisplayIdd *d, DWORD vk, DWORD scan, BOOL ext, BOOL up)
@@ -807,8 +982,13 @@ static LRESULT CALLBACK idd_ll_keyboard_proc(int code, WPARAM wp, LPARAM lp)
         BOOL up = (wp == WM_KEYUP || wp == WM_SYSKEYUP);
         BOOL ext = (k->flags & LLKHF_EXTENDED) != 0;
         BOOL focused = d->input_focused && GetForegroundWindow() == d->hwnd;
+        if (focused && d->suppress_f11_up && up && k->vkCode == VK_F11) {
+            d->suppress_f11_up = FALSE;
+            return 1;
+        }
         if (d->keyboard_version != INPUT_KEYBOARD_VERSION) {
-            if (focused && d->transmit_hotkeys) {
+            if (focused && idd_capture_all_keys(d) &&
+                (d->fullscreen || k->vkCode != VK_F11)) {
                 idd_forward_key(d, k->vkCode, k->scanCode, ext, up);
                 return 1;
             }
@@ -827,7 +1007,9 @@ static LRESULT CALLBACK idd_ll_keyboard_proc(int code, WPARAM wp, LPARAM lp)
             if (!route) {
                 if (up && scan != 0xF1 && scan != 0xF2)
                     return CallNextHookEx(NULL, code, wp, lp);
-                if (d->transmit_hotkeys) {
+                if (!d->fullscreen && k->vkCode == VK_F11) {
+                    route = KEY_ROUTE_HOST;
+                } else if (idd_capture_all_keys(d)) {
                     route = KEY_ROUTE_GUEST;
                 } else if (idd_is_reserved_hotkey(k->vkCode, (k->flags & LLKHF_ALTDOWN) != 0) ||
                            (GetAsyncKeyState(VK_LWIN) & 0x8000) ||
@@ -878,7 +1060,7 @@ static void idd_remove_kbd_hook(VmDisplayIdd *d)
 
 static void idd_update_kbd_hook(VmDisplayIdd *d)
 {
-    if (d->transmit_hotkeys || d->keyboard_version == INPUT_KEYBOARD_VERSION)
+    if (idd_capture_all_keys(d) || d->keyboard_version == INPUT_KEYBOARD_VERSION)
         idd_install_kbd_hook(d);
     else
         idd_remove_kbd_hook(d);
@@ -2527,6 +2709,120 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
  * Window thread — creates window, initializes D3D11, runs message pump
  * ================================================================== */
 
+static void idd_layout_fullscreen_toolbar(VmDisplayIdd *d)
+{
+    RECT rc;
+    int width, height, x;
+    if (!d->fullscreen_toolbar || !GetClientRect(d->hwnd, &rc)) return;
+    width = (int)idd_dip_to_px(d->hwnd, TOOLBAR_WIDTH_DIP);
+    height = (int)idd_dip_to_px(d->hwnd, TOOLBAR_HEIGHT_DIP);
+    if (width > rc.right) width = rc.right;
+    if (height > rc.bottom) height = rc.bottom;
+    x = (rc.right - width) / 2;
+    SetWindowPos(d->fullscreen_toolbar, HWND_TOP, x, 0, width, height,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
+
+static void idd_hide_fullscreen_toolbar(VmDisplayIdd *d)
+{
+    if (!d->fullscreen_toolbar_visible) return;
+    d->fullscreen_toolbar_visible = FALSE;
+    d->fullscreen_toolbar_pressed = FALSE;
+    d->toolbar_leave_tick = 0;
+    KillTimer(d->hwnd, IDT_FULLSCREEN_TOOLBAR);
+    if (d->fullscreen_toolbar)
+        ShowWindow(d->fullscreen_toolbar, SW_HIDE);
+    if (d->fullscreen)
+        idd_update_relative_mouse(d);
+}
+
+static void idd_show_fullscreen_toolbar(VmDisplayIdd *d)
+{
+    if (!d || !d->fullscreen || d->stop || !d->hwnd) return;
+    if (!d->fullscreen_toolbar) {
+        d->fullscreen_toolbar = CreateWindowExW(
+            WS_EX_NOACTIVATE, IDD_TOOLBAR_CLASS, NULL,
+            WS_CHILD | WS_CLIPSIBLINGS,
+            0, 0, 1, 1, d->hwnd, NULL, d->hInstance, d);
+        if (!d->fullscreen_toolbar) {
+            idd_log(d, L"Fullscreen toolbar creation failed (err %lu).",
+                    GetLastError());
+            return;
+        }
+    }
+    d->fullscreen_toolbar_visible = TRUE;
+    d->toolbar_leave_tick = 0;
+    idd_flush_mouse_buttons(d);
+    idd_suspend_relative_mouse_capture(d);
+    SetCursor(LoadCursorW(NULL, IDC_ARROW));
+    idd_layout_fullscreen_toolbar(d);
+    SetTimer(d->hwnd, IDT_FULLSCREEN_TOOLBAR, TOOLBAR_POLL_MS, NULL);
+}
+
+static void idd_enter_fullscreen(VmDisplayIdd *d)
+{
+    WINDOWPLACEMENT placement;
+    MONITORINFO mi;
+    LONG_PTR style;
+    HMONITOR monitor;
+    HWND hwnd;
+
+    if (!d || !d->hwnd || d->fullscreen) return;
+    hwnd = d->hwnd;
+    ZeroMemory(&placement, sizeof(placement));
+    placement.length = sizeof(placement);
+    if (!GetWindowPlacement(hwnd, &placement)) return;
+    monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    ZeroMemory(&mi, sizeof(mi));
+    mi.cbSize = sizeof(mi);
+    if (!monitor || !GetMonitorInfoW(monitor, &mi)) return;
+
+    d->windowed_placement = placement;
+    d->windowed_style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    d->windowed_ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    idd_suspend_relative_mouse_capture(d);
+
+    style = d->windowed_style;
+    style &= ~(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX |
+               WS_MAXIMIZEBOX | WS_SYSMENU);
+    style |= WS_POPUP | WS_CLIPCHILDREN;
+    SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, d->windowed_ex_style);
+    d->fullscreen = TRUE;
+    d->fullscreen_toolbar_visible = FALSE;
+    d->toolbar_leave_tick = 0;
+
+    SetWindowPos(hwnd, HWND_TOP,
+                 mi.rcMonitor.left, mi.rcMonitor.top,
+                 mi.rcMonitor.right - mi.rcMonitor.left,
+                 mi.rcMonitor.bottom - mi.rcMonitor.top,
+                 SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+    idd_update_kbd_hook(d);
+    idd_update_relative_mouse(d);
+    idd_log(d, L"Entered borderless fullscreen.");
+}
+
+static void idd_exit_fullscreen(VmDisplayIdd *d)
+{
+    HWND hwnd;
+    if (!d || !d->hwnd || !d->fullscreen) return;
+    hwnd = d->hwnd;
+
+    idd_suspend_relative_mouse_capture(d);
+    idd_flush_held_keys(d);
+    d->fullscreen = FALSE;
+    idd_hide_fullscreen_toolbar(d);
+    SetWindowLongPtrW(hwnd, GWL_STYLE, d->windowed_style);
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, d->windowed_ex_style);
+    SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                 SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    SetWindowPlacement(hwnd, &d->windowed_placement);
+    idd_update_kbd_hook(d);
+    idd_update_relative_mouse(d);
+    idd_log(d, L"Exited borderless fullscreen.");
+}
+
 static DWORD WINAPI idd_window_thread_proc(LPVOID param)
 {
     VmDisplayIdd *d = (VmDisplayIdd *)param;
@@ -2571,6 +2867,7 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
             AppendMenuW(sysmenu, MF_STRING, IDM_AUDIO_MUTE, L"Mute audio");
             AppendMenuW(sysmenu, MF_STRING, IDM_XMIT_HOTKEYS, L"Transmit Keyboard Hotkeys");
             AppendMenuW(sysmenu, MF_STRING, IDM_SHOW_LOG, L"Show Log");
+            AppendMenuW(sysmenu, MF_STRING, IDM_ENTER_FULLSCREEN, L"Enter Fullscreen");
             CheckMenuItem(sysmenu, IDM_XMIT_HOTKEYS,
                           MF_BYCOMMAND | (d->transmit_hotkeys ? MF_CHECKED : MF_UNCHECKED));
         }
@@ -2693,6 +2990,10 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     switch (msg) {
     case WM_SYSCOMMAND:
+        if (d && (wp & 0xFFF0) == IDM_ENTER_FULLSCREEN) {
+            if (!d->fullscreen) idd_enter_fullscreen(d);
+            return 0;
+        }
         if (d && (wp & 0xFFF0) == IDM_AUDIO_MUTE) {
             HMENU sysmenu = GetSystemMenu(hwnd, FALSE);
             wchar_t title[300];
@@ -2810,6 +3111,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_DESTROY:
         KillTimer(hwnd, IDT_PRESENT);
+        KillTimer(hwnd, IDT_FULLSCREEN_TOOLBAR);
         if (d) idd_remove_kbd_hook(d);  /* safety net if WM_CLOSE was bypassed */
         if (d) {
             d->stop = TRUE;
@@ -2841,12 +3143,19 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
+    case WM_DPICHANGED:
+        if (d && d->fullscreen_toolbar_visible)
+            idd_layout_fullscreen_toolbar(d);
+        return 0;
+
     case WM_SIZE:
         if (d) {
             RECT rc;
             GetClientRect(hwnd, &rc);
             if (d->render_hwnd)
                 MoveWindow(d->render_hwnd, 0, 0, rc.right, rc.bottom, TRUE);
+            if (d->fullscreen_toolbar_visible)
+                idd_layout_fullscreen_toolbar(d);
             d3d_resize_swap_chain(d);
             if (d->relative_mouse) {
                 AcquireSRWLockExclusive(&g_mouse_capture_lock);
@@ -2884,6 +3193,19 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
 
     case WM_TIMER:
+        if (wp == IDT_FULLSCREEN_TOOLBAR && d) {
+            POINT pt;
+            BOOL in_region = GetCursorPos(&pt) &&
+                             idd_point_in_fullscreen_toolbar_region(d, pt);
+            if (in_region) {
+                d->toolbar_leave_tick = 0;
+            } else if (!d->toolbar_leave_tick) {
+                d->toolbar_leave_tick = GetTickCount64();
+            } else if (GetTickCount64() - d->toolbar_leave_tick >= TOOLBAR_HIDE_MS) {
+                idd_hide_fullscreen_toolbar(d);
+            }
+            return 0;
+        }
         if (wp == IDT_PRESENT && d) {
             if (d->mouse_sync_pending) idd_poll_mouse_position(d);
             if (d->frame_dirty)
@@ -3021,6 +3343,10 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_MOUSEMOVE:
         if (d) {
+            if (d->fullscreen &&
+                (int)(short)HIWORD(lp) <=
+                    (int)idd_dip_to_px(d->hwnd, TOOLBAR_HOTZONE_DIP))
+                idd_show_fullscreen_toolbar(d);
             if (!d->tracking && d->render_hwnd) {
                 TRACKMOUSEEVENT tme;
                 tme.cbSize = sizeof(tme);
@@ -3126,7 +3452,20 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         BOOL ext = (lp & (1 << 24)) != 0;
         BOOL up  = (msg == WM_KEYUP || msg == WM_SYSKEYUP);
         if (!d) break;
-        if (!d->transmit_hotkeys &&
+        if (wp == VK_F11) {
+            if (!up && !d->fullscreen) {
+                d->suppress_f11_up = TRUE;
+                idd_enter_fullscreen(d);
+                return 0;
+            }
+            if (up && d->suppress_f11_up) {
+                d->suppress_f11_up = FALSE;
+                return 0;
+            }
+            if (up && !d->fullscreen)
+                return 0;
+        }
+        if (!idd_capture_all_keys(d) &&
             idd_is_reserved_hotkey((DWORD)wp, (GetKeyState(VK_MENU) & 0x8000) != 0))
             break;  /* Default mode: let the host handle this hotkey. */
         if (d->kbd_hook && d->keyboard_version == INPUT_KEYBOARD_VERSION)

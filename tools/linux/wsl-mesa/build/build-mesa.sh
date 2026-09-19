@@ -7,8 +7,8 @@
 # so an Ubuntu VM with Hyper-V GPU-PV gets hardware OpenGL/Vulkan
 # acceleration without needing Microsoft's proprietary libdxcore.so.
 #
-# Output: installs to /opt/wsl-mesa/. The caller is expected to tar that
-# tree and stash it under tools/wsl-mesa/prebuilt/<ubuntu-codename>-amd64/.
+# Output: a staged tarball and BUILDINFO under
+# tools/wsl-mesa/prebuilt/<ubuntu-codename>-amd64/.
 #
 # Tested on: Ubuntu 26.04 LTS (resolute), amd64, LLVM 21, Mesa 25.3.x.
 
@@ -57,8 +57,11 @@ if [[ -d "$PATCH_DIR" ]]; then
     done
 fi
 
-rm -rf build
-meson setup --prefix="$PREFIX" --buildtype=release --strip \
+meson_args=()
+if [[ -f build/build.ninja ]]; then
+    meson_args+=(--reconfigure)
+fi
+meson setup "${meson_args[@]}" --prefix="$PREFIX" --buildtype=release --strip \
     -D gallium-drivers=llvmpipe,d3d12 \
     -D vulkan-drivers=swrast,microsoft-experimental \
     -D microsoft-clc=enabled \
@@ -70,16 +73,24 @@ meson setup --prefix="$PREFIX" --buildtype=release --strip \
 echo "==> Building (this is the slow part, ~30 min)"
 ninja -C build -j "$(nproc)"
 
-echo "==> Installing to $PREFIX"
-sudo ninja -C build install
+echo "==> Installing into a fresh artifact staging directory"
+# Do not replace the builder Guest's active graphics stack or archive stale
+# libraries from an earlier installation. PREFIX remains the runtime path.
+STAGING_ROOT="$(mktemp -d)"
+trap 'rm -rf -- "$STAGING_ROOT"' EXIT
+DESTDIR="$STAGING_ROOT" ninja -C build install
+STAGED_PREFIX="$STAGING_ROOT$PREFIX"
 
 echo "==> Checking production D3D12 and dzn outputs"
-if ! find "$PREFIX/lib" -type f -name 'libd3d12.so*' -print -quit | grep -q .; then
-    echo "ERROR: libd3d12 was not installed; refusing a production artifact." >&2
+# Mesa installs d3d12_dri.so (and the shared Gallium library). libd3d12.so
+# is Microsoft's runtime, supplied separately in the Guest's wsl-deps.
+if ! find -L "$STAGED_PREFIX/lib" -type f -name 'd3d12_dri.so' -print -quit | grep -q . ||
+   ! grep -aRqs 'ASB_D3D12_DISPLAY' "$STAGED_PREFIX/lib"; then
+    echo "ERROR: patched d3d12 Gallium driver was not installed; refusing a production artifact." >&2
     exit 1
 fi
-if ! find "$PREFIX/lib" -type f -iname '*dzn*.so*' -print -quit | grep -q . ||
-   ! find "$PREFIX/share/vulkan/icd.d" -type f -iname '*dzn*.json' -print -quit | grep -q .; then
+if ! find "$STAGED_PREFIX/lib" -type f -iname '*dzn*.so*' -print -quit | grep -q . ||
+   ! find "$STAGED_PREFIX/share/vulkan/icd.d" -type f -iname '*dzn*.json' -print -quit | grep -q .; then
     echo "ERROR: dzn Vulkan driver/ICD was not installed; refusing a production artifact." >&2
     exit 1
 fi
@@ -103,9 +114,9 @@ GRAPHICS_VERSION="${GRAPHICS_VERSION:-mesa-${MESA_VERSION}-appsandbox-${PATCHSET
 mkdir -p "$ARTIFACT_DIR"
 tmp_tar="$ARTIFACT_PATH.tmp.$$"
 tmp_info="$ARTIFACT_DIR/BUILDINFO.tmp.$$"
-trap 'rm -f "$tmp_tar" "$tmp_info"' EXIT
+trap 'rm -f "$tmp_tar" "$tmp_info"; rm -rf -- "$STAGING_ROOT"' EXIT
 echo "==> Creating reproducible artifact $ARTIFACT_PATH"
-sudo tar -C / --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+tar -C "$STAGING_ROOT" --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
     -cf - opt/wsl-mesa | zstd -T0 -19 -q -o "$tmp_tar"
 mv -f "$tmp_tar" "$ARTIFACT_PATH"
 ARTIFACT_SHA256="$(sha256sum "$ARTIFACT_PATH" | cut -d' ' -f1)"
@@ -123,8 +134,9 @@ mesa-source-commit: $SOURCE_COMMIT
 appsandbox-graphics-version: $GRAPHICS_VERSION
 mesa-patchset-version: $PATCHSET_VERSION
 artifact-sha256: $ARTIFACT_SHA256
-production-4k60: true
+production-4k60: false
 EOF
 mv -f "$tmp_info" "$ARTIFACT_DIR/BUILDINFO"
+rm -rf -- "$STAGING_ROOT"
 trap - EXIT
-echo "==> Production artifact and BUILDINFO written under $ARTIFACT_DIR"
+echo "==> Mesa artifact and BUILDINFO written under $ARTIFACT_DIR (4K60 validation pending)"

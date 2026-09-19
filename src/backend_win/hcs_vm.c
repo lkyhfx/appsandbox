@@ -811,28 +811,6 @@ BOOL hcs_try_open_vm(VmInstance *instance)
     return FALSE;
 }
 
-/* Reopen an existing compute system after an offline VHDX transaction.  The
-   stopped handle is intentionally kept so hcs_start_vm can start the same HCS
-   object; no VM or disk recreation is permitted during migration. */
-BOOL hcs_open_stopped_vm(VmInstance *instance)
-{
-    HCS_SYSTEM sys = NULL;
-    HRESULT hr;
-
-    if (!instance || !g_hcs_dll || !pfnOpen)
-        return FALSE;
-    hr = pfnOpen(instance->name, GENERIC_ALL, &sys);
-    if (FAILED(hr) || !sys) {
-        ui_log(L"hcs_open_stopped: open failed for \"%s\" (0x%08X)", instance->name, hr);
-        return FALSE;
-    }
-    instance->handle = sys;
-    instance->running = FALSE;
-    hcs_register_vm_callback(instance);
-    ui_log(L"hcs_open_stopped: reopened \"%s\" without recreating the VM.", instance->name);
-    return TRUE;
-}
-
 /* Wait for a file to become unlocked (vmwp.exe releasing handles after terminate).
    Returns TRUE if file is available, FALSE if still locked after timeout. */
 static BOOL wait_for_file_available(const wchar_t *path, int timeout_ms)
@@ -1136,9 +1114,13 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
     {
         wchar_t entry[256];
         wchar_t guid_str[64];
-        unsigned port;
+        static const unsigned ports[] = {1, 2, 3, 4, 5, 6, 9};
+        size_t i;
         service_table[0] = L'\0';
-        for (port = 1; port <= 6; port++) {
+        for (i = 0; i < ARRAYSIZE(ports); i++) {
+            unsigned port = ports[i];
+            /* Port 9 is the Linux signed-update binary transport. */
+            if (port == 9 && _wcsicmp(config->os_type, L"Linux") != 0) continue;
             hcs_service_guid_str(config->os_type, port, guid_str, 64);
             swprintf_s(entry, 256,
                 L"%s\"%s\":{"
@@ -1146,7 +1128,7 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
                     L"\"ConnectSecurityDescriptor\":\"D:P(A;;FA;;;WD)\","
                     L"\"AllowWildcardBinds\":true"
                 L"}",
-                (port > 1) ? L"," : L"", guid_str);
+                i ? L"," : L"", guid_str);
             wcscat_s(service_table, 2048, entry);
         }
     }

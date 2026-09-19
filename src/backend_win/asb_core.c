@@ -3659,6 +3659,51 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
 
 /* ---- VM Start ---- */
 
+/* Rebuild only the compute system against the existing disk. Offline update
+ * must never select/create a snapshot branch or provision a new guest disk. */
+static HRESULT start_existing_vm(VmInstance *inst, BOOL background)
+{
+    StartVmArgs *args = (StartVmArgs *)calloc(1, sizeof(StartVmArgs));
+    if (!args) return E_OUTOFMEMORY;
+    args->vm = inst;
+    wcscpy_s(args->config.name, 256, inst->name);
+    wcscpy_s(args->config.os_type, 32, inst->os_type);
+    wcscpy_s(args->config.image_path, MAX_PATH, inst->image_path);
+    wcscpy_s(args->config.vhdx_path, MAX_PATH, inst->vhdx_path);
+    args->config.ram_mb = inst->ram_mb;
+    args->config.hdd_gb = inst->hdd_gb;
+    args->config.cpu_cores = inst->cpu_cores;
+    args->config.gpu_mode = inst->gpu_mode;
+    wcscpy_s(args->config.gpu_id, ARRAYSIZE(args->config.gpu_id), inst->gpu_id);
+    args->config.network_mode = inst->network_mode;
+    wcscpy_s(args->config.mac_address, ARRAYSIZE(args->config.mac_address), inst->mac_address);
+    args->config.test_mode = inst->test_mode;
+    wcscpy_s(args->config.admin_user, 128, inst->admin_user);
+    args->config.ssh_enabled = inst->ssh_enabled;
+    wcscpy_s(args->config.resources_iso_path, MAX_PATH, inst->resources_iso_path);
+    args->network_mode = inst->network_mode;
+    inst->network_cleaned = FALSE;
+    asb_log(L"Starting VM \"%s\" (background)...", inst->name);
+    if (background) {
+        HANDLE thread = CreateThread(NULL, 0, start_vm_thread, args, 0, NULL);
+        if (!thread) { free(args); return HRESULT_FROM_WIN32(GetLastError()); }
+        CloseHandle(thread);
+        return S_OK;
+    }
+    return start_vm_thread(args) == 0 && inst->running ? S_OK : E_FAIL;
+}
+
+ASB_API HRESULT asb_vm_restart_after_offline_update(AsbVm vm)
+{
+    int idx = vm_index_of(vm);
+    VmInstance *inst;
+    if (idx < 0) return E_INVALIDARG;
+    inst = &g_vms[idx];
+    if (inst->running || inst->handle) return E_NOT_VALID_STATE;
+    asb_vm_cleanup_network(inst);
+    return start_existing_vm(inst, FALSE);
+}
+
 ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
                               const wchar_t *branch_name)
 {
@@ -3712,35 +3757,27 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
             return hr;
         }
         if (hr == S_OK) {
-            if (inst->handle) hcs_close_vm(inst);
+            /* A Linux start immediately creates a compute system with the
+               current ServiceTable. Finish closing the old stopped handle
+               before that create, including after a branch switch. */
+            if (inst->handle) {
+                if (_wcsicmp(inst->os_type, L"Linux") == 0)
+                    hcs_close_vm_sync(inst);
+                else
+                    hcs_close_vm(inst);
+            }
             save_vm_list();
         }
     }
 
+    /* Stopped Linux systems from an older Host must receive the current
+       ServiceTable, including update transport port 9, on their next start. */
+    if (_wcsicmp(inst->os_type, L"Linux") == 0 && inst->handle)
+        hcs_close_vm_sync(inst);
+
     if (!inst->handle) {
         /* Need to re-create HCS system - do it in a background thread */
-        StartVmArgs *args = (StartVmArgs *)calloc(1, sizeof(StartVmArgs));
-        if (!args) return E_OUTOFMEMORY;
-        args->vm = inst;
-        wcscpy_s(args->config.name, 256, inst->name);
-        wcscpy_s(args->config.os_type, 32, inst->os_type);
-        wcscpy_s(args->config.image_path, MAX_PATH, inst->image_path);
-        wcscpy_s(args->config.vhdx_path, MAX_PATH, inst->vhdx_path);
-        args->config.ram_mb = inst->ram_mb;
-        args->config.hdd_gb = inst->hdd_gb;
-        args->config.cpu_cores = inst->cpu_cores;
-        args->config.gpu_mode = inst->gpu_mode;
-        wcscpy_s(args->config.gpu_id, ARRAYSIZE(args->config.gpu_id), inst->gpu_id);
-        args->config.network_mode = inst->network_mode;
-        wcscpy_s(args->config.mac_address, ARRAYSIZE(args->config.mac_address), inst->mac_address);
-        args->config.test_mode = inst->test_mode;
-        wcscpy_s(args->config.admin_user, 128, inst->admin_user);
-        args->config.ssh_enabled = inst->ssh_enabled;
-        wcscpy_s(args->config.resources_iso_path, MAX_PATH, inst->resources_iso_path);
-        args->network_mode = inst->network_mode;
-        inst->network_cleaned = FALSE;
-        asb_log(L"Starting VM \"%s\" (background)...", inst->name);
-        CloseHandle(CreateThread(NULL, 0, start_vm_thread, args, 0, NULL));
+        return start_existing_vm(inst, TRUE);
     } else {
         BOOL selected_gpu = inst->gpu_id[0] != L'\0';
         HRESULT hr = hcs_start_vm(inst);

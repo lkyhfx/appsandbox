@@ -300,7 +300,7 @@ static BOOL verify_manifest_with_pinned_helper(const wchar_t *bundle,
                                                const char *expected_sha)
 {
     wchar_t verifier[MAX_PATH], verifier_dir[MAX_PATH], *slash;
-    wchar_t command_line[MAX_PATH * 2];
+    wchar_t command_line[MAX_PATH * 4];
     wchar_t expected_w[65];
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
@@ -319,7 +319,10 @@ static BOOL verify_manifest_with_pinned_helper(const wchar_t *bundle,
     if (!slash) return FALSE;
     *slash = L'\0';
     command_line[0] = L'\0';
-    if (swprintf_s(command_line, ARRAYSIZE(command_line), L"--verify-bundle ") < 0 ||
+    /* CreateProcess does not synthesize argv[0] when lpApplicationName is
+     * supplied. Keep the verifier flag in argv[1], as its Go CLI requires. */
+    if (!append_quoted_arg(command_line, ARRAYSIZE(command_line), verifier) ||
+        wcscat_s(command_line, ARRAYSIZE(command_line), L" --verify-bundle ") != 0 ||
         !append_quoted_arg(command_line, ARRAYSIZE(command_line), bundle) ||
         swprintf_s(command_line + wcslen(command_line),
                    ARRAYSIZE(command_line) - wcslen(command_line),
@@ -398,34 +401,21 @@ static BOOL verify_pinned_resource(const wchar_t *path, const char *embedded_sha
     return _stricmp(actual, expected) == 0;
 }
 
-static BOOL flush_vhdx_path(const wchar_t *path)
-{
-    HANDLE h;
-    BOOL ok;
-    if (!path || !path[0]) return FALSE;
-    h = CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                    NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) return FALSE;
-    ok = FlushFileBuffers(h);
-    CloseHandle(h);
-    return ok;
-}
-
 static BOOL windows_path_to_wsl(const wchar_t *windows_path, wchar_t *out, size_t cap)
 {
     const wchar_t *p = windows_path;
     size_t i, used;
-    if (!p || !out || cap < 5) return FALSE;
+    if (!p || !out || cap < 8) return FALSE;
     if (wcsncmp(p, L"\\\\?\\", 4) == 0) p += 4;
     if (!((p[0] >= L'A' && p[0] <= L'Z') ||
-          (p[0] >= L'a' && p[0] <= L'z')) || p[1] != L':') return FALSE;
-    used = 0;
-    out[used++] = L'/';
+          (p[0] >= L'a' && p[0] <= L'z')) || p[1] != L':' ||
+        (p[2] != L'\\' && p[2] != L'/')) return FALSE;
+    wcscpy_s(out, cap, L"/mnt/");
+    used = 5;
     out[used++] = (p[0] >= L'A' && p[0] <= L'Z') ? (wchar_t)(p[0] + (L'a' - L'A')) : p[0];
     out[used++] = L'/';
-    for (i = 2; p[i]; i++) {
-        if (used + 2 >= cap) return FALSE;
+    for (i = 3; p[i]; i++) {
+        if (used + 1 >= cap) return FALSE;
         out[used++] = p[i] == L'\\' ? L'/' : p[i];
     }
     out[used] = L'\0';
@@ -472,18 +462,37 @@ static BOOL wait_for_vm_stopped(VmInstance *vm)
     return FALSE;
 }
 
-static BOOL restart_after_offline_migration(VmInstance *vm)
+/* HCS callback cleanup can close the compute handle on another thread. A
+ * shared open/flush does not prove vmwp has released the backing disk. */
+static BOOL wait_for_vhdx_release(const wchar_t *path)
+{
+    DWORD start = GetTickCount(), error;
+    do {
+        HANDLE file = CreateFileW(path, GENERIC_READ | GENERIC_WRITE, 0, NULL,
+                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (file != INVALID_HANDLE_VALUE) {
+            BOOL ok = FlushFileBuffers(file);
+            CloseHandle(file);
+            return ok;
+        }
+        error = GetLastError();
+        if (error != ERROR_SHARING_VIOLATION && error != ERROR_LOCK_VIOLATION) break;
+        Sleep(250);
+    } while (GetTickCount() - start < 120000UL);
+    ui_log(L"offline migration: VHDX not exclusively available (error %lu)", error);
+    return FALSE;
+}
+
+static BOOL restart_after_offline_migration(VmInstance *vm, BOOL require_updater)
 {
     DWORD start;
-    if (!vm || !hcs_open_stopped_vm(vm) || FAILED(hcs_start_vm(vm))) {
+    if (!vm || FAILED(asb_vm_restart_after_offline_update((AsbVm)vm))) {
         if (vm && vm->handle) hcs_close_vm(vm);
         return FALSE;
     }
-    hcs_start_monitor(vm);
-    vm_agent_start(vm);
     start = GetTickCount();
     while (GetTickCount() - start < 120000UL) {
-        if (vm->agent_online && vm->guest_updater_supported) return TRUE;
+        if (vm->agent_online && (!require_updater || vm->guest_updater_supported)) return TRUE;
         Sleep(250);
     }
     return FALSE;
@@ -491,7 +500,7 @@ static BOOL restart_after_offline_migration(VmInstance *vm)
 
 BOOL vm_guest_update_bootstrap_legacy(VmInstance *instance)
 {
-    wchar_t vhdx_wsl[4096], script_wsl[4096], updater_wsl[4096];
+    wchar_t mount_name[96], mount_root[128], script_wsl[4096], updater_wsl[4096];
     wchar_t service_wsl[4096], watch_wsl[4096], bootstrap_wsl[4096];
     wchar_t updater[MAX_PATH], script[MAX_PATH], service[MAX_PATH];
     wchar_t watch[MAX_PATH], bootstrap[MAX_PATH], args[8192];
@@ -501,37 +510,86 @@ BOOL vm_guest_update_bootstrap_legacy(VmInstance *instance)
         !instance->vhdx_path[0]) return FALSE;
     stopped = !instance->running;
     update_set(instance->unique_id, ASB_UPDATE_LEGACY_MIGRATION, 5, FALSE, NULL, NULL);
+    /* Probe the exact default-distro/root/Python execution path before
+     * stopping a working guest or attaching its disk. */
+    if (!run_wsl_args(L"-u root -- python3 -c \"import sys; assert sys.version_info >= (3, 9)\"",
+                      PREFLIGHT_TIMEOUT_MS)) {
+        ui_log(L"Legacy migration requires a runnable default WSL distro with Python 3.9+.");
+        update_set(instance->unique_id, ASB_UPDATE_FAILED, 0, FALSE, NULL,
+                   "legacy_migration_requires_wsl_python3");
+        return FALSE;
+    }
     if (!get_linux_resource_path(L"updater\\appsandbox-guest-updater", updater, ARRAYSIZE(updater)) ||
         !verify_pinned_resource(updater, ASB_BOOTSTRAP_UPDATER_SHA256) ||
         !get_linux_resource_path(L"offline_legacy_bootstrap.py", script, ARRAYSIZE(script)) ||
         !get_linux_resource_path(L"updater\\appsandbox-guest-updater.service", service, ARRAYSIZE(service)) ||
         !get_linux_resource_path(L"updater\\appsandbox-guest-update-watch.service", watch, ARRAYSIZE(watch)) ||
         !get_linux_resource_path(L"bootstrap-runtime", bootstrap, ARRAYSIZE(bootstrap)) ||
-        !windows_path_to_wsl(instance->vhdx_path, vhdx_wsl, ARRAYSIZE(vhdx_wsl)) ||
         !windows_path_to_wsl(script, script_wsl, ARRAYSIZE(script_wsl)) ||
         !windows_path_to_wsl(updater, updater_wsl, ARRAYSIZE(updater_wsl)) ||
         !windows_path_to_wsl(service, service_wsl, ARRAYSIZE(service_wsl)) ||
         !windows_path_to_wsl(watch, watch_wsl, ARRAYSIZE(watch_wsl)) ||
-        !windows_path_to_wsl(bootstrap, bootstrap_wsl, ARRAYSIZE(bootstrap_wsl))) goto done;
+        !windows_path_to_wsl(bootstrap, bootstrap_wsl, ARRAYSIZE(bootstrap_wsl))) {
+        update_set(instance->unique_id, ASB_UPDATE_FAILED, 0, FALSE, NULL,
+                   "legacy_migration_resources_invalid");
+        return FALSE;
+    }
+    /* Verify the actual /mnt/<drive> resources before shutting down. This
+     * also rejects default distros with incompatible automount settings. */
+    wcscpy_s(args, ARRAYSIZE(args),
+        L"-u root -- python3 -c \"import pathlib,sys; assert all(pathlib.Path(p).exists() for p in sys.argv[1:])\" ");
+    {
+        const wchar_t *paths[] = {script_wsl, updater_wsl, service_wsl, watch_wsl, bootstrap_wsl};
+        size_t i;
+        for (i = 0; i < ARRAYSIZE(paths); i++) {
+            if (!append_quoted_arg(args, ARRAYSIZE(args), paths[i]) ||
+                wcscat_s(args, ARRAYSIZE(args), L" ") != 0) return FALSE;
+        }
+    }
+    if (!run_wsl_args(args, PREFLIGHT_TIMEOUT_MS)) {
+        update_set(instance->unique_id, ASB_UPDATE_FAILED, 0, FALSE, NULL,
+                   "legacy_migration_wsl_resources_unavailable");
+        return FALSE;
+    }
+    swprintf_s(mount_name, ARRAYSIZE(mount_name), L"asb-update-%lu-%llu",
+               GetCurrentProcessId(), (unsigned long long)instance->unique_id);
+    swprintf_s(mount_root, ARRAYSIZE(mount_root), L"/mnt/wsl/%s", mount_name);
     if (instance->running) {
         if (FAILED(hcs_stop_vm(instance)) || !wait_for_vm_stopped(instance)) goto done;
         stopped = TRUE;
     }
     vm_agent_stop(instance);
-    if (!flush_vhdx_path(instance->vhdx_path)) goto done;
-    if (instance->handle) hcs_close_vm_sync(instance);
+    hcs_stop_monitor(instance);
+    hcs_close_vm_sync(instance);
+    if (!wait_for_vhdx_release(instance->vhdx_path)) {
+        /* No WSL mount or offline write has begun. Try to bring the original
+         * guest back even if another process still holds the disk; HCS will
+         * reject the start if that lock has not cleared. */
+        HRESULT restart_hr = asb_vm_restart_after_offline_update((AsbVm)instance);
+        if (FAILED(restart_hr))
+            ui_log(L"offline migration: could not restart guest after VHDX release timeout (0x%08X)",
+                   restart_hr);
+        update_set(instance->unique_id, ASB_UPDATE_FAILED, 0, FALSE, NULL,
+                   "legacy_migration_vhdx_release_failed");
+        return FALSE;
+    }
 
     args[0] = L'\0';
     if (swprintf_s(args, ARRAYSIZE(args), L"--mount ") < 0 ||
         !append_quoted_arg(args, ARRAYSIZE(args), instance->vhdx_path) ||
-        wcscat_s(args, ARRAYSIZE(args), L" --vhd --type ext4") != 0 ||
-        !run_wsl_args(args, 120000UL)) goto done;
+        /* ubuntu_vhdx.c provisions GPT: partition 1 ESP, partition 2 root. */
+        wcscat_s(args, ARRAYSIZE(args), L" --vhd --partition 2 --type ext4 --name ") != 0 ||
+        !append_quoted_arg(args, ARRAYSIZE(args), mount_name)) goto done;
+    /* A failed mount can still leave the VHD attached to WSL. */
     mounted = TRUE;
+    if (!run_wsl_args(args, 120000UL)) goto done;
     update_set(instance->unique_id, ASB_UPDATE_LEGACY_MIGRATION, 45, FALSE, NULL, NULL);
     args[0] = L'\0';
     if (swprintf_s(args, ARRAYSIZE(args), L"-u root -- python3 ") < 0 ||
         !append_quoted_arg(args, ARRAYSIZE(args), script_wsl) ||
-        wcscat_s(args, ARRAYSIZE(args), L" --discover-mounted-root --updater ") != 0 ||
+        wcscat_s(args, ARRAYSIZE(args), L" --root ") != 0 ||
+        !append_quoted_arg(args, ARRAYSIZE(args), mount_root) ||
+        wcscat_s(args, ARRAYSIZE(args), L" --updater ") != 0 ||
         !append_quoted_arg(args, ARRAYSIZE(args), updater_wsl) ||
         wcscat_s(args, ARRAYSIZE(args), L" --service ") != 0 ||
         !append_quoted_arg(args, ARRAYSIZE(args), service_wsl) ||
@@ -544,18 +602,26 @@ BOOL vm_guest_update_bootstrap_legacy(VmInstance *instance)
 done:
     if (mounted) {
         args[0] = L'\0';
-        if (swprintf_s(args, ARRAYSIZE(args), L"--unmount ") >= 0 &&
-            append_quoted_arg(args, ARRAYSIZE(args), instance->vhdx_path))
-            run_wsl_args(args, 120000UL);
+        if (swprintf_s(args, ARRAYSIZE(args), L"--unmount ") < 0 ||
+            !append_quoted_arg(args, ARRAYSIZE(args), instance->vhdx_path) ||
+            !run_wsl_args(args, 120000UL)) {
+            update_set(instance->unique_id, ASB_UPDATE_FAILED, 0, FALSE, NULL,
+                       "legacy_migration_unmount_failed");
+            return FALSE;
+        }
         mounted = FALSE;
     }
-    flush_vhdx_path(instance->vhdx_path);
     if (!stopped) {
         update_set(instance->unique_id, ASB_UPDATE_FAILED, 0, FALSE, NULL,
                    "legacy_migration_shutdown_failed");
         return FALSE;
     }
-    restarted = restart_after_offline_migration(instance);
+    if (!wait_for_vhdx_release(instance->vhdx_path)) {
+        update_set(instance->unique_id, ASB_UPDATE_FAILED, 0, FALSE, NULL,
+                   "legacy_migration_vhdx_release_failed");
+        return FALSE;
+    }
+    restarted = restart_after_offline_migration(instance, migrated);
     if (!restarted) {
         update_set(instance->unique_id, ASB_UPDATE_FAILED, 0, FALSE, NULL,
                    "legacy_migration_restart_failed");
@@ -674,8 +740,6 @@ static DWORD WINAPI update_thread_proc(LPVOID param)
     if (!vm->guest_updater_supported) {
         update_set(job->vm_id, ASB_UPDATE_LEGACY_MIGRATION, 5, FALSE, txid, NULL);
         if (!vm_guest_update_bootstrap_legacy(vm)) {
-            update_set(job->vm_id, ASB_UPDATE_FAILED, 0, FALSE, txid,
-                       "legacy_migration_failed");
             goto done;
         }
         vm = asb_find_vm_by_id(job->vm_id);

@@ -154,13 +154,17 @@ install-agents: agents updater validate-graphics-artifact
 	# release-trust.json is the machine-readable trust boundary consumed by
 	# make-release.ps1. The Windows release step rewrites the two binary hashes
 	# after EV signing and refuses to package an inconsistent copy.
-	@printf '{\n  "schema": 1,\n  "public_key_hex": "%s",\n  "guest_runtime_version": "%s",\n  "updater_sha256": "%s",\n  "verifier_sha256": "%s",\n  "bootstrap_updater_sha256": "%s",\n  "bundle_verifier_sha256": "%s",\n  "graphics_artifact_sha256": "%s",\n  "graphics_production_4k60": true\n}\n' \
+	@graphics_production_4k60=$$(sed -n 's/^production-4k60: //p' \
+		wsl-mesa/prebuilt/ubuntu-26.04-amd64/BUILDINFO); \
+	test "$${graphics_production_4k60}" = true; \
+	printf '{\n  "schema": 1,\n  "public_key_hex": "%s",\n  "guest_runtime_version": "%s",\n  "updater_sha256": "%s",\n  "verifier_sha256": "%s",\n  "bootstrap_updater_sha256": "%s",\n  "bundle_verifier_sha256": "%s",\n  "graphics_artifact_sha256": "%s",\n  "graphics_production_4k60": %s\n}\n' \
 		'$(PUBLIC_KEY_HEX)' '$(GUEST_RUNTIME_VERSION)' \
 		"$$(cut -d' ' -f1 $(DISTDIR)/updater/appsandbox-guest-updater.sha256)" \
 		"$$(cut -d' ' -f1 $(DISTDIR)/updater/appsandbox-guest-bundle-verifier.exe.sha256)" \
 		"$$(cut -d' ' -f1 $(DISTDIR)/updater/appsandbox-guest-updater.sha256)" \
 		"$$(cut -d' ' -f1 $(DISTDIR)/updater/appsandbox-guest-bundle-verifier.exe.sha256)" \
 		"$$(sha256sum $(DISTDIR)/wsl-mesa.tar.zst | cut -d' ' -f1)" \
+		"$${graphics_production_4k60}" \
 		> $(DISTDIR)/updater/release-trust.json
 
 # Production release artifacts must describe an actual Mesa/Mutter/D3D12

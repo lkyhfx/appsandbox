@@ -153,6 +153,9 @@ ASB_API const wchar_t *asb_validate_template_disk_size(const wchar_t *template_n
 ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
                               const wchar_t *branch_name);
 
+/* Internal offline-update restart: reuse the disk, rebuild current HCS config. */
+ASB_API HRESULT asb_vm_restart_after_offline_update(AsbVm vm);
+
 /* Graceful shutdown (sends ACPI shutdown signal). */
 ASB_API HRESULT asb_vm_shutdown(AsbVm vm);
 

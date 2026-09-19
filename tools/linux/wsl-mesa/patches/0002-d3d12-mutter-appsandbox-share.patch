@@ -112,7 +112,7 @@ new file mode 100644
 index 0000000..0000000
 --- /dev/null
 +++ b/src/gallium/drivers/d3d12/d3d12_appsandbox_share.cpp
-@@ -0,0 +1,434 @@
+@@ -0,0 +1,435 @@
 +/* SPDX-License-Identifier: MIT */
 +
 +#include "d3d12_appsandbox_share.h"

@@ -1,14 +1,14 @@
 ubuntu: 26.04 (resolute)
 arch: amd64
-built-on: 2026-05-19T21:11:49Z
-mesa-version: 25.3.6
+built-on: 2026-09-19T07:36:17Z
+mesa-version: 7f1ccad-dirty
 mesa-branch: 25.3
-llvm: 21
+llvm: unknown
 gallium-drivers: llvmpipe,d3d12
 vulkan-drivers: swrast,microsoft-experimental
 icd-name: dzn_icd.x86_64.json
-mesa-source-commit: unavailable-legacy-prebuild
-appsandbox-graphics-version: legacy-probe-prebuilt-2026-05
-appsandbox-patchset-version: none-legacy-artifact
-artifact-sha256: 711dc2d8b137a67a39321a76e70efa5239b80679c8b760db4f8506b26e58671b
+mesa-source-commit: 7f1ccad77883be68e7750ab30b99b16df02e679d
+appsandbox-graphics-version: mesa-7f1ccad-dirty-appsandbox-1.14749ec80dcccd3d
+mesa-patchset-version: 1.14749ec80dcccd3d
+artifact-sha256: ddbcc27654bc6702c674a01173ba1a589b193485387f8d2866cdc7c89bee399f
 production-4k60: false

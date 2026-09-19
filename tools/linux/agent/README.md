@@ -248,6 +248,35 @@ The larger `encode_complete_us` / total-pipeline numbers observed by the probe
 include three-slot recycling and scheduling depth; they are not a direct
 single-frame encoder execution time.
 
+### HEVC 4:4:4 capability probe
+
+The same opt-in executable also contains a diagnostic-only HEVC Main 4:4:4
+gate. It does not alter the default no-argument workload or the production
+NV12 path. Build and run it in the guest with:
+
+```sh
+make d3d12-video-encode-probe
+./d3d12-video-encode-probe --capability-444
+./d3d12-video-encode-probe --workload-444
+```
+
+`--capability-444` checks the real D3D12 Video HEVC Main 4:4:4 profile,
+codec configuration, AYUV input, GPU-only RGBA/BGRA -> AYUV Video Processor
+conversion, and actual 4K60 encoder creation. `--workload-444` then runs the
+existing independent producer/consumer workload for 3600 frames at 60/1 and
+writes the diagnostic stream to:
+
+```text
+/tmp/appsandbox-hevc444-probe.hevc
+```
+
+The workload reports `cpu_conversion=0`, `framebuffer_mmap=0`, and
+`cpu_memcpy_framebuffer=0`; it intentionally does not read source framebuffer
+pixels back to the CPU. It parses the produced Annex-B HEVC SPS and only
+passes the bitstream gate when `chroma_format_idc=3` and the decoded dimensions
+are 3840x2160. A `BLOCKED` result is a runtime capability fact, not a request
+to enable a fallback or change the production display protocol.
+
 ### 7. Real Mutter output gate passed
 
 The isolated Mutter/Mesa integration reached the real compositor render target:

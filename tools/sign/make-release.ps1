@@ -125,6 +125,9 @@ function Write-ReleaseTrust([string]$repoRoot, [string]$key) {
     $updater = Join-Path $root 'updater\appsandbox-guest-updater'
     $verifier = Join-Path $root 'updater\appsandbox-guest-bundle-verifier.exe'
     $graphics = Join-Path $root 'wsl-mesa.tar.zst'
+    $buildInfo = Get-Content (Join-Path $root 'wsl-mesa.BUILDINFO') -Raw
+    $productionFlags = @([regex]::Matches($buildInfo, '(?m)^production-4k60:[ \t]*(true|false)[ \t]*$'))
+    if ($productionFlags.Count -ne 1) { throw 'Mesa BUILDINFO has no unambiguous production-4k60 status.' }
     $runtime = (Get-Content (Join-Path $root 'guest-runtime.version') -Raw).Trim()
     $obj = [ordered]@{
         schema = 1
@@ -135,7 +138,7 @@ function Write-ReleaseTrust([string]$repoRoot, [string]$key) {
         bootstrap_updater_sha256 = $null
         bundle_verifier_sha256 = $null
         graphics_artifact_sha256 = (Get-FileHash $graphics -Algorithm SHA256).Hash.ToLowerInvariant()
-        graphics_production_4k60 = $true
+        graphics_production_4k60 = ($productionFlags[0].Groups[1].Value -eq 'true')
     }
     $obj.bootstrap_updater_sha256 = $obj.updater_sha256
     $obj.bundle_verifier_sha256 = $obj.verifier_sha256

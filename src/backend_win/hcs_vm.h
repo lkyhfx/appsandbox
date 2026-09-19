@@ -189,9 +189,6 @@ void hcs_close_vm_sync(VmInstance *instance);
    If found and running, populates instance->handle and returns TRUE. */
 BOOL hcs_try_open_vm(VmInstance *instance);
 
-/* Open an existing, stopped compute system without recreating its VHDX. */
-BOOL hcs_open_stopped_vm(VmInstance *instance);
-
 /* Check if a VM is running via HCS enumeration (does not require opening). */
 BOOL hcs_is_running_by_enum(const wchar_t *vm_name);
 
