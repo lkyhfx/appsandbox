@@ -28,7 +28,10 @@ wsl-mesa.tar.zst                         (optional GPU release)
 that directory into the Host release's `resources/linux/` tree. Kernel modules
 are deliberately not part of this normal runtime resource set.
 
-The updater is built with `PUBLIC_KEY_HEX` supplied by the release pipeline.
+The updater and the Host verifier are built with the same `PUBLIC_KEY_HEX`
+supplied by the release pipeline. The verifier is built from
+`updater/host/main.go` with `GOOS=windows GOARCH=amd64`; its `.exe` is never
+accepted unless the generated sidecar matches the bytes that were packaged.
 There is no repository fallback key and the private signing key must remain
 outside both the repository and the guest image.
 

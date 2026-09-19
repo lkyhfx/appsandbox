@@ -56,7 +56,8 @@ agents:
 	fi
 
 updater:
-	$(MAKE) -C updater
+	$(MAKE) -C updater PUBLIC_KEY_HEX=$(PUBLIC_KEY_HEX)
+	$(MAKE) -C updater host-verifier PUBLIC_KEY_HEX=$(PUBLIC_KEY_HEX)
 
 install-agents: agents updater
 	@install -d $(DISTDIR)
@@ -99,10 +100,13 @@ install-agents: agents updater
 	install -m 0644 asb_drm/modules-load.d-asb_drm.conf \
 	           $(DISTDIR)/systemd/modules-load.d-asb_drm.conf
 	install -m 0755 updater/appsandbox-guest-updater $(DISTDIR)/updater/
+	install -m 0755 updater/appsandbox-guest-bundle-verifier.exe $(DISTDIR)/updater/
 	install -m 0644 updater/appsandbox-guest-updater.service \
 	           updater/appsandbox-guest-update-watch.service $(DISTDIR)/updater/
 	sha256sum updater/appsandbox-guest-updater > \
 	           $(DISTDIR)/updater/appsandbox-guest-updater.sha256
+	sha256sum updater/appsandbox-guest-bundle-verifier.exe > \
+	           $(DISTDIR)/updater/appsandbox-guest-bundle-verifier.exe.sha256
 	install -m 0644 $(DISTDIR)/trusted-public-key.hex \
 	           $(DISTDIR)/updater/trusted-public-key.hex
 	install -m 0644 asb_drm/modprobe.d-asb_drm.conf \

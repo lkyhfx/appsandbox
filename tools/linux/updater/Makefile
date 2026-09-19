@@ -1,4 +1,7 @@
 CC ?= gcc
+HOST_GO ?= go
+HOST_GOOS ?= windows
+HOST_GOARCH ?= amd64
 CFLAGS ?= -O2 -Wall -Wextra -Werror
 LDFLAGS ?=
 PREFIX ?= /usr/local
@@ -30,6 +33,13 @@ endif
 
 all: appsandbox-guest-updater
 
+# The Host verifier is built in the release pipeline with the same public key.
+# Keep this target separate from the Linux updater so a missing cross compiler
+# cannot silently produce a release without the pinned helper.
+host-verifier: host/main.go
+	GO111MODULE=off GOOS=$(HOST_GOOS) GOARCH=$(HOST_GOARCH) $(HOST_GO) build -trimpath -ldflags '-s -w -X main.releasePublicKeyHex=$(PUBLIC_KEY_HEX)' \
+		-o appsandbox-guest-bundle-verifier.exe ./host
+
 appsandbox-guest-updater: appsandbox-guest-updater.c
 	$(CC) $(CFLAGS) -DASB_UPDATE_PUBLIC_KEY_HEX=\"$(PUBLIC_KEY_HEX)\" \
 		-o $@ $< $(LDFLAGS) -lcrypto
@@ -46,4 +56,4 @@ clean:
 test:
 	python3 -m unittest discover -s tests -p 'test_*.py'
 
-.PHONY: all install clean test
+.PHONY: all host-verifier install clean test

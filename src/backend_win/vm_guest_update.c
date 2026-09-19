@@ -563,29 +563,40 @@ done:
     return ok;
 }
 
-static BOOL wait_for_commit(UpdateJob *job, const char *txid, BOOL reboot)
+typedef enum UpdateOutcome { UPDATE_OUTCOME_COMMITTED, UPDATE_OUTCOME_ROLLBACK,
+                             UPDATE_OUTCOME_FAILED, UPDATE_OUTCOME_TIMEOUT } UpdateOutcome;
+
+static UpdateOutcome wait_for_commit(UpdateJob *job, const char *txid, BOOL *reboot)
 {
     DWORD start = GetTickCount();
     char cmd[128], response[256];
     for (;;) {
         VmInstance *vm = asb_find_vm_by_id(job->vm_id);
-        if (job->cancel || !vm) return FALSE;
-        if (!reboot && vm->agent_online) {
+        if (job->cancel || !vm) return UPDATE_OUTCOME_FAILED;
+        if (vm->agent_online) {
+            char state[32] = {0};
+            int status_reboot = 0, progress = 0;
             sprintf_s(cmd, sizeof(cmd), "update_status %s", txid);
             if (vm_agent_request(vm, cmd, response, sizeof(response), 5000)) {
-                if (!strcmp(response, "committed")) return TRUE;
-                if (!strncmp(response, "rollback", 8) || !strncmp(response, "failed", 6) ||
-                    !strncmp(response, "error:", 6)) return FALSE;
-            }
-        } else if (reboot && vm->agent_online) {
-            sprintf_s(cmd, sizeof(cmd), "update_status %s", txid);
-            if (vm_agent_request(vm, cmd, response, sizeof(response), 5000)) {
-                if (!strcmp(response, "committed")) return TRUE;
-                if (!strncmp(response, "rollback", 8) || !strncmp(response, "failed", 6) ||
-                    !strncmp(response, "error:", 6)) return FALSE;
+                if (sscanf_s(response, "state=%31[a-z_];reboot_required=%d;progress=%d",
+                             state, (unsigned)sizeof(state), &status_reboot, &progress) == 3 &&
+                    (status_reboot == 0 || status_reboot == 1) && progress >= 0 && progress <= 100) {
+                    *reboot = status_reboot != 0;
+                    if (!strcmp(state, "committed")) return UPDATE_OUTCOME_COMMITTED;
+                    if (!strcmp(state, "rollback")) return UPDATE_OUTCOME_ROLLBACK;
+                    if (!strcmp(state, "failed")) return UPDATE_OUTCOME_FAILED;
+                    if (!strcmp(state, "reboot_pending"))
+                        update_set(job->vm_id, ASB_UPDATE_REBOOTING, progress, TRUE, txid, NULL);
+                    else if (!strcmp(state, "health_check"))
+                        update_set(job->vm_id, ASB_UPDATE_HEALTH, progress, *reboot, txid, NULL);
+                    else if (!strcmp(state, "receiving") || !strcmp(state, "received") ||
+                             !strcmp(state, "apply_requested") || !strcmp(state, "verified") ||
+                             !strcmp(state, "activating"))
+                        update_set(job->vm_id, ASB_UPDATE_APPLYING, progress, *reboot, txid, NULL);
+                }
             }
         }
-        if (GetTickCount() - start > UPDATE_MAX_WAIT_MS) return FALSE;
+        if (GetTickCount() - start > UPDATE_MAX_WAIT_MS) return UPDATE_OUTCOME_TIMEOUT;
         Sleep(1000);
     }
 }
@@ -633,10 +644,18 @@ static DWORD WINAPI update_thread_proc(LPVOID param)
         !strcmp(response, "error:update_failed") || !strncmp(response, "error:", 6)) {
         update_set(job->vm_id, ASB_UPDATE_FAILED, 0, FALSE, txid, "apply_rejected"); goto done;
     }
-    reboot = !strcmp(response, "reboot_required");
-    update_set(job->vm_id, reboot ? ASB_UPDATE_REBOOTING : ASB_UPDATE_HEALTH, 90, reboot, txid, NULL);
-    if (wait_for_commit(job, txid, reboot)) update_set(job->vm_id, ASB_UPDATE_COMMITTED, 100, reboot, txid, NULL);
-    else update_set(job->vm_id, ASB_UPDATE_ROLLED_BACK, 0, reboot, txid, "guest_rollback_or_timeout");
+    if (strcmp(response, "accepted")) {
+        update_set(job->vm_id, ASB_UPDATE_FAILED, 0, FALSE, txid, "apply_rejected"); goto done;
+    }
+    {
+        UpdateOutcome outcome = wait_for_commit(job, txid, &reboot);
+        if (outcome == UPDATE_OUTCOME_COMMITTED)
+            update_set(job->vm_id, ASB_UPDATE_COMMITTED, 100, reboot, txid, NULL);
+        else if (outcome == UPDATE_OUTCOME_ROLLBACK)
+            update_set(job->vm_id, ASB_UPDATE_ROLLED_BACK, 0, reboot, txid, "guest_rollback");
+        else update_set(job->vm_id, ASB_UPDATE_FAILED, 0, reboot, txid,
+                        outcome == UPDATE_OUTCOME_TIMEOUT ? "status_timeout" : "guest_update_failed");
+    }
     goto done;
 fail:
     update_set(job->vm_id, ASB_UPDATE_FAILED, 0, FALSE, NULL, "unsupported_or_offline");

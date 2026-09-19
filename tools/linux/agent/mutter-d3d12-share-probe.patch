@@ -1,16 +1,16 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: AppSandbox contributors <appsandbox@example.invalid>
 Date: Fri, 18 Sep 2026 00:00:00 +0800
-Subject: [PATCH] clutter: flush the isolated D3D12 output probe after paint
+Subject: [PATCH] clutter: flush the AppSandbox D3D12 output after paint
 
 This is an opt-in experiment hook for Mutter 50.x.  The hook is placed after
 the default `paint-view` handler, while the stage view framebuffer is still
 the compositor's output and before the native backend submits/presents it.
-Mesa's d3d12 probe hook consumes the current Gallium framebuffer at the
+Mesa's AppSandbox d3d12 hook consumes the current Gallium framebuffer at the
 following flush and performs the GPU-only copy into its shared ring.
 
 The environment guard is essential: normal Mutter sessions do not acquire the
-extra flush or open a probe socket.  The patch does not change
+extra flush or open an unrelated socket. The patch does not change
 appsandbox-display, KMS, GBM modifiers, PRIME, DMA-BUF, or scanout behavior.
 
 Hook point: `clutter/clutter/clutter-stage.c`, `_clutter_stage_paint_view`,

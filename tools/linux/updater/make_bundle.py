@@ -22,6 +22,39 @@ DISALLOWED_KERNEL_MARKERS = (
     "modules/",
 )
 
+REQUIRED_RUNTIME = frozenset({
+    "bin/appsandbox-agent", "bin/appsandbox-display", "bin/appsandbox-input",
+    "bin/appsandbox-audio", "bin/appsandbox-clipboard",
+    "systemd/appsandbox-agent.service", "systemd/appsandbox-display.service",
+    "systemd/appsandbox-input.service", "systemd/appsandbox-audio.service",
+})
+REQUIRED_D3D12 = frozenset({
+    "libexec/appsandbox-display-d3d12",
+    "systemd/appsandbox-display-d3d12.service",
+})
+
+
+def validate_composition(kind: str, paths: set[str], graphics_version: str) -> None:
+    if kind == "runtime":
+        missing = REQUIRED_RUNTIME - paths
+        if missing:
+            raise ValueError(f"incomplete runtime bundle: {', '.join(sorted(missing))}")
+        if paths & REQUIRED_D3D12 and not REQUIRED_D3D12 <= paths:
+            raise ValueError("D3D12 binary and service must be supplied together")
+    elif kind == "graphics":
+        if not graphics_version or "graphics/wsl-mesa.tar.zst" not in paths:
+            raise ValueError("graphics bundle needs a graphics version and Mesa archive")
+        if any(p.startswith(("bin/", "libexec/", "systemd/")) for p in paths):
+            raise ValueError("graphics bundle contains runtime executable or service")
+        if any(not p.startswith(("graphics/", "config/", "gnome/")) for p in paths):
+            raise ValueError("graphics bundle contains unsupported payload")
+    else:
+        raise ValueError(f"unsupported bundle kind: {kind}")
+    if graphics_version and "graphics/wsl-mesa.tar.zst" not in paths:
+        raise ValueError("graphics version declared without Mesa archive")
+    if "graphics/wsl-mesa.tar.zst" in paths and not graphics_version:
+        raise ValueError("Mesa archive needs a graphics version")
+
 
 def safe_rel(path: pathlib.Path) -> str:
     value = path.as_posix()
@@ -47,6 +80,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--payload", type=pathlib.Path, required=True)
     ap.add_argument("--version", required=True, type=semver)
+    ap.add_argument("--kind", required=True, choices=("runtime", "graphics"))
     ap.add_argument("--commit", required=True)
     ap.add_argument("--graphics-version", default="", type=lambda v: semver(v) if v else "")
     ap.add_argument("--arch", default="amd64", choices=("amd64",))
@@ -59,6 +93,8 @@ def main() -> int:
 
     files = []
     for source in sorted(args.payload.rglob("*")):
+        if source.is_symlink():
+            raise ValueError(f"symlink payload is not allowed: {source}")
         if not source.is_file():
             continue
         rel = safe_rel(source.relative_to(args.payload))
@@ -74,9 +110,11 @@ def main() -> int:
         })
     if not files:
         raise SystemExit("payload is empty")
+    validate_composition(args.kind, {item["path"] for item in files}, args.graphics_version)
 
     manifest = {
         "schema": 1,
+        "kind": args.kind,
         "version": args.version,
         "commit": args.commit,
         "arch": args.arch,

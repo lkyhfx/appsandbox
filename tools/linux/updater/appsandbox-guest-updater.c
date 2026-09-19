@@ -26,6 +26,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -98,6 +99,7 @@ typedef struct PayloadFile {
 
 typedef struct Manifest {
     int schema;
+    char kind[16];
     char version[96];
     char commit[128];
     char arch[32];
@@ -449,6 +451,7 @@ static int parse_manifest(const unsigned char *data, size_t len, Manifest *m)
         if (v < 0 || token_copy((const char *)data, &t[v], field, sizeof(field)) < 0) goto fail; \
     } while (0)
     REQ_STR("version", m->version);
+    REQ_STR("kind", m->kind);
     REQ_STR("commit", m->commit);
     REQ_STR("arch", m->arch);
     REQ_STR("os", m->os);
@@ -958,7 +961,9 @@ static int verify_payload(const Manifest *m, const char *stage,
     uint64_t declared_total = 0;
     char path[PATH_MAX], payload_root[PATH_MAX];
     if (snprintf(payload_root, sizeof(payload_root), "%s/payload", stage) >= (int)sizeof(payload_root)) return -1;
-    if (!valid_version(m->version) || strcmp(m->arch, "amd64") != 0 ||
+    if (!valid_version(m->version) || !valid_version(m->updater_min_version) ||
+        (strcmp(m->kind, "runtime") && strcmp(m->kind, "graphics")) ||
+        m->kernel_components_present || strcmp(m->arch, "amd64") != 0 ||
         strcmp(m->os, "ubuntu-26.04") != 0 || m->host_protocol_min > UPDATE_PROTOCOL ||
         m->host_protocol_max < UPDATE_PROTOCOL || version_cmp(m->updater_min_version, UPDATER_VERSION) > 0)
         return -1;
@@ -967,17 +972,49 @@ static int verify_payload(const Manifest *m, const char *stage,
         if (f->size > UPDATE_MAX_FILE_SIZE || declared_total > UPDATE_MAX_UNCOMPRESSED - f->size)
             return -1;
         declared_total += f->size;
-        if (strstr(f->path, "..") || !strcmp(f->component, "kernel") ||
+        if (strstr(f->path, "..") || strstr(f->path, "modules/") ||
+            !strcmp(f->component, "kernel") ||
             strstr(f->path, "dxgkrnl") || strstr(f->path, "asb_drm.ko") ||
             join_path(path, sizeof(path), payload_root, f->path) < 0 ||
             !hash_matches(path, f)) return -1;
         for (j = i + 1; j < m->file_count; j++) if (!strcmp(f->path, m->files[j].path)) return -1;
         if (!extracted_has(extracted, extracted_count, f->path)) return -1;
+        if (!strcmp(m->kind, "graphics") &&
+            (strncmp(f->path, "graphics/", 9) && strncmp(f->path, "config/", 7) &&
+             strncmp(f->path, "gnome/", 6))) return -1;
     }
     for (i = 0; i < extracted_count; i++) {
         int found = 0;
         for (j = 0; j < m->file_count; j++) if (!strcmp(extracted[i].path, m->files[j].path)) { found = 1; break; }
         if (!found) return -1;
+    }
+    {
+        static const char *const core[] = {
+            "bin/appsandbox-agent", "bin/appsandbox-display", "bin/appsandbox-input",
+            "bin/appsandbox-audio", "bin/appsandbox-clipboard",
+            "systemd/appsandbox-agent.service", "systemd/appsandbox-display.service",
+            "systemd/appsandbox-input.service", "systemd/appsandbox-audio.service"
+        };
+        int d3d12_binary = 0, d3d12_unit = 0, mesa = 0;
+        for (i = 0; i < m->file_count; i++) {
+            const char *p = m->files[i].path;
+            if (!strcmp(p, "libexec/appsandbox-display-d3d12")) d3d12_binary = 1;
+            if (!strcmp(p, "systemd/appsandbox-display-d3d12.service")) d3d12_unit = 1;
+            if (!strcmp(p, "graphics/wsl-mesa.tar.zst")) mesa = 1;
+        }
+        if (d3d12_binary != d3d12_unit ||
+            (m->graphics_version[0] != 0) != mesa ||
+            (mesa && !valid_version(m->graphics_version))) return -1;
+        if (!strcmp(m->kind, "graphics")) {
+            if (!mesa) return -1;
+        } else {
+            for (i = 0; i < (int)(sizeof(core) / sizeof(core[0])); i++) {
+                int found = 0;
+                for (j = 0; j < m->file_count; j++)
+                    if (!strcmp(core[i], m->files[j].path)) { found = 1; break; }
+                if (!found) return -1;
+            }
+        }
     }
     return 0;
 }
@@ -1289,25 +1326,69 @@ typedef struct HealthResult {
     int encode_failures;
     char configured_resolution[64];
     char graphics_version[96];
+    char produced_graphics_version[96];
+    char produced_resolution[64];
+    uint64_t produced_timestamp;
+    long session_id;
+    int producer_valid;
 } HealthResult;
 
-static int health_probe_flag(const char *name, int fallback)
+static void health_read_producer(HealthResult *h)
 {
+    static const struct { const char *name; size_t offset; } fields[] = {
+        {"encoder_initialized", offsetof(HealthResult, encoder_initialized)},
+        {"native_d3d12_shared", offsetof(HealthResult, native_d3d12_shared)},
+        {"gpu_copy", offsetof(HealthResult, gpu_copy)},
+        {"cpu_copy", offsetof(HealthResult, cpu_copy)},
+        {"cpu_conversion", offsetof(HealthResult, cpu_conversion)},
+        {"framebuffer_mmap", offsetof(HealthResult, framebuffer_mmap)},
+        {"cpu_memcpy_framebuffer", offsetof(HealthResult, cpu_memcpy_framebuffer)},
+        {"gpu_cpu_gpu", offsetof(HealthResult, gpu_cpu_gpu)},
+        {"stale_frames", offsetof(HealthResult, stale_frames)},
+        {"mismatches", offsetof(HealthResult, mismatches)},
+        {"encode_failures", offsetof(HealthResult, encode_failures)}
+    };
     unsigned char *data = NULL;
     size_t len = 0;
-    char needle[64];
-    int result = fallback;
+    char *line, *save = NULL;
+    unsigned seen = 0;
     if (file_read_limited("/run/appsandbox/display-d3d12.health", &data, &len, 65536) < 0)
-        return fallback;
-    snprintf(needle, sizeof(needle), "%s=1", name);
-    if (strstr((char *)data, needle) || (snprintf(needle, sizeof(needle), "\"%s\":1", name),
-                                        strstr((char *)data, needle))) result = 1;
-    else {
-        snprintf(needle, sizeof(needle), "%s=0", name);
-        if (strstr((char *)data, needle)) result = 0;
+        return;
+    for (line = strtok_r((char *)data, "\n", &save); line;
+         line = strtok_r(NULL, "\n", &save)) {
+        char *eq = strchr(line, '=');
+        char *end;
+        unsigned long long value;
+        size_t i;
+        if (!eq || eq == line || !eq[1]) goto done;
+        *eq++ = 0;
+        if (!strcmp(line, "graphics_version")) {
+            if (seen & (1U << 11) || strlen(eq) >= sizeof(h->produced_graphics_version)) goto done;
+            strcpy(h->produced_graphics_version, eq); seen |= 1U << 11; continue;
+        }
+        if (!strcmp(line, "resolution")) {
+            if (seen & (1U << 14) || strlen(eq) >= sizeof(h->produced_resolution)) goto done;
+            strcpy(h->produced_resolution, eq); seen |= 1U << 14; continue;
+        }
+        errno = 0; value = strtoull(eq, &end, 10);
+        if (errno || *end || end == eq) goto done;
+        if (!strcmp(line, "session_id")) {
+            if (seen & (1U << 12) || value == 0 || value > LONG_MAX) goto done;
+            h->session_id = (long)value; seen |= 1U << 12; continue;
+        }
+        if (!strcmp(line, "timestamp")) {
+            if (seen & (1U << 13)) goto done;
+            h->produced_timestamp = value; seen |= 1U << 13; continue;
+        }
+        for (i = 0; i < sizeof(fields) / sizeof(fields[0]); i++)
+            if (!strcmp(line, fields[i].name)) break;
+        if (i == sizeof(fields) / sizeof(fields[0]) || (seen & (1U << i)) || value > INT_MAX) goto done;
+        *(int *)((char *)h + fields[i].offset) = (int)value;
+        seen |= 1U << i;
     }
+    h->producer_valid = seen == ((1U << 15) - 1U);
+done:
     free(data);
-    return result;
 }
 
 static int any_wayland_session(void)
@@ -1342,7 +1423,6 @@ static void health_collect(HealthResult *h)
         service_active("appsandbox-display-d3d12.service") : 0;
     h->mutter_active = any_wayland_session();
     h->shared_path_initialized = access("/opt/wsl-mesa/current", F_OK) == 0;
-    h->encoder_initialized = h->d3d12_helper_active || access("/run/appsandbox/display-d3d12.sock", F_OK) == 0;
     snprintf(h->configured_resolution, sizeof(h->configured_resolution), "unknown");
     if (file_read_limited("/etc/modprobe.d/asb_drm.conf", &data, &len, 65536) == 0) {
         p = strstr((char *)data, "width="); if (p) width = atoi(p + 6);
@@ -1362,25 +1442,29 @@ static void health_collect(HealthResult *h)
         if (p) sscanf(p + 17, "%95[0-9A-Za-z.+-]", h->graphics_version);
         free(data);
     }
-    h->native_d3d12_shared = health_probe_flag("native_d3d12_shared", 0);
-    h->gpu_copy = health_probe_flag("gpu_copy", 0);
-    h->cpu_copy = health_probe_flag("cpu_copy", 0);
-    h->cpu_conversion = health_probe_flag("cpu_conversion", 0);
-    h->framebuffer_mmap = health_probe_flag("framebuffer_mmap", 0);
-    h->cpu_memcpy_framebuffer = health_probe_flag("cpu_memcpy_framebuffer", 0);
-    h->gpu_cpu_gpu = health_probe_flag("gpu_cpu_gpu", 0);
-    h->stale_frames = health_probe_flag("stale_frames", 0);
-    h->mismatches = health_probe_flag("mismatches", 0);
-    h->encode_failures = health_probe_flag("encode_failures", 0);
+    health_read_producer(h);
 }
 
-static int health_check(void)
+static int health_check(const UpdateState *s)
 {
     HealthResult h;
+    uint64_t now = (uint64_t)time(NULL);
     health_collect(&h);
     if (!h.agent_active || !h.display_active) return -1;
     if (h.dxg_present && access("/etc/systemd/system/appsandbox-display-d3d12.service", F_OK) == 0 &&
         !h.d3d12_helper_active) return -1;
+    if (s->graphics_changed && h.dxg_present) {
+        if (!h.producer_valid || strcmp(h.graphics_version, s->graphics_version) ||
+            strcmp(h.produced_graphics_version, s->graphics_version) ||
+            h.produced_timestamp > now + 5 || h.produced_timestamp + UPDATE_HEALTH_SECONDS < s->deadline ||
+            kill((pid_t)h.session_id, 0) < 0 || !h.d3d12_helper_active || !h.mutter_active ||
+            !h.shared_path_initialized || !h.encoder_initialized || !h.native_d3d12_shared ||
+            !h.gpu_copy || h.cpu_copy || h.cpu_conversion || h.framebuffer_mmap ||
+            h.cpu_memcpy_framebuffer || h.gpu_cpu_gpu || h.stale_frames || h.mismatches ||
+            h.encode_failures) return -1;
+        if (!strcmp(h.configured_resolution, "3840x2160@60") &&
+            strcmp(h.produced_resolution, "3840x2160@60")) return -1;
+    }
     return 0;
 }
 
@@ -1514,8 +1598,7 @@ static int apply_update(const char *txid)
         strcmp(os, m.os) != 0 || verify_payload(&m, stage, files, file_count) < 0) {
         snprintf(s.error, sizeof(s.error), "verification_failed"); strcpy(s.state, "failed"); write_state(&s); goto done;
     }
-    for (int i = 0; i < m.file_count; i++)
-        if (strncmp(m.files[i].path, "graphics/", 9) != 0) { runtime_payload_present = 1; break; }
+    runtime_payload_present = !strcmp(m.kind, "runtime");
     if (!m.allow_downgrade && current_target(old_target, sizeof(old_target)) == 0) {
         if (read_current_version(current_version, sizeof(current_version)) < 0 ||
             version_cmp(m.version, current_version) < 0) {
@@ -1874,7 +1957,7 @@ static int watch_main(void)
             write_state(&s);
         } else if (read_state(&s) == 0 && (!strcmp(s.state, "reboot_pending") || !strcmp(s.state, "health_check"))) {
             if (!strcmp(s.state, "reboot_pending")) { strcpy(s.state, "health_check"); s.deadline = (uint64_t)time(NULL) + UPDATE_HEALTH_SECONDS; write_state(&s); }
-            if (health_check() == 0) { strcpy(s.state, "committed"); s.error[0] = 0; write_state(&s); }
+            if (health_check(&s) == 0) { strcpy(s.state, "committed"); s.error[0] = 0; write_state(&s); }
             else if (s.deadline && (uint64_t)time(NULL) >= s.deadline) rollback_update();
         }
         sleep(2);
@@ -1909,7 +1992,21 @@ int main(int argc, char **argv)
     if (argc >= 2 && !strcmp(argv[1], "--submit") && argc == 3) return submit_apply(argv[2]);
     if (argc >= 2 && !strcmp(argv[1], "--apply") && argc == 3) return apply_update(argv[2]);
     if (argc >= 2 && !strcmp(argv[1], "--rollback") && argc == 2) return rollback_update();
-    if (argc >= 2 && !strcmp(argv[1], "--status") && argc == 3) { UpdateState s; if (read_state(&s) < 0 || strcmp(s.txid, argv[2])) return 1; printf("%s\n", s.state); return 0; }
+    if (argc >= 2 && !strcmp(argv[1], "--status") && argc == 3) {
+        UpdateState s;
+        int progress = 0;
+        if (read_state(&s) < 0 || strcmp(s.txid, argv[2])) return 1;
+        if (!strcmp(s.state, "receiving")) progress = 10;
+        else if (!strcmp(s.state, "received")) progress = 75;
+        else if (!strcmp(s.state, "apply_requested")) progress = 80;
+        else if (!strcmp(s.state, "verified")) progress = 82;
+        else if (!strcmp(s.state, "activating")) progress = 85;
+        else if (!strcmp(s.state, "reboot_pending") || !strcmp(s.state, "health_check")) progress = 90;
+        else if (!strcmp(s.state, "committed")) progress = 100;
+        printf("state=%s;reboot_required=%d;progress=%d\n", s.state,
+               s.reboot_required ? 1 : 0, progress);
+        return 0;
+    }
     if (argc >= 2 && !strcmp(argv[1], "--cancel") && argc == 3) {
         UpdateState s; char bundle[PATH_MAX], part[PATH_MAX]; int l = update_lock();
         if (l < 0 || read_state(&s) < 0 || strcmp(s.txid, argv[2])) { if (l >= 0) close(l); return 1; }

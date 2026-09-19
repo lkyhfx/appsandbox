@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: MIT
  *
- * D3D12 shared RGBA/BGRA texture -> GPU NV12 -> D3D12 HEVC encode probe.
+ * D3D12 shared RGBA/BGRA texture -> GPU NV12 -> D3D12 HEVC encoder.
  *
- * The existing cross-process share probe is included deliberately: this keeps
+ * The existing cross-process share transport is included deliberately: this keeps
  * the SCM_RIGHTS, eventfd, independent exec, and triple-buffer protocol
  * identical while replacing only the consumer GPU operation.
  */
@@ -24,11 +24,14 @@
 #undef main
 
 #include <algorithm>
+#include <ctime>
 #include <fstream>
 #include <limits>
 #include <memory>
 #include <ostream>
+#include <string>
 #include <vector>
+#include <unistd.h>
 
 #include "display_protocol.h"
 
@@ -41,7 +44,7 @@ constexpr UINT kFrameRateNumerator = 60;
 constexpr UINT kFrameRateDenominator = 1;
 constexpr UINT64 kBitstreamCapacity = 8ULL * 1024ULL * 1024ULL;
 
-/* Standalone probes keep their historical 4K/3600 validation workload. The
+/* Standalone diagnostics keep their historical 4K/3600 validation workload. The
  * production encoder overwrites these dimensions from Mutter's resource
  * bundle before constructing any D3D12 video objects. */
 static std::uint32_t kWidth = 3840;
@@ -57,7 +60,15 @@ static void publish_production_health(bool production, std::uint32_t width,
     std::ofstream health(temporary, std::ios::trunc);
     if (!health)
         return;
-    health << "encoder_initialized=" << (ready ? 1 : 0) << "\n"
+    std::ifstream marker("/opt/wsl-mesa/current/GRAPHICS");
+    std::string graphics_version;
+    std::getline(marker, graphics_version);
+    if (!marker || graphics_version.empty())
+        return;
+    health << "graphics_version=" << graphics_version << "\n"
+           << "session_id=" << static_cast<long>(getpid()) << "\n"
+           << "timestamp=" << static_cast<long long>(std::time(nullptr)) << "\n"
+           << "encoder_initialized=" << (ready ? 1 : 0) << "\n"
            << "native_d3d12_shared=" << (ready ? 1 : 0) << "\n"
            << "gpu_copy=" << (ready ? 1 : 0) << "\n"
            << "cpu_copy=0\n"

@@ -1,9 +1,9 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: AppSandbox contributors <appsandbox@example.invalid>
 Date: Fri, 18 Sep 2026 00:00:00 +0800
-Subject: [PATCH] d3d12: opt-in native shared ring for the Mutter probe
+Subject: [PATCH] d3d12: native AppSandbox shared ring for Mutter
 
-This patch is for the isolated experiment only.  It is deliberately gated by
+This patch is enabled only for the AppSandbox D3D12 display path. It is gated by
 ASB_MUTTER_D3D12_SHARE_SOCKET and is not used by appsandbox-display.
 
 Hook points:

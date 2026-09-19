@@ -31,6 +31,7 @@ param(
   [ValidateSet('x64','ARM64')][string]$Platform = 'x64',
   [string]$OS            = 'win',   # OS token in the zip name; not passed to MSBuild
   [string]$Version       = '',     # empty => read from Directory.Build.props (single source)
+  [string]$PublicKeyHex  = '',     # release Ed25519 public key; defaults to ASB_RELEASE_PUBLIC_KEY_HEX
   [switch]$NoBuild,
   [switch]$BuildOnly,
   [switch]$SkipDrivers,
@@ -100,6 +101,61 @@ function Get-AsbVersion([string]$repoRoot) {
     if (-not $pg) { return $null }
     $p = @("$($pg.AsbVersionMajor)", "$($pg.AsbVersionMinor)", "$($pg.AsbVersionPatch)", "$($pg.AsbVersionRevision)") | ForEach-Object { $_.Trim() }
     return [pscustomobject]@{ Short = ($p[0..2] -join '.'); Full = ($p -join '.') }
+}
+
+function Get-ReleaseLinuxTrust([string]$repoRoot) {
+    $root = Join-Path $repoRoot 'release\resources\linux'
+    $updater = Join-Path $root 'updater\appsandbox-guest-updater'
+    $verifier = Join-Path $root 'updater\appsandbox-guest-bundle-verifier.exe'
+    $required = @(
+        'guest-runtime.version',
+        'updater\appsandbox-guest-updater',
+        'updater\appsandbox-guest-updater.sha256',
+        'updater\appsandbox-guest-updater.service',
+        'updater\appsandbox-guest-update-watch.service',
+        'updater\trusted-public-key.hex',
+        'updater\appsandbox-guest-bundle-verifier.exe',
+        'updater\appsandbox-guest-bundle-verifier.exe.sha256',
+        'systemd', 'agent-src', 'asb_drm-src', 'dxgkrnl-src',
+        'modprobe.d-asb_drm.conf', '50-appsandbox-gpu', 'org.gnome.Shell-no-gpu.conf', 'appsandbox-gpu',
+        'wsl-mesa.tar.zst'
+    )
+    $missing = @($required | Where-Object { -not (Test-Path (Join-Path $root $_)) })
+    if ($missing.Count) { throw "Guest Update release tree is incomplete: $($missing -join ', ')" }
+    $key = (Get-Content (Join-Path $root 'updater\trusted-public-key.hex') -Raw).Trim()
+    if ($key -notmatch '^[0-9a-fA-F]{64}$' -or $key -match '^0+$') { throw 'trusted-public-key.hex is missing or malformed.' }
+    function Read-Sidecar([string]$artifact, [string]$sidecar) {
+        $actual = (Get-FileHash $artifact -Algorithm SHA256).Hash.ToLowerInvariant()
+        $declared = ((Get-Content $sidecar -Raw) -split '\s+')[0].ToLowerInvariant()
+        if ($declared -notmatch '^[0-9a-f]{64}$' -or $declared -ne $actual) { throw "SHA256 sidecar mismatch: $sidecar" }
+        return $actual
+    }
+    return [pscustomobject]@{
+        Updater = Read-Sidecar $updater (Join-Path $root 'updater\appsandbox-guest-updater.sha256')
+        Verifier = Read-Sidecar $verifier (Join-Path $root 'updater\appsandbox-guest-bundle-verifier.exe.sha256')
+    }
+}
+
+function Ensure-LinuxReleaseTree([string]$repoRoot) {
+    $root = Join-Path $repoRoot 'release\resources\linux'
+    $keyPath = Join-Path $root 'updater\trusted-public-key.hex'
+    $key = if ($PublicKeyHex) { $PublicKeyHex } elseif ($env:ASB_RELEASE_PUBLIC_KEY_HEX) { $env:ASB_RELEASE_PUBLIC_KEY_HEX } elseif (Test-Path $keyPath) { (Get-Content $keyPath -Raw).Trim() } else { '' }
+    if ($key -notmatch '^[0-9a-fA-F]{64}$' -or $key -match '^0+$') { throw 'A non-test ASB_RELEASE_PUBLIC_KEY_HEX is required to build Linux release artifacts.' }
+    if ((Test-Path (Join-Path $root 'updater\appsandbox-guest-updater')) -and
+        (Test-Path (Join-Path $root 'updater\appsandbox-guest-bundle-verifier.exe'))) { return }
+    $wsl = Get-Command wsl.exe -ErrorAction SilentlyContinue
+    if (-not $wsl) { throw 'Linux release artifacts are missing and wsl.exe is unavailable.' }
+    New-Item -ItemType Directory -Force -Path (Split-Path $keyPath) | Out-Null
+    Set-Content -NoNewline -Path $keyPath -Value $key
+    $drive = $repoRoot.Substring(0, 1).ToLowerInvariant()
+    $wslRepo = '/mnt/' + $drive + $repoRoot.Substring(2).Replace('\', '/')
+    & $wsl.Source -- make -C ("$wslRepo/tools/linux") ("PUBLIC_KEY_HEX=$key")
+    if ($LASTEXITCODE -ne 0) { throw "Linux release build failed (exit $LASTEXITCODE)." }
+    $dist = Join-Path $repoRoot 'tools\linux\dist'
+    if (-not (Test-Path $dist)) { throw 'Linux release build did not produce tools/linux/dist.' }
+    robocopy $dist $root /E | Out-Null
+    if ($LASTEXITCODE -ge 8) { throw "Copying Linux release artifacts failed (exit $LASTEXITCODE)." }
+    $global:LASTEXITCODE = 0
 }
 
 # A smart-card cert stays in the store with HasPrivateKey=$true even after the YubiKey is unplugged,
@@ -243,13 +299,15 @@ $asb = Get-AsbVersion $repo
 if (-not $asb) { throw "Could not read the version from Directory.Build.props under $repo." }
 if (-not $Version) { $Version = $asb.Short }
 Write-Host "Release version: $Version  (DriverVer $($asb.Full), source: Directory.Build.props)"
+Ensure-LinuxReleaseTree $repo
+$linuxTrust = Get-ReleaseLinuxTrust $repo
 
 # ------------------------------------------------------------------- 1. build
 
 if (-not $NoBuild) {
     $msbuild = Find-MSBuild
     Write-Host "Building $Configuration|$Platform ..."
-    & $msbuild $sln /t:Build /p:Configuration=$Configuration /p:Platform=$Platform /m /v:minimal /nologo
+    & $msbuild $sln /t:Build /p:Configuration=$Configuration /p:Platform=$Platform /p:AsbBootstrapUpdaterSha256=$linuxTrust.Updater /p:AsbBundleVerifierSha256=$linuxTrust.Verifier /m /v:minimal /nologo
     if ($LASTEXITCODE -ne 0) { throw "Build failed (exit $LASTEXITCODE)." }
 } else {
     Write-Host "-NoBuild: packaging existing $bin"

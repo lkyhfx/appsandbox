@@ -32,8 +32,6 @@ class SignedBundleBehaviorTests(unittest.TestCase):
         tool("tar")
         payload = root / "payload"
         payload.mkdir()
-        (payload / "bin").mkdir()
-        (payload / "bin" / "appsandbox-agent").write_bytes(b"agent")
         (payload / "config").mkdir()
         (payload / "config" / "asb_drm.conf").write_text(
             "options asb_drm width=3840 height=2160 refresh=60\n"
@@ -63,6 +61,8 @@ class SignedBundleBehaviorTests(unittest.TestCase):
             str(payload),
             "--version",
             "1.0.1",
+            "--kind",
+            "graphics",
             "--commit",
             "test-commit",
             "--graphics-version",
@@ -90,6 +90,7 @@ class SignedBundleBehaviorTests(unittest.TestCase):
             self.assertIn("payload/graphics/wsl-mesa.tar.zst", names)
             self.assertEqual(manifest["arch"], "amd64")
             self.assertEqual(manifest["os"], "ubuntu-26.04")
+            self.assertEqual(manifest["kind"], "graphics")
             self.assertFalse(manifest["kernel_components_present"])
             verify = pathlib.Path(temp) / "manifest.json"
             sig = pathlib.Path(temp) / "manifest.sig"
@@ -181,6 +182,20 @@ class SignedBundleBehaviorTests(unittest.TestCase):
                 check=False,
             )
             self.assertNotEqual(result.returncode, 0)
+
+    def test_builder_enforces_runtime_closure_and_graphics_isolation(self):
+        spec = importlib.util.spec_from_file_location("make_bundle", MAKE_BUNDLE)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        core = set(module.REQUIRED_RUNTIME)
+        module.validate_composition("runtime", core, "")
+        with self.assertRaises(ValueError):
+            module.validate_composition("runtime", core - {"bin/appsandbox-agent"}, "")
+        with self.assertRaises(ValueError):
+            module.validate_composition("runtime", core - {"systemd/appsandbox-agent.service"}, "")
+        module.validate_composition("graphics", {"graphics/wsl-mesa.tar.zst", "config/asb_drm.conf"}, "1.0.0")
+        with self.assertRaises(ValueError):
+            module.validate_composition("graphics", {"graphics/wsl-mesa.tar.zst", "bin/appsandbox-agent"}, "1.0.0")
 
 
 if __name__ == "__main__":

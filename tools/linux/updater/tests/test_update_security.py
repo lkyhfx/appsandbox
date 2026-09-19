@@ -56,6 +56,18 @@ class UpdateSecurityContractTests(unittest.TestCase):
         self.assertIn("$(DISTDIR)/agent-src", linux_make)
         self.assertIn("$(DISTDIR)/dxgkrnl-src", linux_make)
 
+    def test_release_build_builds_and_pins_host_verifier(self):
+        linux_make = (ROOT.parents[2] / "tools" / "linux" / "Makefile").read_text(
+            encoding="utf-8", errors="replace")
+        updater_make = (ROOT / "Makefile").read_text(encoding="utf-8", errors="replace")
+        release = (ROOT.parents[2] / "tools" / "sign" / "make-release.ps1").read_text(
+            encoding="utf-8", errors="replace")
+        self.assertIn("host-verifier", linux_make)
+        self.assertIn("appsandbox-guest-bundle-verifier.exe.sha256", linux_make)
+        self.assertIn("GOOS=$(HOST_GOOS)", updater_make)
+        self.assertIn("AsbBundleVerifierSha256", release)
+        self.assertIn("Guest Update release tree is incomplete", release)
+
     def test_activation_metadata_is_durable_before_live_switch(self):
         self.assertIn('strcpy(s.state, "activating")', SOURCE)
         self.assertIn('old_runtime_target', SOURCE)
