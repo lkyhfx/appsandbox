@@ -148,7 +148,7 @@ int main(int argc, char **argv)
         char output_text[32];
         std::snprintf(output_text, sizeof(output_text), "%d", output_pair[0]);
         setenv("ASB_D3D12_ENCODED_FD", output_text, 1);
-        bool ok = encode_consumer_main(publisher);
+        bool ok = encode_consumer_main(publisher, EncodeProbeMode::Hevc420);
         unsetenv("ASB_D3D12_ENCODED_FD");
         close(publisher);
         shutdown(output_pair[0], SHUT_RDWR);

@@ -25,13 +25,19 @@ ring while Mutter owns the render target.  This is the explicitly allowed
 second-priority path; the direct shared render-target path remains a separate
 optimization after this evidence is collected.
 
+For producer isolation, `ASB_D3D12_COPY_PROBE` selects a one-frame diagnostic
+mode (`ring-only`, `barrier-only`, `local-copy`, `shared-copy-no-consumer`, or
+`shared-copy-consumer`). The probe submits a diagnostic fence on the same
+command queue and records `GetDeviceRemovedReason()` after completion. The
+environment variable is intentionally ignored when unset.
+
 ---
  src/gallium/drivers/d3d12/d3d12_context.h            |   1 +
  src/gallium/drivers/d3d12/d3d12_context_common.cpp   |   6 +
- src/gallium/drivers/d3d12/d3d12_appsandbox_share.cpp | 434 ++++++++++++++++++++++++
+ src/gallium/drivers/d3d12/d3d12_appsandbox_share.cpp | 687 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++
  src/gallium/drivers/d3d12/d3d12_appsandbox_share.h |  15 +
  src/gallium/drivers/d3d12/meson.build                |   1 +
- 5 files changed, 457 insertions(+)
+ 5 files changed, 710 insertions(+)
 
 diff --git a/src/gallium/drivers/d3d12/d3d12_appsandbox_share.h b/src/gallium/drivers/d3d12/d3d12_appsandbox_share.h
 new file mode 100644
@@ -112,7 +118,7 @@ new file mode 100644
 index 0000000..0000000
 --- /dev/null
 +++ b/src/gallium/drivers/d3d12/d3d12_appsandbox_share.cpp
-@@ -0,0 +1,435 @@
+@@ -0,0 +1,687 @@
 +/* SPDX-License-Identifier: MIT */
 +
 +#include "d3d12_appsandbox_share.h"
@@ -156,6 +162,16 @@ index 0000000..0000000
 +constexpr uint32_t kSlotCount = 3;
 +/* Production dimensions come from the actual Mutter render target. */
 +constexpr int kPollTimeoutMs = 0;
++constexpr int kDiagnosticTimeoutMs = 10000;
++
++enum class CopyProbeMode {
++   None,
++   RingOnly,
++   BarrierOnly,
++   LocalCopy,
++   SharedCopyNoConsumer,
++   SharedCopyConsumer,
++};
 +
 +struct ResourceBundle {
 +   uint32_t magic, type, width, height, slots, frames;
@@ -194,6 +210,14 @@ index 0000000..0000000
 +   uint64_t copy_start_ns = 0;
 +   std::vector<uint64_t> gpu_copy_us;
 +   std::vector<uint64_t> slot_recycle_us;
++   ComPtr<ID3D12Resource> diagnostic_destination;
++   ComPtr<ID3D12Fence> diagnostic_fence;
++   int diagnostic_resource_fd = -1;
++   int diagnostic_event_fd = -1;
++   uint64_t diagnostic_value = 0;
++   CopyProbeMode probe_mode = CopyProbeMode::None;
++   bool diagnostic_pending = false;
++   bool diagnostic_done = false;
 +   bool initialized = false;
 +   bool pending = false;
 +};
@@ -201,6 +225,38 @@ index 0000000..0000000
 +static bool hook_logged = false;
 +static bool empty_hook_logged = false;
 +static bool ensure_logged = false;
++
++static CopyProbeMode copy_probe_mode()
++{
++   const char *value = getenv("ASB_D3D12_COPY_PROBE");
++   if (!value || !value[0])
++      return CopyProbeMode::None;
++   if (!strcmp(value, "ring-only"))
++      return CopyProbeMode::RingOnly;
++   if (!strcmp(value, "barrier-only"))
++      return CopyProbeMode::BarrierOnly;
++   if (!strcmp(value, "local-copy"))
++      return CopyProbeMode::LocalCopy;
++   if (!strcmp(value, "shared-copy-no-consumer"))
++      return CopyProbeMode::SharedCopyNoConsumer;
++   if (!strcmp(value, "shared-copy-consumer") ||
++       !strcmp(value, "shared-copy+consumer"))
++      return CopyProbeMode::SharedCopyConsumer;
++   return CopyProbeMode::None;
++}
++
++static const char *copy_probe_mode_name(CopyProbeMode mode)
++{
++   switch (mode) {
++   case CopyProbeMode::RingOnly: return "ring-only";
++   case CopyProbeMode::BarrierOnly: return "barrier-only";
++   case CopyProbeMode::LocalCopy: return "local-copy";
++   case CopyProbeMode::SharedCopyNoConsumer: return "shared-copy-no-consumer";
++   case CopyProbeMode::SharedCopyConsumer: return "shared-copy-consumer";
++   case CopyProbeMode::None: break;
++   }
++   return "none";
++}
 +
 +static uint64_t now_ns()
 +{
@@ -293,6 +349,147 @@ index 0000000..0000000
 +{
 +   return SUCCEEDED(fence->SetEventOnCompletion(
 +      value, reinterpret_cast<HANDLE>(static_cast<intptr_t>(fd))));
++}
++
++static bool ensure_diagnostic_destination(struct d3d12_context *ctx,
++                                           struct d3d12_resource *source,
++                                           AppsandboxShare *share,
++                                           bool shared)
++{
++   if (share->diagnostic_destination)
++      return true;
++   struct d3d12_screen *screen = d3d12_screen(ctx->base.screen);
++   const D3D12_RESOURCE_DESC desc =
++      d3d12_resource_resource(source)->GetDesc();
++   D3D12_HEAP_PROPERTIES heap = {};
++   heap.Type = D3D12_HEAP_TYPE_DEFAULT;
++   heap.CreationNodeMask = 1;
++   heap.VisibleNodeMask = 1;
++   const D3D12_HEAP_FLAGS flags =
++      shared ? D3D12_HEAP_FLAG_SHARED : D3D12_HEAP_FLAG_NONE;
++   HRESULT hr = screen->dev->CreateCommittedResource(
++      &heap, flags, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
++      IID_PPV_ARGS(&share->diagnostic_destination));
++   if (FAILED(hr)) {
++      fprintf(stderr, "ASB_D3D12 copy_probe mode=%s stage=create-destination "
++                   "status=fail hr=0x%08x shared=%u\n",
++                   copy_probe_mode_name(share->probe_mode),
++                   static_cast<unsigned>(hr), shared ? 1U : 0U);
++      return false;
++   }
++   if (shared) {
++      HANDLE raw = nullptr;
++      hr = screen->dev->CreateSharedHandle(
++         share->diagnostic_destination.Get(), nullptr, GENERIC_ALL, nullptr,
++         &raw);
++      const int fd = static_cast<int>(reinterpret_cast<intptr_t>(raw));
++      if (FAILED(hr) || fd < 0) {
++         fprintf(stderr, "ASB_D3D12 copy_probe mode=%s stage=export-destination "
++                      "status=fail hr=0x%08x fd=%d\n",
++                      copy_probe_mode_name(share->probe_mode),
++                      static_cast<unsigned>(hr), fd);
++         if (raw && fd >= 0)
++            close(fd);
++         share->diagnostic_destination.Reset();
++         return false;
++      }
++      share->diagnostic_resource_fd = fd;
++   }
++   return true;
++}
++
++static bool record_diagnostic_copy(struct d3d12_context *ctx,
++                                   struct d3d12_resource *source,
++                                   AppsandboxShare *share,
++                                   bool shared)
++{
++   if (!ensure_diagnostic_destination(ctx, source, share, shared))
++      return false;
++   d3d12_transition_resource_state(ctx, source,
++                                   D3D12_RESOURCE_STATE_COPY_SOURCE,
++                                   D3D12_TRANSITION_FLAG_INVALIDATE_BINDINGS);
++   d3d12_apply_resource_states(ctx, false);
++   D3D12_RESOURCE_BARRIER barrier = {};
++   barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++   barrier.Transition.pResource = share->diagnostic_destination.Get();
++   barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++   barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
++   barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
++   ctx->cmdlist->ResourceBarrier(1, &barrier);
++   ctx->cmdlist->CopyResource(share->diagnostic_destination.Get(),
++                              d3d12_resource_resource(source));
++   barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
++   barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
++   ctx->cmdlist->ResourceBarrier(1, &barrier);
++   d3d12_transition_resource_state(ctx, source,
++                                   D3D12_RESOURCE_STATE_RENDER_TARGET,
++                                   D3D12_TRANSITION_FLAG_INVALIDATE_BINDINGS);
++   d3d12_apply_resource_states(ctx, false);
++   ctx->has_commands = true;
++   return true;
++}
++
++static bool record_diagnostic_barrier(struct d3d12_context *ctx,
++                                      struct d3d12_resource *source)
++{
++   d3d12_transition_resource_state(ctx, source,
++                                   D3D12_RESOURCE_STATE_COPY_SOURCE,
++                                   D3D12_TRANSITION_FLAG_INVALIDATE_BINDINGS);
++   d3d12_apply_resource_states(ctx, false);
++   d3d12_transition_resource_state(ctx, source,
++                                   D3D12_RESOURCE_STATE_RENDER_TARGET,
++                                   D3D12_TRANSITION_FLAG_INVALIDATE_BINDINGS);
++   d3d12_apply_resource_states(ctx, false);
++   ctx->has_commands = true;
++   return true;
++}
++
++static void run_diagnostic_fence(struct d3d12_context *ctx,
++                                 AppsandboxShare *share)
++{
++   struct d3d12_screen *screen = d3d12_screen(ctx->base.screen);
++   if (!share->diagnostic_fence) {
++      const HRESULT create_hr = screen->dev->CreateFence(
++         0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&share->diagnostic_fence));
++      if (FAILED(create_hr)) {
++         const HRESULT removed_reason = screen->dev->GetDeviceRemovedReason();
++         fprintf(stderr, "ASB_D3D12 copy_probe mode=%s status=fail "
++                      "stage=create-diagnostic-fence hr=0x%08x "
++                      "removed_reason=0x%08x\n",
++                      copy_probe_mode_name(share->probe_mode),
++                      static_cast<unsigned>(create_hr),
++                      static_cast<unsigned>(removed_reason));
++         share->diagnostic_done = true;
++         return;
++      }
++   }
++   share->diagnostic_event_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
++   const uint64_t value = ++share->diagnostic_value;
++   HRESULT signal_hr = screen->cmdqueue->Signal(share->diagnostic_fence.Get(), value);
++   bool completion_ok = false;
++   if (SUCCEEDED(signal_hr) && share->diagnostic_event_fd >= 0 &&
++       set_completion(share->diagnostic_fence.Get(), value,
++                      share->diagnostic_event_fd)) {
++      struct pollfd pfd = {share->diagnostic_event_fd, POLLIN, 0};
++      int result;
++      do
++         result = poll(&pfd, 1, kDiagnosticTimeoutMs);
++      while (result < 0 && errno == EINTR);
++      eventfd_t event_value = 0;
++      completion_ok = result > 0 && (pfd.revents & POLLIN) &&
++                      eventfd_read(share->diagnostic_event_fd, &event_value) == 0 &&
++                      event_value != 0;
++   }
++   const HRESULT removed_reason = screen->dev->GetDeviceRemovedReason();
++   const bool ok = SUCCEEDED(signal_hr) && completion_ok &&
++                   removed_reason == S_OK;
++   fprintf(stderr, "ASB_D3D12 copy_probe mode=%s status=%s signal_hr=0x%08x "
++                "completion=%s removed_reason=0x%08x\n",
++                copy_probe_mode_name(share->probe_mode), ok ? "pass" : "fail",
++                static_cast<unsigned>(signal_hr), completion_ok ? "pass" : "fail",
++                static_cast<unsigned>(removed_reason));
++   close_fd(share->diagnostic_event_fd);
++   share->diagnostic_done = true;
 +}
 +
 +static bool connect_share(AppsandboxShare *share)
@@ -462,13 +659,58 @@ index 0000000..0000000
 +   return true;
 +}
 +
++static bool record_copy_probe(struct d3d12_context *ctx,
++                              struct d3d12_resource *source,
++                              AppsandboxShare *share)
++{
++   if (share->diagnostic_done)
++      return false;
++   switch (share->probe_mode) {
++   case CopyProbeMode::RingOnly:
++      if (!ensure_ring(ctx, source, share))
++         return false;
++      /* Submit an otherwise empty list so the fence samples this queue. */
++      ctx->has_commands = true;
++      share->diagnostic_pending = true;
++      return true;
++   case CopyProbeMode::BarrierOnly:
++      if (!record_diagnostic_barrier(ctx, source))
++         return false;
++      share->diagnostic_pending = true;
++      return true;
++   case CopyProbeMode::LocalCopy:
++      if (!record_diagnostic_copy(ctx, source, share, false))
++         return false;
++      share->diagnostic_pending = true;
++      return true;
++   case CopyProbeMode::SharedCopyNoConsumer:
++      if (!record_diagnostic_copy(ctx, source, share, true))
++         return false;
++      share->diagnostic_pending = true;
++      return true;
++   case CopyProbeMode::SharedCopyConsumer:
++      if (!record_copy(ctx, source, share))
++         return false;
++      share->diagnostic_pending = true;
++      return true;
++   case CopyProbeMode::None:
++      break;
++   }
++   return false;
++}
++
 +} // namespace
 +
 +bool d3d12_appsandbox_share_record(struct d3d12_context *ctx)
 +{
 +   const char *display = getenv("ASB_D3D12_DISPLAY");
++   const CopyProbeMode requested_mode = copy_probe_mode();
++   const bool needs_consumer =
++      requested_mode == CopyProbeMode::None ||
++      requested_mode == CopyProbeMode::RingOnly ||
++      requested_mode == CopyProbeMode::SharedCopyConsumer;
 +   if (!display || strcmp(display, "1") != 0 ||
-+       access("/run/appsandbox/display-d3d12.sock", F_OK) != 0)
++       (needs_consumer && access("/run/appsandbox/display-d3d12.sock", F_OK) != 0))
 +      return false;
 +   void *cbuf_texture = (void *)ctx->fb.cbufs[0].texture;
 +   if (cbuf_texture && !hook_logged) {
@@ -485,40 +727,54 @@ index 0000000..0000000
 +   if (!ctx->fb.cbufs[0].texture)
 +      return false;
 +   auto **state = reinterpret_cast<AppsandboxShare **>(&ctx->appsandbox_share);
-+   if (!*state)
++   if (!*state) {
 +      *state = new AppsandboxShare();
++      (*state)->probe_mode = requested_mode;
++      if (requested_mode != CopyProbeMode::None)
++         fprintf(stderr, "ASB_D3D12 copy_probe mode=%s stage=begin one_frame=1\n",
++                      copy_probe_mode_name(requested_mode));
++   }
 +   struct d3d12_resource *source = d3d12_resource(ctx->fb.cbufs[0].texture);
++   if ((*state)->probe_mode != CopyProbeMode::None)
++      return record_copy_probe(ctx, source, *state);
 +   return record_copy(ctx, source, *state);
 +}
 +
 +void d3d12_appsandbox_share_publish(struct d3d12_context *ctx)
 +{
 +   auto *share = reinterpret_cast<AppsandboxShare *>(ctx->appsandbox_share);
-+   if (!share || !share->pending)
++   if (!share)
 +      return;
 +   struct d3d12_screen *screen = d3d12_screen(ctx->base.screen);
-+   if (share->copy_start_ns != 0)
-+      share->gpu_copy_us.push_back((now_ns() - share->copy_start_ns) / 1000);
-+   const uint64_t value = share->frame + 1;
-+   if (FAILED(screen->cmdqueue->Signal(share->fence.Get(), value)) ||
-+       !set_completion(share->fence.Get(), value,
-+                       share->slots[share->pending_slot].ready_fd)) {
-+      debug_printf("ASB_D3D12 blocker=producer-eventfd-sync\n");
++   if (share->pending) {
++      if (share->copy_start_ns != 0)
++         share->gpu_copy_us.push_back((now_ns() - share->copy_start_ns) / 1000);
++      const uint64_t value = share->frame + 1;
++      const bool ready_ok =
++         SUCCEEDED(screen->cmdqueue->Signal(share->fence.Get(), value)) &&
++         set_completion(share->fence.Get(), value,
++                        share->slots[share->pending_slot].ready_fd);
++      if (!ready_ok) {
++         debug_printf("ASB_D3D12 blocker=producer-eventfd-sync\n");
++      } else {
++         const uint8_t expected_r = 31U;
++         const uint8_t expected_g = 127U;
++         const uint8_t expected_b = 223U;
++         FrameInfo info = {kMagic, kFrameInfo, share->frame, share->pending_slot,
++                           ((share->frame + 1) % 120) == 0 ? 1U : 0U,
++                           now_ns(),
++                           expected_r, expected_g, expected_b, 255,
++                           1};
++         if (!send_fds(share->socket_fd, &info, sizeof(info), {}))
++            debug_printf("ASB_D3D12 blocker=consumer-control-socket\n");
++         ++share->frame;
++      }
 +      share->pending = false;
-+      return;
 +   }
-+   const uint8_t expected_r = 31U;
-+   const uint8_t expected_g = 127U;
-+   const uint8_t expected_b = 223U;
-+   FrameInfo info = {kMagic, kFrameInfo, share->frame, share->pending_slot,
-+                     ((share->frame + 1) % 120) == 0 ? 1U : 0U,
-+                     now_ns(),
-+                     expected_r, expected_g, expected_b, 255,
-+                     1};
-+   if (!send_fds(share->socket_fd, &info, sizeof(info), {}))
-+      debug_printf("ASB_D3D12 blocker=consumer-control-socket\n");
-+   ++share->frame;
-+   share->pending = false;
++   if (share->diagnostic_pending) {
++      run_diagnostic_fence(ctx, share);
++      share->diagnostic_pending = false;
++   }
 +}
 +
 +void d3d12_appsandbox_share_destroy(struct d3d12_context *ctx)
@@ -539,6 +795,8 @@ index 0000000..0000000
 +   debug_printf("ASB_D3D12 source_resource_changes=%llu frames=%llu\n",
 +                static_cast<unsigned long long>(share->source_resource_changes),
 +                static_cast<unsigned long long>(share->frame));
++   close_fd(share->diagnostic_resource_fd);
++   close_fd(share->diagnostic_event_fd);
 +   for (Slot &slot : share->slots) {
 +      close_fd(slot.resource_fd);
 +      close_fd(slot.ready_fd);

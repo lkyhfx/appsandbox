@@ -8,7 +8,7 @@ gallium-drivers: llvmpipe,d3d12
 vulkan-drivers: swrast,microsoft-experimental
 icd-name: dzn_icd.x86_64.json
 mesa-source-commit: 7f1ccad77883be68e7750ab30b99b16df02e679d
-appsandbox-graphics-version: mesa-7f1ccad-dirty-appsandbox-1.14749ec80dcccd3d
+appsandbox-graphics-version: 0.0.0-mesa.7f1ccad7783.asb.14749ec80dcccd3d
 mesa-patchset-version: 1.14749ec80dcccd3d
 artifact-sha256: ddbcc27654bc6702c674a01173ba1a589b193485387f8d2866cdc7c89bee399f
 production-4k60: false

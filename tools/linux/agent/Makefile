@@ -138,6 +138,9 @@ d3d12-video-encode-probe: d3d12-video-encode-probe.cpp
 	       $(LDFLAGS) -L$(D3D12_LIBDIR) \
 	       $$(pkg-config --cflags --libs DirectX-Headers) -ld3d12 -ldxcore
 
+test:
+	python3 test_hevc_headers.py
+
 # Socket-facing consumer for the isolated Mutter/Mesa producer.  It includes
 # the validated encode consumer implementation but has no producer or daemon
 # integration, so the production appsandbox-display target is unchanged.
@@ -169,6 +172,7 @@ xdg-shell-protocol.c: $(WAYLAND_XDG_SHELL_XML)
 	wayland-scanner private-code $< $@
 
 .PHONY: all install install-pointer enable disable clean \
+	test \
 	d3d12-helper \
 	d3d12-native-share-probe d3d12-cross-process-share-probe \
 	d3d12-video-encode-probe d3d12-mutter-consumer \

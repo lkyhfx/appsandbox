@@ -1,20 +1,24 @@
-# AppSandbox Linux GPU display: final validation and engineering guidance
+# AppSandbox Linux GPU display: probe status and engineering guidance
 
-This directory contains the Linux guest agents and the completed GPU-PV display
-validation work for AppSandbox.
+This directory contains the Linux guest agents and the GPU-PV display probes for
+AppSandbox. The synthetic feasibility probes and the production Mutter/Mesa
+integration are tracked separately.
 
 This README is the **single source of truth for validated facts and engineering
 guidance**. Historical probe-result Markdown files have been consolidated here.
 For the production implementation plan, see
 [IMPLEMENTATION_PLAN.md](./IMPLEMENTATION_PLAN.md).
 
-## Final conclusion
+## Current conclusion
 
-The target architecture is validated end to end on the GPU-PV Linux Guest with
-an NVIDIA GeForce RTX 4070:
+The architecture feasibility probes passed on the GPU-PV Linux Guest with an
+NVIDIA GeForce RTX 4070, but the current production Mutter/Mesa integration is
+not validated. Its first real-target `CopyResource` currently ends in
+`DXGI_ERROR_DEVICE_HUNG`; isolate that producer operation before making any
+4K60 production claim.
 
 ```text
-Mutter real compositor output (RGBA8)
+Mutter real compositor output (RGBA8) [production path under investigation]
         |
         | GPU CopyResource
         v
@@ -35,7 +39,7 @@ D3D12 Video Encode
         |
         | HEVC
         v
-valid 3840x2160 stream
+historical feasibility 3840x2160 stream
 ```
 
 ## Secure Guest Runtime Update
@@ -67,16 +71,17 @@ line-oriented control channel never carries bundle bytes.
 `current` and `previous` select versioned runtime directories. Mesa uses the
 equivalent `/opt/wsl-mesa/releases` layout. The watchdog checks agent/display
 health and can restore both pointers if the target agent or display service
-fails, even when the host cannot reconnect. The validated 4K60 path remains
+fails, even when the host cannot reconnect. The intended 4K60 path is
 Mutter final target -> GPU-only CopyResource -> 3-slot shared D3D12 ring ->
-independent consumer -> GPU-only RGBA8/NV12 -> D3D12 HEVC. `dxgkrnl.ko` and
+independent consumer -> GPU-only RGBA8/NV12 -> D3D12 HEVC, but the current
+production producer is blocked at its first real-target copy. `dxgkrnl.ko` and
 `asb_drm.ko` are intentionally outside normal Guest Runtime updates.
 
 The checked-in Mesa tarball is explicitly marked `production-4k60: false` in
 its `BUILDINFO`; it is a legacy provisioning artifact and must be rebuilt from
 the production patchset before a signed 4K60 bundle is shipped.
 
-The final real-Mutter run validated:
+Historical feasibility-probe result (not current production evidence):
 
 ```text
 RGBA8 dxgi_format=28
@@ -101,13 +106,16 @@ mutter_session_exit=0
 consumer_exit=0
 ```
 
-This closes the architecture feasibility phase. Production work should build on
-this path instead of reopening DMA-BUF, Vulkan/CUDA, or CPU framebuffer capture
-as the primary design.
+This closes the synthetic/architecture feasibility phase only. The current
+production Mutter integration remains blocked by the real-target first-copy
+`DXGI_ERROR_DEVICE_HUNG`; the five-mode producer isolation probe is the next
+acceptance gate. Do not use the historical 3600-frame result as production
+validation.
 
 ## What "zero-copy" means here
 
-The validated claim is **zero CPU framebuffer copy / GPU-resident video path**.
+The historical feasibility claim is **zero CPU framebuffer copy / GPU-resident
+video path**. It is not yet a production acceptance result.
 
 It means:
 
@@ -119,8 +127,8 @@ It means:
 - producer and encoder are independent processes sharing native D3D12
   resources.
 
-It does **not** mean that the pipeline performs zero GPU copies. The validated
-Mutter integration currently performs one explicit GPU `CopyResource` from
+It does **not** mean that the pipeline performs zero GPU copies. The prototype
+Mutter integration attempts one explicit GPU `CopyResource` from
 the compositor-owned render target into the shared three-slot ring:
 
 ```text
@@ -128,9 +136,9 @@ Mutter private GPU target -> shared D3D12 ring
                       gpu_copy=1
 ```
 
-That copy is acceptable for the production baseline. A future direct-shared
-render target can remove it, but that optimization must not block production
-integration.
+That copy is currently the production blocker: the real-target first-copy probe
+reports `DXGI_ERROR_DEVICE_HUNG`. A future direct-shared render target can be
+considered only after the producer isolation result is understood.
 
 ## Validation summary
 
@@ -195,10 +203,12 @@ GPU producer work
 
 CPU synchronization is not a CPU framebuffer copy.
 
-### 5. Cross-process shared-resource + eventfd 4K60 gate passed
+### 5. Synthetic cross-process shared-resource + eventfd 4K60 gate passed
 
 The cross-process probe uses independent `fork+exec` producer and consumer
-roles, so the consumer does not inherit the producer D3D12 device.
+roles, so the consumer does not inherit the producer D3D12 device. This is a
+synthetic producer gate; it does not exercise the real Mutter framebuffer or
+the current Mesa Gallium command list.
 
 Validated configuration:
 
@@ -261,9 +271,12 @@ make d3d12-video-encode-probe
 ```
 
 `--capability-444` checks the real D3D12 Video HEVC Main 4:4:4 profile,
-codec configuration, AYUV input, GPU-only RGBA/BGRA -> AYUV Video Processor
-conversion, and actual 4K60 encoder creation. `--workload-444` then runs the
-existing independent producer/consumer workload for 3600 frames at 60/1 and
+driver-supported HEVC1 codec/picture configuration, AYUV input, GPU-only
+RGBA/BGRA -> AYUV Video Processor conversion, and encoder/heap creation. Its
+`hevc444_4k60_config=1` result is an object/configuration gate only;
+`hevc444_4k60_sustained` is `not-run`. `--workload-444` explicitly selects the
+probe-only `Hevc444` mode, keeps the production wrapper on `Hevc420`, runs the
+existing independent producer/consumer workload for 3600 frames at 60/1, and
 writes the diagnostic stream to:
 
 ```text
@@ -272,26 +285,56 @@ writes the diagnostic stream to:
 
 The workload reports `cpu_conversion=0`, `framebuffer_mmap=0`, and
 `cpu_memcpy_framebuffer=0`; it intentionally does not read source framebuffer
-pixels back to the CPU. It parses the produced Annex-B HEVC SPS and only
-passes the bitstream gate when `chroma_format_idc=3` and the decoded dimensions
-are 3840x2160. A `BLOCKED` result is a runtime capability fact, not a request
-to enable a fallback or change the production display protocol.
+pixels back to the CPU. `guest_sequence_header_444=1` only proves that the
+guest-owned VPS/SPS/PPS has `chroma_format_idc=3` and the expected dimensions;
+`guest_bitstream_generated=1` proves that the requested encode workload wrote
+frames without encode failures. Neither is a decoder result. The Windows host
+probe below owns actual decodability.
 
-### 7. Real Mutter output gate passed
+There are four distinct evidence levels:
 
-The isolated Mutter/Mesa integration reached the real compositor render target:
+- capability: support queries such as HEVC Main 4:4:4 and AYUV;
+- object creation: encoder/heap, decoder/heap, and processor objects;
+- actual encode/decode: completed GPU work or real `ProcessInput`/
+  `ProcessOutput` on the guest stream;
+- end-to-end path: decoded GPU-resident AYUV passed through a real
+  `VideoProcessorBlt` to RGB.
+
+The standalone Windows host probe consumes the guest stream:
+
+```text
+appsandbox-hevc444-probe.exe [--adapter <index>] <path-to-hevc444-stream>
+```
+
+It tests every enumerated hardware HEVC MFT independently. `HEVC444_PATH=MF`
+is allowed only after real hardware decode succeeds, an `IMFDXGIBuffer` yields
+an `ID3D11Texture2D` whose format is `DXGI_FORMAT_AYUV`, and the decoded
+surface passes the actual AYUV -> RGB `VideoProcessorBlt`. D3D12 capability or
+decoder/heap creation alone never produces `HEVC444_PATH=D3D12`; until a
+real D3D12 decode is implemented, that field is `not-tested` and the final
+path is `UNAVAILABLE` when MF does not pass. A `BLOCKED` result is a runtime
+capability fact, not a request to enable a fallback or change the production
+display protocol.
+
+### 7. Current real Mutter output gate is blocked
+
+The isolated Mutter/Mesa integration reaches the real compositor render target:
 
 ```text
 DXGI_FORMAT_R8G8B8A8_UNORM = 28
 synthetic_source=0
 ```
 
-The Mesa D3D12 hook creates a shared ring using the real source format and
-records a GPU-only `CopyResource` into that ring. The independent encoder
-process opens those resources, converts RGBA8 -> NV12 with D3D12 Video
-Processor, and encodes HEVC with D3D12 Video Encode.
+The Mesa D3D12 hook then attempts a GPU-only `CopyResource` into the shared
+ring. The current production result is:
 
-The final real-desktop result is:
+```text
+FAIL: real Mutter target first CopyResource
+DXGI_ERROR_DEVICE_HUNG
+production-4k60: false
+```
+
+The historical feasibility result is retained only as historical evidence:
 
 ```text
 PASS: real Mutter target
@@ -305,6 +348,51 @@ PASS: no stale/mismatched frames
 PASS: zero CPU framebuffer-copy conditions
 PASS: 3840x2160 / 3600-frame decode
 ```
+
+### 8. Producer `CopyResource` isolation probe
+
+Run the five one-frame modes against a real Mutter session after rebuilding the
+Mesa patch:
+
+```sh
+make d3d12-mutter-consumer
+MUTTER_TEST_CLIENT_CMD='...' \
+  ./gpu-mutter-d3d12-isolation-probe.sh gpu-mutter-d3d12-isolation-results
+```
+
+The Mesa hook selects one mode with `ASB_D3D12_COPY_PROBE` and, after the
+current command list is submitted, signals a diagnostic fence on the same
+`screen->cmdqueue`, waits for completion, and immediately logs
+`GetDeviceRemovedReason()`:
+
+```text
+ring-only                 shared ring + consumer OpenSharedHandle; no source operation
+barrier-only              real source state transition; no CopyResource
+local-copy                real source -> same-device non-shared destination
+shared-copy-no-consumer   real source -> shared destination; no consumer use
+shared-copy-consumer      current complete producer/consumer path
+```
+
+The first mode reporting a failed diagnostic fence, timeout, or
+`DXGI_ERROR_DEVICE_HUNG` identifies the failing boundary. The diagnostic
+environment variable is opt-in and does not alter the normal production path.
+
+The first real-Mutter run on the GPU Guest (Mutter 50.1, Mesa commit `7f1ccad`,
+one frame per mode) produced this boundary result:
+
+```text
+ring-only                 PASS: producer fence; consumer OpenSharedHandle
+barrier-only              PASS: producer fence; removed_reason=0x00000000
+local-copy                FAIL: completion timeout; Mutter session timed out
+shared-copy-no-consumer   FAIL: completion timeout; Mutter session timed out
+shared-copy-consumer      FAIL: completion timeout; consumer ready timed out
+```
+
+The copy-failure modes returned `removed_reason=0x00000000` at the immediate
+diagnostic read, so the hang is observable as queue completion failure before
+the device-removal reason becomes `DXGI_ERROR_DEVICE_HUNG`. This isolates the
+first failure to the real-target `CopyResource` path in the current Gallium
+command list; shared-destination and consumer ownership are downstream.
 
 ## Production engineering guidance
 
@@ -364,9 +452,9 @@ The real Mutter source is currently
 Never reinterpret one byte layout as the other. Configure the D3D12 Video
 Processor from the negotiated source format.
 
-### Keep the compositor-to-ring GPU copy for the baseline
+### Keep the compositor-to-ring GPU copy as the current probe target
 
-The validated baseline is:
+The intended baseline is:
 
 ```text
 private compositor target
@@ -375,8 +463,8 @@ private compositor target
 ```
 
 Do not first redesign Mutter allocation to make its render target directly
-shared. Direct sharing is a later optimization after the production pipeline is
-stable and measured.
+shared. First isolate the current real-target copy failure; direct sharing is a
+later optimization only if the producer path is stable and measured.
 
 ### Keep bitstream/metadata CPU visibility separate from framebuffer copying
 
@@ -436,6 +524,8 @@ The validated behavior is represented by these implementation/probe sources:
 - `d3d12-video-encode-probe.cpp` — D3D12 Video Processor + HEVC encode gate.
 - `d3d12-mutter-consumer.cpp` — isolated Mutter encoder consumer.
 - `gpu-mutter-d3d12-share-probe.sh` — real compositor end-to-end gate.
+- `gpu-mutter-d3d12-isolation-probe.sh` — five one-frame real-target producer
+  isolation modes with a post-submit diagnostic fence.
 - `../wsl-mesa/patches/0002-d3d12-mutter-appsandbox-share.patch` — Mesa
   D3D12 publisher prototype.
 - `mutter-appsandbox-display.patch` — deterministic AppSandbox Mutter
@@ -486,9 +576,9 @@ A change to the accelerated display pipeline must not regress these invariants:
 9. the produced stream decodes to the expected frame count and resolution;
 10. accelerated-path failure remains recoverable through explicit restart/fallback.
 
-The baseline architectural result is therefore:
+The current repository status is therefore:
 
 ```text
-PASS: Mutter -> D3D12 shared ring -> GPU NV12 -> D3D12 HEVC
-      at real 4K60 with zero CPU framebuffer copy.
+BLOCKED: Mutter real-target CopyResource -> DXGI_ERROR_DEVICE_HUNG
+         production-4k60: false; synthetic feasibility probes remain PASS.
 ```

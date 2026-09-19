@@ -79,6 +79,69 @@ int main() {
             subprocess.run(["c++", "-std=c++17", str(cpp), "-o", str(executable)], check=True)
             subprocess.run([str(executable)], check=True)
 
+    def test_picture_control_keeps_420_legacy_and_444_hevc1(self):
+        source = Path(__file__).with_name("d3d12-video-encode-probe.cpp").read_text()
+        self.assertIn("D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC1", source)
+        self.assertIn("picture.PictureControlCodecData.pHEVCPicData1", source)
+        self.assertIn("picture.PictureControlCodecData.pHEVCPicData = &picture_data", source)
+        branch = source[source.index("if (hevc444_session)") : source.index(
+            "input.SequenceControlDesc", source.index("if (hevc444_session)")
+        )]
+        self.assertIn("pHEVCPicData1", branch)
+        self.assertIn("else", branch)
+        self.assertIn("pHEVCPicData =", branch)
+
+    def test_hevc1_defaults_are_selected_from_driver_masks(self):
+        source = Path(__file__).with_name("d3d12-video-encode-probe.cpp").read_text()
+        self.assertIn("choose_hevc444_picture_defaults", source)
+        for field in (
+            "allowed_diff_cu_chroma_qp_offset_depth_values",
+            "allowed_log2_sao_offset_scale_luma_values",
+            "allowed_log2_sao_offset_scale_chroma_values",
+            "allowed_log2_max_transform_skip_block_size_minus2_values",
+            "allowed_chroma_qp_offset_list_len_minus1_values",
+            "allowed_cb_qp_offset_list_values",
+            "allowed_cr_qp_offset_list_values",
+        ):
+            self.assertIn(field, source)
+        self.assertIn("reason=no-valid-configuration", source)
+
+    def test_sequence_header_is_not_bitstream_decode_evidence(self):
+        source = Path(__file__).with_name("d3d12-video-encode-probe.cpp").read_text()
+        self.assertIn("stage=hevc444-sequence-header", source)
+        self.assertNotIn("stage=hevc444-bitstream", source)
+        self.assertIn("guest_sequence_header_444", source)
+        self.assertIn("guest_bitstream_generated", source)
+
+    def test_probe_mode_cannot_switch_production_to_444(self):
+        source = Path(__file__).with_name("d3d12-video-encode-probe.cpp").read_text()
+        production = Path(__file__).with_name("display_d3d12_encoder.cpp").read_text()
+        self.assertNotIn("ASB_D3D12_HEVC444", source)
+        self.assertIn("encode_consumer_main(publisher, EncodeProbeMode::Hevc420)", production)
+        self.assertIn("!production_session && mode == EncodeProbeMode::Hevc444", source)
+
+    def test_capability_does_not_claim_sustained_4k60(self):
+        source = Path(__file__).with_name("d3d12-video-encode-probe.cpp").read_text()
+        capability = source[source.index("static int capability_444_main") :]
+        self.assertIn("hevc444_4k60_config", capability)
+        self.assertIn("hevc444_4k60_sustained=not-run", capability)
+        self.assertNotIn("hevc444_4k60=", capability)
+
+    def test_host_requires_real_mf_decode_and_gpu_ayuv_surface(self):
+        host = Path(__file__).parents[2] / "win" / "hevc444-probe" / "hevc444-probe.cpp"
+        source = host.read_text()
+        for token in (
+            "ProcessInput",
+            "ProcessOutput",
+            "IMFDXGIBuffer",
+            "DXGI_FORMAT_AYUV",
+            "VideoProcessorBlt",
+            "HEVC444_PATH=",
+        ):
+            self.assertIn(token, source)
+        self.assertIn("d3d12_actual_decode=not-tested", source)
+        self.assertIn("const bool d3d12_path = false", source)
+
 
 if __name__ == "__main__":
     unittest.main()

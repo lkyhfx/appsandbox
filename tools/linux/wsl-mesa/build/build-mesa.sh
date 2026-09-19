@@ -109,7 +109,12 @@ PATCHSET_HASH="$(find "$PATCH_DIR" -maxdepth 1 -type f -name '*.patch' -print0 |
 MESA_VERSION="$(git -C "$MESA_SRC" describe --tags --always --dirty 2>/dev/null || echo unknown)"
 LLVM_VERSION="$(llvm-config --version 2>/dev/null || echo unknown)"
 PATCHSET_VERSION="1.${PATCHSET_HASH:0:16}"
-GRAPHICS_VERSION="${GRAPHICS_VERSION:-mesa-${MESA_VERSION}-appsandbox-${PATCHSET_VERSION}}"
+GRAPHICS_VERSION="${GRAPHICS_VERSION:-0.0.0-mesa.${SOURCE_COMMIT:0:12}.asb.${PATCHSET_HASH:0:16}}"
+SEMVER_RE='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+if [[ ! "$GRAPHICS_VERSION" =~ $SEMVER_RE ]]; then
+    echo "ERROR: GRAPHICS_VERSION must be SemVer (got '$GRAPHICS_VERSION')." >&2
+    exit 1
+fi
 
 mkdir -p "$ARTIFACT_DIR"
 tmp_tar="$ARTIFACT_PATH.tmp.$$"
