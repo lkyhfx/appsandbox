@@ -29,6 +29,7 @@
    SPCR for early boot output; earlyprintk is x86-only. */
 #  define IP_SERIAL_A          "ttyAMA0"
 #  define IP_EARLYCON_A        "earlycon "
+#  define IP_UART_PARAMS_A     ""
 #  define IP_EARLYPRINTK_A     ""
 #else
 #  define IP_DEB_ARCH         L"amd64"
@@ -42,6 +43,7 @@
 #  define IP_D3D_LIBDIR       L"x64"
 #  define IP_SERIAL_A          "ttyS0"
 #  define IP_EARLYCON_A        ""
+#  define IP_UART_PARAMS_A     "8250_core.nr_uarts=1 8250_core.skip_txen_test=1 "
 #  define IP_EARLYPRINTK_A     "earlyprintk=ttyS0"
 #endif
 

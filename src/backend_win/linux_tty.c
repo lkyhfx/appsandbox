@@ -12,12 +12,16 @@
    the server: CreateFileW is retried until the guest/HCS side appears. */
 #define LINUX_TTY_PIPE_PREFIX L"\\\\.\\pipe\\"
 #define LINUX_TTY_RETRY_MS    250
+#define LINUX_TTY_RENDER_LIMIT (1024 * 1024)
+#define LINUX_TTY_STOP_WAIT_MS 5000
 
 typedef struct LinuxTtyCapture {
     HANDLE stop_event;
+    HANDLE ready_event;
     HANDLE thread;
     HANDLE tty_file;
     volatile HANDLE pipe;
+    volatile LONG references; /* VM owner, reader thread, start waiter */
 
     wchar_t vm_name[256];
     wchar_t pipe_name[512];
@@ -29,9 +33,20 @@ typedef struct LinuxTtyCapture {
     size_t line_len;
     size_t line_cap;
     BOOL pending_cr;
+    BOOL line_discarded;
+    uint64_t raw_offset;
 } LinuxTtyCapture;
 
 static SRWLOCK g_linux_tty_lock = SRWLOCK_INIT;
+
+static void tty_release(LinuxTtyCapture *capture)
+{
+    if (InterlockedDecrement(&capture->references) == 0) {
+        CloseHandle(capture->ready_event);
+        CloseHandle(capture->stop_event);
+        free(capture);
+    }
+}
 
 static BOOL tty_is_stopping(LinuxTtyCapture *capture)
 {
@@ -84,6 +99,7 @@ static BOOL tty_append_byte(LinuxTtyCapture *capture, unsigned char byte)
     }
 
     new_cap = capture->line_cap ? capture->line_cap * 2 : 256;
+    if (new_cap > LINUX_TTY_RENDER_LIMIT) new_cap = LINUX_TTY_RENDER_LIMIT;
     if (new_cap < capture->line_cap || new_cap > SIZE_MAX / 2)
         return FALSE;
     new_line = (unsigned char *)realloc(capture->line, new_cap);
@@ -174,6 +190,11 @@ static wchar_t *tty_line_for_log(const unsigned char *line, size_t line_len)
 
 static void tty_emit_line(LinuxTtyCapture *capture)
 {
+    if (capture->line_discarded) {
+        capture->line_discarded = FALSE;
+        capture->line_len = 0;
+        return;
+    }
     wchar_t *line = tty_line_for_log(capture->line, capture->line_len);
     if (line) {
         ui_log(L"[TTY:%s] %s", capture->vm_name, line);
@@ -209,7 +230,10 @@ static void tty_process_bytes(LinuxTtyCapture *capture,
             capture->pending_cr = TRUE;
         } else if (byte == '\n') {
             tty_emit_line(capture);
-        } else if (!tty_append_byte(capture, byte)) {
+        } else if (capture->line_discarded) {
+            continue;
+        } else if (capture->line_len >= LINUX_TTY_RENDER_LIMIT ||
+                   !tty_append_byte(capture, byte)) {
             /* Do not let an unbounded guest line take down the reader.  The
                raw file is already complete; discard only the host rendering
                of this line until its next terminator. */
@@ -217,7 +241,8 @@ static void tty_process_bytes(LinuxTtyCapture *capture,
             capture->line_cap = 0;
             free(capture->line);
             capture->line = NULL;
-            ui_log(L"[TTY:%s] line buffer allocation failed; raw capture continues.",
+            capture->line_discarded = TRUE;
+            ui_log(L"[TTY:%s] <line exceeded render limit; raw bytes preserved>",
                    capture->vm_name);
         }
     }
@@ -231,14 +256,36 @@ static BOOL tty_write_raw(LinuxTtyCapture *capture,
     if (capture->tty_file == INVALID_HANDLE_VALUE) return FALSE;
     while (offset < count) {
         DWORD written = 0;
-        if (!WriteFile(capture->tty_file, bytes + offset, count - offset,
-                       &written, NULL) || written == 0) {
-            tty_log_error(capture, L"WriteFile(tty.log)", GetLastError());
+        OVERLAPPED ov = { 0 };
+        HANDLE waits[2];
+        BOOL ok;
+        DWORD error = ERROR_SUCCESS;
+        ov.Offset = (DWORD)capture->raw_offset;
+        ov.OffsetHigh = (DWORD)(capture->raw_offset >> 32);
+        ov.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+        if (!ov.hEvent) error = GetLastError();
+        if (error == ERROR_SUCCESS) {
+            ok = WriteFile(capture->tty_file, bytes + offset, count - offset,
+                           &written, &ov);
+            if (!ok && GetLastError() == ERROR_IO_PENDING) {
+                waits[0] = capture->stop_event;
+                waits[1] = ov.hEvent;
+                if (WaitForMultipleObjects(2, waits, FALSE, INFINITE) == WAIT_OBJECT_0)
+                    CancelIoEx(capture->tty_file, &ov);
+                ok = GetOverlappedResult(capture->tty_file, &ov, &written, TRUE);
+            }
+            if (!ok) error = GetLastError();
+            CloseHandle(ov.hEvent);
+        }
+        if (error != ERROR_SUCCESS || written == 0) {
+            if (!tty_is_stopping(capture))
+                tty_log_error(capture, L"WriteFile(tty.log)", error);
             CloseHandle(capture->tty_file);
             capture->tty_file = INVALID_HANDLE_VALUE;
             return FALSE;
         }
         offset += written;
+        capture->raw_offset += written;
     }
     return TRUE;
 }
@@ -254,6 +301,7 @@ static HANDLE tty_connect(LinuxTtyCapture *capture)
         pipe = CreateFileW(capture->pipe_name, GENERIC_READ,
                            FILE_SHARE_READ | FILE_SHARE_WRITE,
                            NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+        SetEvent(capture->ready_event); /* one connection attempt before HCS Start */
         if (pipe != INVALID_HANDLE_VALUE)
             return pipe;
 
@@ -342,12 +390,24 @@ static DWORD WINAPI tty_thread_proc(LPVOID parameter)
     LinuxTtyCapture *capture = (LinuxTtyCapture *)parameter;
     unsigned char buffer[16 * 1024];
 
+    /* Opening a log on a slow or unavailable VM disk never holds the global
+       capture lock. The stop caller can detach after its bounded wait. */
+    capture->tty_file = CreateFileW(capture->tty_path, GENERIC_WRITE,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE |
+                                    FILE_SHARE_DELETE,
+                                    NULL, CREATE_ALWAYS,
+                                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+                                    NULL);
+    if (capture->tty_file == INVALID_HANDLE_VALUE && !tty_is_stopping(capture))
+        tty_log_error(capture, L"CreateFile(tty.log)", GetLastError());
+
     while (!tty_is_stopping(capture)) {
         HANDLE pipe = tty_connect(capture);
         DWORD count = 0;
 
         if (pipe == INVALID_HANDLE_VALUE) break;
         InterlockedExchangePointer((PVOID volatile *)&capture->pipe, pipe);
+        ui_log(L"[TTY:%s] COM1 connected", capture->vm_name);
 
         while (!tty_is_stopping(capture)) {
             if (!tty_read_once(capture, pipe, buffer, sizeof(buffer), &count))
@@ -362,6 +422,8 @@ static DWORD WINAPI tty_thread_proc(LPVOID parameter)
 
         InterlockedExchangePointer((PVOID volatile *)&capture->pipe, NULL);
         CloseHandle(pipe);
+        if (!tty_is_stopping(capture))
+            ui_log(L"[TTY:%s] COM1 disconnected; reconnecting", capture->vm_name);
     }
 
     if (capture->pending_cr)
@@ -369,10 +431,10 @@ static DWORD WINAPI tty_thread_proc(LPVOID parameter)
     free(capture->line);
     capture->line = NULL;
     if (capture->tty_file != INVALID_HANDLE_VALUE) {
-        FlushFileBuffers(capture->tty_file);
         CloseHandle(capture->tty_file);
         capture->tty_file = INVALID_HANDLE_VALUE;
     }
+    tty_release(capture);
     return 0;
 }
 
@@ -396,6 +458,7 @@ void linux_tty_start(VmInstance *instance)
 {
     LinuxTtyCapture *capture;
     HANDLE thread;
+    HANDLE waits[2];
 
     if (!instance || _wcsicmp(instance->os_type, L"Linux") != 0)
         return;
@@ -414,12 +477,16 @@ void linux_tty_start(VmInstance *instance)
         return;
     }
     capture->stop_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    capture->ready_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    capture->references = 3;
     capture->tty_file = INVALID_HANDLE_VALUE;
     wcscpy_s(capture->vm_name, ARRAYSIZE(capture->vm_name), instance->name);
 
-    if (!capture->stop_event || !tty_prepare_paths(capture, instance)) {
+    if (!capture->stop_event || !capture->ready_event ||
+        !tty_prepare_paths(capture, instance)) {
         DWORD error = GetLastError();
         if (capture->stop_event) CloseHandle(capture->stop_event);
+        if (capture->ready_event) CloseHandle(capture->ready_event);
         free(capture);
         ui_log(L"[TTY:%s] capture setup failed (error=%lu); VM continues without TTY capture.",
                instance->name, (unsigned long)error);
@@ -427,20 +494,12 @@ void linux_tty_start(VmInstance *instance)
         return;
     }
 
-    /* CREATE_ALWAYS is intentional: every VM boot gets a fresh raw stream. */
-    capture->tty_file = CreateFileW(capture->tty_path, GENERIC_WRITE,
-                                    FILE_SHARE_READ | FILE_SHARE_WRITE |
-                                    FILE_SHARE_DELETE,
-                                    NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
-                                    NULL);
-    if (capture->tty_file == INVALID_HANDLE_VALUE)
-        tty_log_error(capture, L"CreateFile(tty.log)", GetLastError());
-
     thread = CreateThread(NULL, 0, tty_thread_proc, capture, 0, NULL);
     if (!thread) {
         DWORD error = GetLastError();
         if (capture->tty_file != INVALID_HANDLE_VALUE)
             CloseHandle(capture->tty_file);
+        CloseHandle(capture->ready_event);
         CloseHandle(capture->stop_event);
         free(capture);
         ui_log(L"[TTY:%s] reader thread creation failed (error=%lu); VM continues without TTY capture.",
@@ -451,13 +510,31 @@ void linux_tty_start(VmInstance *instance)
 
     capture->thread = thread;
     instance->linux_tty_capture = capture;
+    ui_log(L"[TTY:%s] capture starting", capture->vm_name);
+    ui_log(L"[TTY:%s] pipe=%s", capture->vm_name, capture->pipe_name);
+    ui_log(L"[TTY:%s] raw_log=%s", capture->vm_name, capture->tty_path);
+    ReleaseSRWLockExclusive(&g_linux_tty_lock);
+    waits[0] = capture->ready_event;
+    waits[1] = capture->stop_event;
+    WaitForMultipleObjects(2, waits, FALSE, 1000);
+    tty_release(capture);
+}
+
+void linux_tty_transfer(VmInstance *from, VmInstance *to)
+{
+    if (!from || !to || from == to) return;
+    AcquireSRWLockExclusive(&g_linux_tty_lock);
+    if (!to->linux_tty_capture) {
+        to->linux_tty_capture = from->linux_tty_capture;
+        from->linux_tty_capture = NULL;
+    }
     ReleaseSRWLockExclusive(&g_linux_tty_lock);
 }
 
 void linux_tty_stop(VmInstance *instance)
 {
     LinuxTtyCapture *capture;
-    HANDLE pipe;
+    DWORD wait_result;
 
     if (!instance) return;
 
@@ -470,16 +547,16 @@ void linux_tty_stop(VmInstance *instance)
     }
 
     SetEvent(capture->stop_event);
-    pipe = (HANDLE)InterlockedExchangePointer(
-        (PVOID volatile *)&capture->pipe, NULL);
-    if (pipe != NULL && pipe != INVALID_HANDLE_VALUE)
-        CancelIoEx(pipe, NULL);
-
-    /* The reader owns pipe closing and final file flushing.  CancelIoEx above
-       wakes any pending overlapped ReadFile before this join. */
-    WaitForSingleObject(capture->thread, INFINITE);
-    CloseHandle(capture->thread);
-    CloseHandle(capture->stop_event);
-    free(capture);
     ReleaseSRWLockExclusive(&g_linux_tty_lock);
+
+    /* Reader owns the pipe handle. It sees stop_event and cancels pending I/O.
+       A stalled filesystem cannot hold other VMs or shutdown indefinitely. */
+    wait_result = WaitForSingleObject(capture->thread, LINUX_TTY_STOP_WAIT_MS);
+    CloseHandle(capture->thread);
+    if (wait_result == WAIT_OBJECT_0)
+        ui_log(L"[TTY:%s] capture stopped", capture->vm_name);
+    else
+        ui_log(L"[TTY:%s] stop timed out; reader will release resources on exit",
+               capture->vm_name);
+    tty_release(capture);
 }

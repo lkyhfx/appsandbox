@@ -1175,15 +1175,16 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
     }
 
     asb_log(L"Starting VM \"%s\"...", vm->name);
+    linux_tty_start(vm);
     hr = hcs_start_vm(vm);
     if (wcscmp(vm->gpu_id, args->config.gpu_id) != 0) save_vm_list();
     if (FAILED(hr)) {
+        linux_tty_stop(vm);
         asb_log(L"Error: Failed to start VM (0x%08X)", hr);
         if (hr == (HRESULT)0x800705AF)
             asb_alert(L"The host doesn't have enough resources to start this VM.");
     } else {
         asb_log(L"VM \"%s\" started.", vm->name);
-        linux_tty_start(vm);
         /* Agent + IDD probe run for any OS: hcs_service_guid() resolves
            per-OS to the correct HV-socket service GUID, and the in-VM
            agent listens on AF_HYPERV (Windows) or AF_VSOCK (Linux). */
@@ -1471,8 +1472,10 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
             goto done;
         }
 
+        linux_tty_start(&temp_inst);
         hr = hcs_start_vm(&temp_inst);
         if (FAILED(hr)) {
+            linux_tty_stop(&temp_inst);
             args->result = hr;
             swprintf_s(args->error_msg, 512, L"Failed to start VM (0x%08X)", hr);
             hcs_close_vm(&temp_inst);
@@ -1489,7 +1492,16 @@ static DWORD WINAPI vhdx_create_thread(LPVOID param)
         /* Allocate heap copy to pass to completion */
         {
             VmInstance *heap_inst = (VmInstance *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(VmInstance));
-            if (heap_inst) memcpy(heap_inst, &temp_inst, sizeof(VmInstance));
+            if (heap_inst) {
+                memcpy(heap_inst, &temp_inst, sizeof(VmInstance));
+                heap_inst->linux_tty_capture = NULL;
+                linux_tty_transfer(&temp_inst, heap_inst);
+            } else {
+                linux_tty_stop(&temp_inst);
+                hcs_close_vm(&temp_inst);
+                args->result = E_OUTOFMEMORY;
+                goto done;
+            }
             args->vm_inst = heap_inst;
         }
 
@@ -1538,6 +1550,7 @@ done:
                     inst->network_mode = heap_inst->network_mode;
                     inst->network_id = args->network_id;
                     inst->endpoint_id = args->endpoint_id;
+                    linux_tty_transfer(heap_inst, inst);
                     HeapFree(GetProcessHeap(), 0, heap_inst);
                     args->vm_inst = NULL;
                     hcs_register_vm_callback(inst);
@@ -1545,7 +1558,6 @@ done:
                 LeaveCriticalSection(&g_cs);
 
                 hcs_start_monitor(inst);
-                linux_tty_start(inst);
                 if (inst->is_template) {
                     asb_log(L"Template \"%s\" building (sysprep will shut down when ready).", inst->name);
                 } else {
@@ -1587,6 +1599,7 @@ done:
                handle copy, and don't write into a stale slot. */
             LeaveCriticalSection(&g_cs);
             if (args->vm_inst) {
+                linux_tty_stop(args->vm_inst);
                 hcs_unregister_vm_callback(args->vm_inst);
                 hcs_close_vm(args->vm_inst);
                 HeapFree(GetProcessHeap(), 0, args->vm_inst);
@@ -2642,8 +2655,10 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
             goto done;
         }
 
+        linux_tty_start(&temp_inst);
         hr = hcs_start_vm(&temp_inst);
         if (FAILED(hr)) {
+            linux_tty_stop(&temp_inst);
             args->result = hr;
             swprintf_s(args->error_msg, 512, L"Failed to start VM (0x%08X)", hr);
             hcs_close_vm(&temp_inst);
@@ -2657,7 +2672,16 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
 
         {
             VmInstance *heap_inst = (VmInstance *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(VmInstance));
-            if (heap_inst) memcpy(heap_inst, &temp_inst, sizeof(VmInstance));
+            if (heap_inst) {
+                memcpy(heap_inst, &temp_inst, sizeof(VmInstance));
+                heap_inst->linux_tty_capture = NULL;
+                linux_tty_transfer(&temp_inst, heap_inst);
+            } else {
+                linux_tty_stop(&temp_inst);
+                hcs_close_vm(&temp_inst);
+                args->result = E_OUTOFMEMORY;
+                goto done;
+            }
             args->vm_inst = heap_inst;
         }
 
@@ -2693,6 +2717,7 @@ done:
                     inst->network_mode = heap_inst->network_mode;
                     inst->network_id = args->network_id;
                     inst->endpoint_id = args->endpoint_id;
+                    linux_tty_transfer(heap_inst, inst);
                     HeapFree(GetProcessHeap(), 0, heap_inst);
                     args->vm_inst = NULL;
                     hcs_register_vm_callback(inst);
@@ -2700,7 +2725,6 @@ done:
                 LeaveCriticalSection(&g_cs);
 
                 hcs_start_monitor(inst);
-                linux_tty_start(inst);
                 vm_agent_start(inst);
                 idd_probe_start(inst);
                 asb_log(L"VM \"%s\" created and started.", inst->name);
@@ -2736,6 +2760,7 @@ done:
                handle copy, and don't write into a stale slot. */
             LeaveCriticalSection(&g_cs);
             if (args->vm_inst) {
+                linux_tty_stop(args->vm_inst);
                 hcs_unregister_vm_callback(args->vm_inst);
                 hcs_close_vm(args->vm_inst);
                 HeapFree(GetProcessHeap(), 0, args->vm_inst);
@@ -3641,14 +3666,15 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
 
     /* Auto-start */
     asb_log(L"Starting VM \"%s\"...", cfg.name);
+    linux_tty_start(inst);
     hr = hcs_start_vm(inst);
     if (SUCCEEDED(hr)) {
-        linux_tty_start(inst);
         hcs_start_monitor(inst);
         vm_agent_start(inst);
         idd_probe_start(inst);
         asb_log(L"VM \"%s\" %s.", cfg.name, is_template_create ? L"started (template)" : L"created and started");
     } else {
+        linux_tty_stop(inst);
         asb_log(L"VM \"%s\" created but failed to start (0x%08X).", cfg.name, hr);
         if (hr == (HRESULT)0x800705AF)
             asb_alert(L"The host doesn't have enough resources to start this VM.");
@@ -3748,21 +3774,24 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
         CloseHandle(CreateThread(NULL, 0, start_vm_thread, args, 0, NULL));
     } else {
         BOOL selected_gpu = inst->gpu_id[0] != L'\0';
-        HRESULT hr = hcs_start_vm(inst);
+        HRESULT hr;
+        linux_tty_start(inst);
+        hr = hcs_start_vm(inst);
         if (selected_gpu && !inst->gpu_id[0]) save_vm_list();
         if (hr == (HRESULT)0x80370110L && inst->handle) {
+            linux_tty_stop(inst);
             hcs_terminate_vm(inst);
             hcs_close_vm(inst);
             return asb_vm_start(vm, -1, -1, NULL);
         }
         if (FAILED(hr)) {
+            linux_tty_stop(inst);
             asb_log(L"Error: Failed to start VM (0x%08X)", hr);
             if (hr == (HRESULT)0x800705AF)
                 asb_alert(L"The host doesn't have enough resources to start this VM.");
             return hr;
         }
         asb_log(L"VM \"%s\" started.", inst->name);
-        linux_tty_start(inst);
         vm_agent_start(inst);
         idd_probe_start(inst);
         hcs_start_monitor(inst);
