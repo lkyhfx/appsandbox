@@ -44,7 +44,9 @@ needs_consumer() {
 
 valid_mode() {
     case "$1" in
-        postflush-local-copy|postflush-shared-copy-no-consumer|postflush-shared-copy-consumer)
+        postflush-no-copy|postflush-local-copy|postflush-local-copy-region|\
+        postflush-state-transition-copy|postflush-flush-fence-copy|\
+        postflush-shared-copy-no-consumer|postflush-shared-copy-consumer)
             return 0
             ;;
         *)
@@ -57,7 +59,9 @@ status=0
 if [[ -n "${ASB_ISOLATION_MODES:-}" ]]; then
     read -r -a modes <<<"$ASB_ISOLATION_MODES"
 else
-    modes=(postflush-local-copy postflush-shared-copy-no-consumer postflush-shared-copy-consumer)
+    modes=(postflush-no-copy postflush-local-copy postflush-local-copy-region \
+           postflush-state-transition-copy postflush-flush-fence-copy \
+           postflush-shared-copy-no-consumer postflush-shared-copy-consumer)
 fi
 if [[ "${#modes[@]}" -eq 0 ]]; then
     printf 'BLOCKED stage=copy-isolation reason=no-modes\n'
@@ -183,6 +187,18 @@ for mode in "${modes[@]}"; do
     cat "$runner_log"
     cat "$mutter_log" 2>/dev/null || true
     cat "$consumer_log" 2>/dev/null || true
+    probe_log=$(mktemp)
+    cat "$runner_log" "$mutter_log" "$consumer_log" 2>/dev/null >"$probe_log"
+    source_state=$(grep -oE 'source_resource_state=[^[:space:]]+' "$probe_log" | tail -1 | cut -d= -f2-)
+    dest_state=$(grep -oE 'dest_resource_state=[^[:space:]]+' "$probe_log" | tail -1 | cut -d= -f2-)
+    submit_state=$(grep -oE 'capture_submit=[^[:space:]]+' "$probe_log" | tail -1 | cut -d= -f2-)
+    completion_state=$(grep -oE 'capture_completion=[^[:space:]]+' "$probe_log" | tail -1 | cut -d= -f2-)
+    removed_reason=$(grep -oE 'removed_reason=0x[0-9A-Fa-f]+' "$probe_log" | tail -1 | cut -d= -f2-)
+    printf 'mode=%s source_resource_state=%s dest_resource_state=%s submit=%s completion=%s removed_reason=%s mutter_exit=%d\n' \
+        "$mode" "${source_state:-unknown}" "${dest_state:-unknown}" \
+        "${submit_state:-unknown}" "${completion_state:-unknown}" \
+        "${removed_reason:-unknown}" "$mutter_status"
+    rm -f "$probe_log"
     if grep -Eq "ASB_D3D12 postflush_probe mode=${mode} mesa_flush=pass" \
            "$runner_log" "$mutter_log" "$consumer_log" 2>/dev/null &&
        grep -Eq "ASB_D3D12 postflush_probe mode=${mode} capture_submit=pass" \

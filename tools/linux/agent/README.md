@@ -376,6 +376,21 @@ add CPU readback or upload.
 The real Mutter B4 workload remains separate and cannot be replaced by the
 synthetic texture in this probe.
 
+The final B' stop-loss probe is independent of CUDA external-memory import:
+
+```sh
+make d3d12-nvenc-direct-probe \
+  NV_CODEC_HEADERS=/path/to/nv-codec-headers/include
+bash gpu-d3d12-nvenc-direct-probe.sh gate-b-prime
+```
+
+It reports `nvenc_directx_session`, `nvenc_register_d3d12_resource`,
+`nvenc_directx_map`, and `nvenc_directx_actual_encode`. If registration or the
+session is blocked, the HEVC444 DirectX interop branch is closed. If
+registration passes, a real HEVC444 encode is attempted and `ffprobe` must
+report `3840x2160 yuv444p`; `cpu_framebuffer_copy` and `cpu_upload` remain zero
+in all outcomes.
+
 Gate C is the Host D3D12 production decoder path. It now owns a fixed three-slot
 ring with persistent decode/process queues, processor, fences, bitstream
 uploads, AYUV outputs, RGB shared surfaces, command allocators/lists, and
@@ -397,14 +412,13 @@ continues to publish:
 production-4k60: false
 ```
 
-Validation snapshot for this implementation: Gate A passed both 600 and 3600
-frame runs, with `3840x2160 yuv444p`, zero encode/decode failures, and full
-frame counts. Gate B is `BLOCKED` at
-`d3d12_cuda_import: opaque-fd-texture-import`; B2/B3/B4 remain blocked and no
-CPU fallback is used. Gate C passed both 600 and 3600 frame runs with zero
-decode/process/present failures, `device_removed=0`, three persistent slots,
-and all per-frame creation/copy metrics at zero. The resulting decision is
-`HIGH_PERFORMANCE_HEVC420`; `production-4k60` remains false.
+The harness now executes the real D3D11 `VideoProcessorBlt` -> swap-chain
+`Present` path for every frame. Gate C is only PASS when decode/process/present
+frame counts are complete, both measured FPS values are at least 60, mean frame
+time is below 16.67 ms, renderer slot ownership reports no hazards, and the
+device remains present. Until the real Mutter path and this sustained present
+harness are independently verified, the decision remains
+`HIGH_PERFORMANCE_HEVC420` and `production-4k60` remains false.
 
 ### 7. Current real Mutter output gate is blocked
 
@@ -462,9 +476,13 @@ MUTTER_TEST_CLIENT_CMD='...' \
 ```
 
 ```text
+postflush-no-copy                    PASS|FAIL
 postflush-local-copy                 PASS|FAIL
+postflush-local-copy-region          PASS|FAIL
+postflush-state-transition-copy      PASS|FAIL
+postflush-flush-fence-copy           PASS|FAIL
 postflush-shared-copy-no-consumer    PASS|FAIL
-postflush-shared-copy-consumer      PASS|FAIL
+postflush-shared-copy-consumer       PASS|FAIL
 ```
 
 The Mesa hook prepares the real framebuffer before `d3d12_flush_cmdlist()` and
@@ -474,9 +492,13 @@ The capture list uses direct D3D12 barriers, keeps an explicit COM reference to
 the source, and signals a bounded diagnostic capture fence. It does not call
 Mesa's resource-state tracker or write capture work to `ctx->cmdlist`.
 
-`postflush-local-copy` uses a non-shared DEFAULT destination and does not
-require a consumer socket. `postflush-shared-copy-no-consumer` uses a shared
-destination but does not open it in another process. Only
+The fine-grained post-flush matrix is: no-copy/barrier-only; `CopyResource` to
+a local non-shared destination; `CopyTextureRegion` to a local destination;
+an explicit resource-state transition copy; an explicit flush plus queue-fence
+copy; a shared destination without a consumer; and the shared destination with
+the cross-process consumer. Every mode logs
+`source_resource_state`, `dest_resource_state`, `submit`, `completion`,
+`removed_reason`, and `mutter_exit`. Only
 `postflush-shared-copy-consumer` starts the existing consumer and exercises the
 ready/consumer-done slot ownership protocol.
 

@@ -806,6 +806,38 @@ HRESULT vm_video_decoder_decode(VmVideoDecoder *d,
     return hr;
 }
 
+BOOL vm_video_decoder_render_begin(VmVideoDecoder *d,
+                                   ID3D11Texture2D *texture)
+{
+    if (!d || !texture) return FALSE;
+    if (d->d3d12) return vm_d3d12_render_begin(d->d3d12, texture);
+    /* MF/D3D11 owns the surface lifetime through the caller's reference;
+     * the immediate context is already the renderer queue for this path. */
+    return TRUE;
+}
+
+BOOL vm_video_decoder_render_submitted(VmVideoDecoder *d,
+                                       ID3D11Texture2D *texture)
+{
+    if (!d || !texture) return FALSE;
+    if (d->d3d12) return vm_d3d12_render_submitted(d->d3d12, texture);
+    return TRUE;
+}
+
+void vm_video_decoder_render_cancel(VmVideoDecoder *d,
+                                    ID3D11Texture2D *texture)
+{
+    if (!d || !texture) return;
+    if (d->d3d12) vm_d3d12_render_cancel(d->d3d12, texture);
+}
+
+void vm_video_decoder_drop_frame(VmVideoDecoder *d,
+                                 ID3D11Texture2D *texture)
+{
+    if (!d || !texture) return;
+    if (d->d3d12) vm_d3d12_drop_frame(d->d3d12, texture);
+}
+
 void vm_video_decoder_destroy(VmVideoDecoder *d)
 {
     if (!d) return;

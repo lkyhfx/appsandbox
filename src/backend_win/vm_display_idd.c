@@ -1903,6 +1903,10 @@ static BOOL d3d_render_video_frame(VmDisplayIdd *d)
     D3D11_TEXTURE2D_DESC texture_desc;
     const char *failure_reason = "hevc-video-processor-failed";
     float clear[4] = {0, 0, 0, 1};
+    BOOL render_started = FALSE;
+    const BOOL d3d12_surface =
+        d->video_profile == VM_VIDEO_HEVC444 &&
+        d->hevc444_capability.backend == VM_VIDEO_DECODE_BACKEND_D3D12;
 
     EnterCriticalSection(&d->frame_cs);
     if (d->video_active && d->decoded_tex) {
@@ -2030,6 +2034,13 @@ static BOOL d3d_render_video_frame(VmDisplayIdd *d)
         ZeroMemory(&stream, sizeof(stream));
         stream.Enable = TRUE;
         stream.pInputSurface = input_view;
+        if (d3d12_surface &&
+            !vm_video_decoder_render_begin(d->video_decoder, texture)) {
+            failure_reason = "hevc-render-slot-not-ready";
+            hr = DXGI_ERROR_WAS_STILL_DRAWING;
+            goto fail;
+        }
+        render_started = d3d12_surface;
         hr = ID3D11VideoContext_VideoProcessorBlt(d->video_context,
             d->video_processor, output_view, d->recv_count, 1, &stream);
     }
@@ -2049,7 +2060,14 @@ static BOOL d3d_render_video_frame(VmDisplayIdd *d)
                 ? (d->hevc444_capability.backend == VM_VIDEO_DECODE_BACKEND_D3D12
                     ? ASB_DISPLAY_BACKEND_HEVC444_D3D12 : ASB_DISPLAY_BACKEND_HEVC444_D3D11)
                 : ASB_DISPLAY_BACKEND_HEVC420_D3D11,
-            ASB_DISPLAY_PROFILE_STATE_READY, "");
+                ASB_DISPLAY_PROFILE_STATE_READY, "");
+        if (d3d12_surface &&
+            !vm_video_decoder_render_submitted(d->video_decoder, texture)) {
+            failure_reason = "hevc-render-fence-signal-failed";
+            hr = E_FAIL;
+            goto fail;
+        }
+        render_started = FALSE;
     }
     if (output_view) ID3D11VideoProcessorOutputView_Release(output_view);
     if (input_view) ID3D11VideoProcessorInputView_Release(input_view);
@@ -2058,7 +2076,10 @@ static BOOL d3d_render_video_frame(VmDisplayIdd *d)
     return SUCCEEDED(hr);
 
 fail:
-    idd_mark_video_path_failed(d, failure_reason, hr);
+    if (hr != DXGI_ERROR_WAS_STILL_DRAWING)
+        idd_mark_video_path_failed(d, failure_reason, hr);
+    if (render_started)
+        (void)vm_video_decoder_render_submitted(d->video_decoder, texture);
     if (output_view) ID3D11VideoProcessorOutputView_Release(output_view);
     if (input_view) ID3D11VideoProcessorInputView_Release(input_view);
     if (back_buffer) ID3D11Texture2D_Release(back_buffer);
@@ -2166,6 +2187,8 @@ static void d3d_cleanup(VmDisplayIdd *d)
     d->hevc444_probe_done = FALSE;
     d->hevc444_probe_ok = FALSE;
     ZeroMemory(&d->hevc444_capability, sizeof(d->hevc444_capability));
+    if (d->decoded_tex && d->video_decoder)
+        vm_video_decoder_drop_frame(d->video_decoder, d->decoded_tex);
     if (d->video_decoder) { vm_video_decoder_destroy(d->video_decoder); d->video_decoder = NULL; }
     if (d->decoded_tex) { ID3D11Texture2D_Release(d->decoded_tex); d->decoded_tex = NULL; }
     if (d->video_processor) { ID3D11VideoProcessor_Release(d->video_processor); d->video_processor = NULL; }
@@ -2622,6 +2645,9 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     }
                 }
                 EnterCriticalSection(&d->frame_cs);
+                if (d->decoded_tex && d->video_decoder)
+                    vm_video_decoder_drop_frame(d->video_decoder,
+                                                d->decoded_tex);
                 if (d->video_decoder) vm_video_decoder_destroy(d->video_decoder);
                 d->video_decoder = vm_video_decoder_create_with_capability(
                     d->device,
@@ -2696,6 +2722,12 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     recv_buf, frame.payload_size,
                     (LONGLONG)(frame.capture_time_ns / 100),
                     &texture, &subresource);
+                if (decode_hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+                    /* All decoder slots are renderer-owned.  Drop this
+                     * encoded frame rather than overwriting a slot or
+                     * declaring the video path failed. */
+                    continue;
+                }
                 if (FAILED(decode_hr)) {
                     idd_mark_video_path_failed(d,
                         d->video_profile == VM_VIDEO_HEVC444
@@ -2902,6 +2934,8 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         EnterCriticalSection(&d->frame_cs);
         d->video_active = FALSE;
         if (d->decoded_tex) {
+            if (d->video_decoder)
+                vm_video_decoder_drop_frame(d->video_decoder, d->decoded_tex);
             ID3D11Texture2D_Release(d->decoded_tex);
             d->decoded_tex = NULL;
         }

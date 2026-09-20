@@ -66,6 +66,17 @@ HRESULT vm_video_decoder_decode(VmVideoDecoder *decoder,
                                 LONGLONG capture_time_100ns,
                                 ID3D11Texture2D **texture,
                                 UINT *subresource);
+/* The renderer calls these around the actual VideoProcessorBlt/Present.  The
+ * D3D12 backend uses a shared D3D11/D3D12 fence; AddRef alone is not a GPU
+ * completion signal and must never be used to recycle a slot. */
+BOOL vm_video_decoder_render_begin(VmVideoDecoder *decoder,
+                                   ID3D11Texture2D *texture);
+BOOL vm_video_decoder_render_submitted(VmVideoDecoder *decoder,
+                                       ID3D11Texture2D *texture);
+void vm_video_decoder_render_cancel(VmVideoDecoder *decoder,
+                                    ID3D11Texture2D *texture);
+void vm_video_decoder_drop_frame(VmVideoDecoder *decoder,
+                                 ID3D11Texture2D *texture);
 void vm_video_decoder_destroy(VmVideoDecoder *decoder);
 
 #ifdef __cplusplus

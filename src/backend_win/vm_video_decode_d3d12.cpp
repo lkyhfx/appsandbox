@@ -2,6 +2,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <d3d11_1.h>
+#include <d3d11_4.h>
 #include <d3d12.h>
 #include <d3d12video.h>
 #include <dxgi1_2.h>
@@ -24,6 +25,13 @@ static void print_hr(const char *stage, HRESULT hr)
 struct VmD3D12Decoder {
     static constexpr UINT kSlotCount = 3;
     static constexpr UINT kBitstreamCapacity = 8u * 1024u * 1024u;
+    enum SlotState : LONG {
+        SLOT_FREE = 0,
+        SLOT_DECODE_PENDING = 1,
+        SLOT_PROCESS_PENDING = 2,
+        SLOT_READY_FOR_RENDER = 3,
+        SLOT_RENDER_IN_USE = 4
+    };
     struct Slot {
         ComPtr<ID3D12Resource> bitstream;
         ComPtr<ID3D12Resource> output;
@@ -36,8 +44,14 @@ struct VmD3D12Decoder {
         ComPtr<ID3D11Texture2D> host_texture;
         UINT64 decode_value = 0;
         UINT64 process_value = 0;
+        UINT64 render_value = 0;
+        volatile LONG state = SLOT_FREE;
     };
     ComPtr<ID3D11Device1> host;
+    ComPtr<ID3D11Device5> host5;
+    ComPtr<ID3D11DeviceContext4> host_context4;
+    ComPtr<ID3D11Fence> render_fence;
+    ComPtr<ID3D12Fence> render_wait_fence;
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12VideoDevice> video;
     ComPtr<ID3D12VideoDecoder> decoder;
@@ -51,8 +65,35 @@ struct VmD3D12Decoder {
     bool reference_only = false;
     UINT next_slot = 0;
     UINT64 serial = 0;
+    UINT64 render_serial = 0;
+    UINT64 slot_reuse_hazards = 0;
     ~VmD3D12Decoder() { destroy_process_pipeline(&process); }
 };
+
+static int find_slot(VmD3D12Decoder *d, ID3D11Texture2D *texture)
+{
+    if (!d || !texture) return -1;
+    for (UINT i = 0; i < VmD3D12Decoder::kSlotCount; ++i)
+        if (d->slots[i].host_texture.Get() == texture)
+            return static_cast<int>(i);
+    return -1;
+}
+
+static bool slot_gpu_free(VmD3D12Decoder *d, VmD3D12Decoder::Slot *slot)
+{
+    if (!d || !slot) return false;
+    if (InterlockedCompareExchange(&slot->state, 0, 0) ==
+            VmD3D12Decoder::SLOT_RENDER_IN_USE &&
+        d->render_fence && slot->render_value != 0 &&
+        d->render_fence->GetCompletedValue() >= slot->render_value)
+        if (InterlockedCompareExchange(&slot->state,
+                                       VmD3D12Decoder::SLOT_FREE,
+                                       VmD3D12Decoder::SLOT_RENDER_IN_USE) ==
+            VmD3D12Decoder::SLOT_RENDER_IN_USE)
+            slot->render_value = 0;
+    return InterlockedCompareExchange(&slot->state, 0, 0) ==
+           VmD3D12Decoder::SLOT_FREE;
+}
 
 static D3D12_RESOURCE_DESC buffer_desc(UINT64 size)
 {
@@ -190,6 +231,23 @@ extern "C" VmD3D12Decoder *vm_d3d12_create(ID3D11Device *host, UINT width,
             FAILED(dxgi->GetAdapter(&adapter)) ||
             FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&d->device))) ||
             FAILED(d->device.As(&d->video))) return nullptr;
+        ComPtr<ID3D11DeviceContext> host_context;
+        host->GetImmediateContext(&host_context);
+        if (FAILED(host->QueryInterface(IID_PPV_ARGS(&d->host5))) ||
+            !host_context ||
+            FAILED(host_context.As(&d->host_context4)) ||
+            FAILED(d->host5->CreateFence(0, D3D11_FENCE_FLAG_SHARED,
+                                         IID_PPV_ARGS(&d->render_fence))))
+            return nullptr;
+        HANDLE render_handle = nullptr;
+        if (FAILED(d->render_fence->CreateSharedHandle(
+                       nullptr, GENERIC_ALL, nullptr, &render_handle)) ||
+            FAILED(d->device->OpenSharedHandle(
+                       render_handle, IID_PPV_ARGS(&d->render_wait_fence)))) {
+            if (render_handle) CloseHandle(render_handle);
+            return nullptr;
+        }
+        CloseHandle(render_handle);
         D3D12_VIDEO_DECODE_CONFIGURATION config = {};
         config.DecodeProfile = D3D12_VIDEO_DECODE_PROFILE_HEVC_MAIN_444;
         D3D12_FEATURE_DATA_VIDEO_DECODE_SUPPORT support = {};
@@ -300,17 +358,52 @@ extern "C" HRESULT vm_d3d12_decode(VmD3D12Decoder *d, const BYTE *data,
         if (compressed.empty() || compressed.size() > VmD3D12Decoder::kBitstreamCapacity)
             return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
 
-        const UINT slot_index = d->next_slot++ % VmD3D12Decoder::kSlotCount;
+        UINT slot_index = VmD3D12Decoder::kSlotCount;
+        for (UINT offset = 0; offset < VmD3D12Decoder::kSlotCount; ++offset) {
+            const UINT candidate =
+                (d->next_slot + offset) % VmD3D12Decoder::kSlotCount;
+            auto &candidate_slot = d->slots[candidate];
+            if (slot_gpu_free(d, &candidate_slot) &&
+                InterlockedCompareExchange(
+                    &candidate_slot.state,
+                    VmD3D12Decoder::SLOT_DECODE_PENDING,
+                    VmD3D12Decoder::SLOT_FREE) == VmD3D12Decoder::SLOT_FREE) {
+                slot_index = candidate;
+                d->next_slot = (candidate + 1) % VmD3D12Decoder::kSlotCount;
+                break;
+            }
+        }
+        if (slot_index == VmD3D12Decoder::kSlotCount) {
+            /* The renderer still owns all three surfaces.  Drop this decode
+             * opportunity instead of waiting forever or overwriting a live
+             * renderer texture. */
+            ++d->slot_reuse_hazards;
+            return DXGI_ERROR_WAS_STILL_DRAWING;
+        }
         auto &slot = d->slots[slot_index];
+        if (slot.render_value != 0 && d->render_wait_fence &&
+            FAILED(d->queue->Wait(d->render_wait_fence.Get(),
+                                   slot.render_value))) {
+            InterlockedExchange(&slot.state, VmD3D12Decoder::SLOT_FREE);
+            return E_FAIL;
+        }
+        bool gpu_submitted = false;
+        const auto fail_slot = [&](HRESULT error) {
+            if (!gpu_submitted)
+                InterlockedExchange(&slot.state, VmD3D12Decoder::SLOT_FREE);
+            return error;
+        };
         HRESULT hr;
         void *mapped = nullptr;
         D3D12_RANGE no_read = {0, 0};
-        if (FAILED(hr = slot.bitstream->Map(0, &no_read, &mapped))) return hr;
+        if (FAILED(hr = slot.bitstream->Map(0, &no_read, &mapped)))
+            return fail_slot(hr);
         std::memcpy(mapped, compressed.data(), compressed.size());
         slot.bitstream->Unmap(0, nullptr);
 
         if (FAILED(hr = slot.allocator->Reset()) ||
-            FAILED(hr = slot.list->Reset(slot.allocator.Get()))) return hr;
+            FAILED(hr = slot.list->Reset(slot.allocator.Get())))
+            return fail_slot(hr);
         DXVA_Slice_HEVC_Short slice = {};
         slice.SliceBytesInBuffer = static_cast<UINT>(compressed.size());
         d->picture.params.StatusReportFeedbackNumber = static_cast<UINT>(d->serial + 1);
@@ -351,38 +444,101 @@ extern "C" HRESULT vm_d3d12_decode(VmD3D12Decoder *d, const BYTE *data,
             d->query.Get(), D3D12_QUERY_TYPE_VIDEO_DECODE_STATISTICS,
             slot_index, 1, d->statistics.Get(),
             sizeof(D3D12_QUERY_DATA_VIDEO_DECODE_STATISTICS) * slot_index);
-        if (FAILED(hr = slot.list->Close())) return hr;
+        if (FAILED(hr = slot.list->Close())) return fail_slot(hr);
         ID3D12CommandList *lists[] = {slot.list.Get()};
         d->queue->ExecuteCommandLists(1, lists);
+        gpu_submitted = true;
         slot.decode_value = ++d->serial;
         if (FAILED(hr = d->queue->Signal(slot.decode_fence.Get(),
-                                         slot.decode_value))) return hr;
+                                         slot.decode_value))) return fail_slot(hr);
 
         /* The process queue waits on the decode fence on the GPU. The CPU only
          * waits for the completed presentation slot, so decode and process
          * remain separate queues and all heavyweight objects stay persistent. */
+        InterlockedExchange(&slot.state, VmD3D12Decoder::SLOT_PROCESS_PENDING);
         if (!record_ayuv_to_rgb(&d->process, slot.output.Get(), slot.rgb.Get()))
-            return E_FAIL;
+            return fail_slot(E_FAIL);
         const UINT64 process_value = ++slot.process_value;
         if (!submit_process(&d->process, slot.decode_fence.Get(),
                             slot.decode_value, slot.process_fence.Get(),
                             process_value, d->device.Get(),
                             d->process.list.Get()))
-            return E_FAIL;
+            return fail_slot(E_FAIL);
 
         const D3D12_RANGE range = {
             static_cast<SIZE_T>(sizeof(D3D12_QUERY_DATA_VIDEO_DECODE_STATISTICS) * slot_index),
             static_cast<SIZE_T>(sizeof(D3D12_QUERY_DATA_VIDEO_DECODE_STATISTICS) * (slot_index + 1))};
-        if (FAILED(hr = d->statistics->Map(0, &range, &mapped))) return hr;
+        if (FAILED(hr = d->statistics->Map(0, &range, &mapped))) return fail_slot(hr);
         const auto status = reinterpret_cast<const D3D12_QUERY_DATA_VIDEO_DECODE_STATISTICS *>(
             static_cast<const BYTE *>(mapped) + range.Begin)->Status;
         d->statistics->Unmap(0, &no_read);
-        if (status != D3D12_VIDEO_DECODE_STATUS_OK) return E_FAIL;
+        if (status != D3D12_VIDEO_DECODE_STATUS_OK) return fail_slot(E_FAIL);
+        InterlockedExchange(&slot.state, VmD3D12Decoder::SLOT_READY_FOR_RENDER);
+        slot.render_value = ++d->render_serial;
         *texture = slot.host_texture.Get();
         (*texture)->AddRef();
         return S_OK;
     } catch (...) { return E_OUTOFMEMORY; }
 }
+extern "C" BOOL vm_d3d12_render_begin(VmD3D12Decoder *d,
+                                       ID3D11Texture2D *texture)
+{
+    const int index = find_slot(d, texture);
+    if (index < 0) return FALSE;
+    auto &slot = d->slots[static_cast<UINT>(index)];
+    return InterlockedCompareExchange(
+               &slot.state, VmD3D12Decoder::SLOT_RENDER_IN_USE,
+               VmD3D12Decoder::SLOT_READY_FOR_RENDER) ==
+           VmD3D12Decoder::SLOT_READY_FOR_RENDER;
+}
+
+extern "C" BOOL vm_d3d12_render_submitted(VmD3D12Decoder *d,
+                                           ID3D11Texture2D *texture)
+{
+    const int index = find_slot(d, texture);
+    if (index < 0 || !d->host_context4 || !d->render_fence) return FALSE;
+    auto &slot = d->slots[static_cast<UINT>(index)];
+    if (InterlockedCompareExchange(&slot.state, 0, 0) !=
+        VmD3D12Decoder::SLOT_RENDER_IN_USE)
+        return FALSE;
+    /* This Signal is recorded on the same D3D11 immediate context after the
+     * renderer's VideoProcessorBlt/Present.  D3D12 opens the same fence and
+     * waits before considering the slot reusable. */
+    return SUCCEEDED(d->host_context4->Signal(d->render_fence.Get(),
+                                              slot.render_value));
+}
+
+extern "C" void vm_d3d12_render_cancel(VmD3D12Decoder *d,
+                                        ID3D11Texture2D *texture)
+{
+    const int index = find_slot(d, texture);
+    if (index < 0) return;
+    auto &slot = d->slots[static_cast<UINT>(index)];
+    if (InterlockedCompareExchange(&slot.state, VmD3D12Decoder::SLOT_FREE,
+                                   VmD3D12Decoder::SLOT_RENDER_IN_USE) ==
+        VmD3D12Decoder::SLOT_RENDER_IN_USE)
+        slot.render_value = 0;
+}
+
+extern "C" void vm_d3d12_drop_frame(VmD3D12Decoder *d,
+                                     ID3D11Texture2D *texture)
+{
+    const int index = find_slot(d, texture);
+    if (index < 0) return;
+    auto &slot = d->slots[static_cast<UINT>(index)];
+    /* A READY frame has never been handed to the GPU renderer.  Dropping it
+     * is therefore safe; RENDER_IN_USE remains protected by the fence. */
+    if (InterlockedCompareExchange(&slot.state, VmD3D12Decoder::SLOT_FREE,
+                                   VmD3D12Decoder::SLOT_READY_FOR_RENDER) ==
+        VmD3D12Decoder::SLOT_READY_FOR_RENDER)
+        slot.render_value = 0;
+}
+
+extern "C" UINT64 vm_d3d12_slot_reuse_hazards(VmD3D12Decoder *d)
+{
+    return d ? d->slot_reuse_hazards : 0;
+}
+
 extern "C" void vm_d3d12_destroy(VmD3D12Decoder *d) { delete d; }
 
 // Diagnostic readback is used only once per device capability probe. The

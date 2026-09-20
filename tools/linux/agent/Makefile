@@ -107,6 +107,7 @@ disable:
 clean:
 	rm -f $(BINS) appsandbox-display-d3d12 nvenc-hevc444-probe \
 		d3d12-cuda-nvenc-interop-probe d3d12-native-share-probe d3d12-cross-process-share-probe \
+		d3d12-nvenc-direct-probe \
 		d3d12-video-encode-probe d3d12-mutter-consumer \
 		mutter-wayland-pattern-client gbm-egl-d3d12-probe \
 		xdg-shell-client-protocol.h \
@@ -138,6 +139,14 @@ d3d12-cuda-nvenc-interop-probe: d3d12-cuda-nvenc-interop-probe.cpp
 	$(CXX) -std=c++17 $(CXXFLAGS) -D_GNU_SOURCE -D_WIN32_WINNT=0x0A00 -DGUID_DEFINED \
 	       -I$(NV_CODEC_HEADERS) -O2 -Wall -Wextra -Werror \
 	       -Wno-unknown-pragmas -o $@ $< $(LDFLAGS) -L$(D3D12_LIBDIR) \
+	       $$(pkg-config --cflags --libs DirectX-Headers) -ld3d12 -ldxcore -ldl
+
+# Gate B': the final independent D3D12 resource -> NVENC DirectX probe.  It
+# remains opt-in and never adds a CPU staging dependency to normal builds.
+d3d12-nvenc-direct-probe: d3d12-nvenc-direct-probe.cpp
+	$(CXX) -std=c++17 $(CXXFLAGS) -D_GNU_SOURCE -D_WIN32_WINNT=0x0A00 -DGUID_DEFINED \
+	       -O2 -Wall -Wextra -Werror -Wno-unknown-pragmas -o $@ $< \
+	       $(LDFLAGS) -L$(D3D12_LIBDIR) \
 	       $$(pkg-config --cflags --libs DirectX-Headers) -ld3d12 -ldxcore -ldl
 
 # Cross-process diagnostic: producer and consumer are fork+exec children and
@@ -199,5 +208,6 @@ xdg-shell-protocol.c: $(WAYLAND_XDG_SHELL_XML)
 	d3d12-helper nvenc-hevc444-probe-600 nvenc-hevc444-probe-3600 \
 	d3d12-native-share-probe d3d12-cross-process-share-probe \
 	nvenc-hevc444-probe d3d12-cuda-nvenc-interop-probe \
+	d3d12-nvenc-direct-probe \
 	d3d12-video-encode-probe d3d12-mutter-consumer \
 	mutter-wayland-pattern-client gbm-egl-d3d12-probe

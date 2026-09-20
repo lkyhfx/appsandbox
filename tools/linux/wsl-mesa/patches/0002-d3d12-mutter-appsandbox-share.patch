@@ -132,7 +132,7 @@ new file mode 100644
 index 0000000..0000000
 --- /dev/null
 +++ b/src/gallium/drivers/d3d12/d3d12_appsandbox_share.cpp
-@@ -0,0 +1,1165 @@
+@@ -0,0 +1,1282 @@
 +/* SPDX-License-Identifier: MIT */
 +
 +#include "d3d12_appsandbox_share.h"
@@ -187,8 +187,12 @@ index 0000000..0000000
 +   SharedCopyNoConsumer,
 +   SharedCopyConsumer,
 +   PostflushLocalCopy,
++   PostflushLocalCopyRegion,
++   PostflushStateTransitionCopy,
++   PostflushFlushFenceCopy,
 +   PostflushSharedCopyNoConsumer,
 +   PostflushSharedCopyConsumer,
++   PostflushNoCopy,
 +};
 +
 +struct ResourceBundle {
@@ -285,23 +289,51 @@ index 0000000..0000000
 +      return CopyProbeMode::SharedCopyConsumer;
 +   if (!strcmp(value, "postflush-local-copy"))
 +      return CopyProbeMode::PostflushLocalCopy;
++   if (!strcmp(value, "postflush-local-copy-region"))
++      return CopyProbeMode::PostflushLocalCopyRegion;
++   if (!strcmp(value, "postflush-state-transition-copy"))
++      return CopyProbeMode::PostflushStateTransitionCopy;
++   if (!strcmp(value, "postflush-flush-fence-copy"))
++      return CopyProbeMode::PostflushFlushFenceCopy;
 +   if (!strcmp(value, "postflush-shared-copy-no-consumer"))
 +      return CopyProbeMode::PostflushSharedCopyNoConsumer;
 +   if (!strcmp(value, "postflush-shared-copy-consumer"))
 +      return CopyProbeMode::PostflushSharedCopyConsumer;
++   if (!strcmp(value, "postflush-no-copy"))
++      return CopyProbeMode::PostflushNoCopy;
 +   return CopyProbeMode::Invalid;
 +}
 +
 +static bool is_postflush_probe(CopyProbeMode mode)
 +{
 +   return mode == CopyProbeMode::PostflushLocalCopy ||
++          mode == CopyProbeMode::PostflushLocalCopyRegion ||
++          mode == CopyProbeMode::PostflushStateTransitionCopy ||
++          mode == CopyProbeMode::PostflushFlushFenceCopy ||
 +          mode == CopyProbeMode::PostflushSharedCopyNoConsumer ||
-+          mode == CopyProbeMode::PostflushSharedCopyConsumer;
++          mode == CopyProbeMode::PostflushSharedCopyConsumer ||
++          mode == CopyProbeMode::PostflushNoCopy;
 +}
 +
 +static bool postflush_needs_consumer(CopyProbeMode mode)
 +{
 +   return mode == CopyProbeMode::PostflushSharedCopyConsumer;
++}
++
++static bool postflush_needs_destination(CopyProbeMode mode)
++{
++   return mode != CopyProbeMode::PostflushNoCopy;
++}
++
++static bool postflush_uses_texture_region(CopyProbeMode mode)
++{
++   return mode == CopyProbeMode::PostflushLocalCopyRegion;
++}
++
++static bool postflush_uses_explicit_state_transition(CopyProbeMode mode)
++{
++   return mode == CopyProbeMode::PostflushStateTransitionCopy ||
++          mode == CopyProbeMode::PostflushFlushFenceCopy;
 +}
 +
 +static const char *copy_probe_mode_name(CopyProbeMode mode)
@@ -314,10 +346,18 @@ index 0000000..0000000
 +   case CopyProbeMode::SharedCopyNoConsumer: return "shared-copy-no-consumer";
 +   case CopyProbeMode::SharedCopyConsumer: return "shared-copy-consumer";
 +   case CopyProbeMode::PostflushLocalCopy: return "postflush-local-copy";
++   case CopyProbeMode::PostflushLocalCopyRegion:
++      return "postflush-local-copy-region";
++   case CopyProbeMode::PostflushStateTransitionCopy:
++      return "postflush-state-transition-copy";
++   case CopyProbeMode::PostflushFlushFenceCopy:
++      return "postflush-flush-fence-copy";
 +   case CopyProbeMode::PostflushSharedCopyNoConsumer:
 +      return "postflush-shared-copy-no-consumer";
 +   case CopyProbeMode::PostflushSharedCopyConsumer:
 +      return "postflush-shared-copy-consumer";
++   case CopyProbeMode::PostflushNoCopy:
++      return "postflush-no-copy";
 +   case CopyProbeMode::None: break;
 +   }
 +   return "none";
@@ -900,13 +940,43 @@ index 0000000..0000000
 +   barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 +   barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
 +   barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
++   if (share->probe_mode == CopyProbeMode::PostflushNoCopy) {
++      list->ResourceBarrier(1, barriers);
++      barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
++      barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
++      list->ResourceBarrier(1, barriers);
++      const HRESULT close_hr = list->Close();
++      fprintf(stderr, "ASB_D3D12 postflush_probe mode=%s "
++                   "source_resource_state=RENDER_TARGET "
++                   "dest_resource_state=NONE copy=none "
++                   "capture_list_close=%s\n",
++              copy_probe_mode_name(share->probe_mode),
++              SUCCEEDED(close_hr) ? "pass" : "fail");
++      return SUCCEEDED(close_hr);
++   }
 +   barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 +   barriers[1].Transition.pResource = destination;
 +   barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 +   barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
 +   barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-+   list->ResourceBarrier(2, barriers);
-+   list->CopyResource(destination, source);
++   if (postflush_uses_explicit_state_transition(share->probe_mode)) {
++      list->ResourceBarrier(1, &barriers[0]);
++      list->ResourceBarrier(1, &barriers[1]);
++   } else {
++      list->ResourceBarrier(2, barriers);
++   }
++   if (postflush_uses_texture_region(share->probe_mode)) {
++      D3D12_TEXTURE_COPY_LOCATION source_location = {};
++      source_location.pResource = source;
++      source_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++      D3D12_TEXTURE_COPY_LOCATION destination_location = {};
++      destination_location.pResource = destination;
++      destination_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++      list->CopyTextureRegion(&destination_location, 0, 0, 0,
++                              &source_location, nullptr);
++   } else {
++      list->CopyResource(destination, source);
++   }
 +   barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
 +   barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
 +   barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
@@ -914,10 +984,43 @@ index 0000000..0000000
 +   list->ResourceBarrier(2, barriers);
 +   const HRESULT close_hr = list->Close();
 +   fprintf(stderr, "ASB_D3D12 postflush_probe mode=%s "
-+                "capture_list_close=%s\n",
++                "source_resource_state=RENDER_TARGET "
++                "dest_resource_state=COMMON capture_list_close=%s\n",
 +           copy_probe_mode_name(share->probe_mode),
 +           SUCCEEDED(close_hr) ? "pass" : "fail");
 +   return SUCCEEDED(close_hr);
++}
++
++static bool wait_postflush_queue_fence(struct d3d12_context *ctx,
++                                        AppsandboxShare *share)
++{
++   struct d3d12_screen *screen = d3d12_screen(ctx->base.screen);
++   if (!share->diagnostic_fence) {
++      const HRESULT hr = screen->dev->CreateFence(
++         0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&share->diagnostic_fence));
++      if (FAILED(hr)) {
++         fprintf(stderr, "ASB_D3D12 postflush_probe mode=%s "
++                      "flush_fence=fail stage=create-fence hr=0x%08x\n",
++                 copy_probe_mode_name(share->probe_mode),
++                 static_cast<unsigned>(hr));
++         return false;
++      }
++   }
++   const uint64_t value = ++share->diagnostic_value;
++   const HRESULT signal_hr = screen->cmdqueue->Signal(
++      share->diagnostic_fence.Get(), value);
++   bool complete = SUCCEEDED(signal_hr);
++   for (unsigned i = 0; complete && i < kDiagnosticTimeoutMs; ++i) {
++      if (share->diagnostic_fence->GetCompletedValue() >= value)
++         break;
++      usleep(1000);
++      complete = share->diagnostic_fence->GetCompletedValue() >= value;
++   }
++   fprintf(stderr, "ASB_D3D12 postflush_probe mode=%s "
++                "flush_fence=%s signal_hr=0x%08x\n",
++           copy_probe_mode_name(share->probe_mode),
++           complete ? "pass" : "fail", static_cast<unsigned>(signal_hr));
++   return complete;
 +}
 +
 +static bool record_copy_probe(struct d3d12_context *ctx,
@@ -956,8 +1059,12 @@ index 0000000..0000000
 +      return true;
 +   case CopyProbeMode::Invalid:
 +   case CopyProbeMode::PostflushLocalCopy:
++   case CopyProbeMode::PostflushLocalCopyRegion:
++   case CopyProbeMode::PostflushStateTransitionCopy:
++   case CopyProbeMode::PostflushFlushFenceCopy:
 +   case CopyProbeMode::PostflushSharedCopyNoConsumer:
 +   case CopyProbeMode::PostflushSharedCopyConsumer:
++   case CopyProbeMode::PostflushNoCopy:
 +   case CopyProbeMode::None:
 +      break;
 +   }
@@ -981,7 +1088,8 @@ index 0000000..0000000
 +   }
 +   struct d3d12_resource *source = d3d12_resource(ctx->fb.cbufs[0].texture);
 +   log_postflush_source(source, requested_mode,
-+                        requested_mode != CopyProbeMode::PostflushLocalCopy);
++                        requested_mode == CopyProbeMode::PostflushSharedCopyNoConsumer ||
++                        requested_mode == CopyProbeMode::PostflushSharedCopyConsumer);
 +   if (!postflush_source_supported(source)) {
 +      fprintf(stderr, "ASB_D3D12 postflush_probe mode=%s prepare=fail "
 +                   "reason=unsupported-source\n",
@@ -1009,7 +1117,8 @@ index 0000000..0000000
 +                                      bool mesa_flush_succeeded)
 +{
 +   const CopyProbeMode mode = share->probe_mode;
-+   const bool shared = mode != CopyProbeMode::PostflushLocalCopy;
++   const bool shared = mode == CopyProbeMode::PostflushSharedCopyNoConsumer ||
++                       mode == CopyProbeMode::PostflushSharedCopyConsumer;
 +   fprintf(stderr, "ASB_D3D12 postflush_probe mode=%s mesa_flush=%s\n",
 +           copy_probe_mode_name(mode), mesa_flush_succeeded ? "pass" : "fail");
 +   share->postflush_submitted = true;
@@ -1021,6 +1130,12 @@ index 0000000..0000000
 +                   "removed_reason=0x%08x\n",
 +              copy_probe_mode_name(mode),
 +              static_cast<unsigned>(d3d12_screen(ctx->base.screen)->dev->GetDeviceRemovedReason()));
++      share->pending_capture.valid = false;
++      return;
++   }
++   if (mode == CopyProbeMode::PostflushFlushFenceCopy &&
++       !wait_postflush_queue_fence(ctx, share)) {
++      log_postflush_failure(ctx, share, "flush-fence");
 +      share->pending_capture.valid = false;
 +      return;
 +   }
@@ -1041,7 +1156,8 @@ index 0000000..0000000
 +            return;
 +         }
 +      }
-+   } else if (!ensure_postflush_destination(ctx, share, shared)) {
++   } else if (postflush_needs_destination(mode) &&
++              !ensure_postflush_destination(ctx, share, shared)) {
 +      log_postflush_failure(ctx, share, "create-destination");
 +      share->pending_capture.valid = false;
 +      return;
@@ -1067,6 +1183,7 @@ index 0000000..0000000
 +   }
 +   Slot &slot = share->slots[share->pending_capture.slot];
 +   ID3D12Resource *destination =
++      mode == CopyProbeMode::PostflushNoCopy ? nullptr :
 +      mode == CopyProbeMode::PostflushSharedCopyConsumer ?
 +      slot.resource.Get() : share->postflush_destination.Get();
 +   if (!record_postflush_capture(share, destination)) {
