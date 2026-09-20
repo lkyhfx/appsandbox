@@ -234,6 +234,7 @@ static void tty_process_bytes(LinuxTtyCapture *capture,
             continue;
         } else if (capture->line_len >= LINUX_TTY_RENDER_LIMIT ||
                    !tty_append_byte(capture, byte)) {
+            BOOL limit = capture->line_len >= LINUX_TTY_RENDER_LIMIT;
             /* Do not let an unbounded guest line take down the reader.  The
                raw file is already complete; discard only the host rendering
                of this line until its next terminator. */
@@ -242,8 +243,12 @@ static void tty_process_bytes(LinuxTtyCapture *capture,
             free(capture->line);
             capture->line = NULL;
             capture->line_discarded = TRUE;
-            ui_log(L"[TTY:%s] <line exceeded render limit; raw bytes preserved>",
-                   capture->vm_name);
+            if (limit)
+                ui_log(L"[TTY:%s] <line exceeded render limit; raw bytes preserved>",
+                       capture->vm_name);
+            else
+                ui_log(L"[TTY:%s] <line could not be rendered; raw bytes preserved>",
+                       capture->vm_name);
         }
     }
 }
@@ -494,7 +499,7 @@ void linux_tty_start(VmInstance *instance)
         return;
     }
 
-    thread = CreateThread(NULL, 0, tty_thread_proc, capture, 0, NULL);
+    thread = CreateThread(NULL, 0, tty_thread_proc, capture, CREATE_SUSPENDED, NULL);
     if (!thread) {
         DWORD error = GetLastError();
         if (capture->tty_file != INVALID_HANDLE_VALUE)
@@ -513,6 +518,19 @@ void linux_tty_start(VmInstance *instance)
     ui_log(L"[TTY:%s] capture starting", capture->vm_name);
     ui_log(L"[TTY:%s] pipe=%s", capture->vm_name, capture->pipe_name);
     ui_log(L"[TTY:%s] raw_log=%s", capture->vm_name, capture->tty_path);
+    if (ResumeThread(thread) == (DWORD)-1) {
+        DWORD error = GetLastError();
+        instance->linux_tty_capture = NULL;
+        TerminateThread(thread, 1); /* suspended thread has not run */
+        CloseHandle(thread);
+        CloseHandle(capture->ready_event);
+        CloseHandle(capture->stop_event);
+        free(capture);
+        ReleaseSRWLockExclusive(&g_linux_tty_lock);
+        ui_log(L"[TTY:%s] reader thread start failed (error=%lu); VM continues without TTY capture.",
+               instance->name, (unsigned long)error);
+        return;
+    }
     ReleaseSRWLockExclusive(&g_linux_tty_lock);
     waits[0] = capture->ready_event;
     waits[1] = capture->stop_event;

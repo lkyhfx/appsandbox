@@ -67,11 +67,17 @@ static DWORD WINAPI race_start(LPVOID p)
     return 0;
 }
 
+static DWORD WINAPI race_stop(LPVOID p)
+{
+    linux_tty_stop((VmInstance *)p);
+    return 0;
+}
+
 int main(void)
 {
     LinuxTtyCapture parser = { 0 };
     static VmInstance vm, moved;
-    HANDLE pipe, thread, file;
+    HANDLE pipe, thread, thread2, file;
     DWORD written, got, handles_before, handles_after;
     char raw[256];
     const unsigned char invalid[] = { 'x', 0xff, '\n' };
@@ -156,6 +162,15 @@ int main(void)
     check(vm.linux_tty_capture == NULL, "start stop race cleanup");
     check(GetProcessHandleCount(GetCurrentProcess(), &handles_after) &&
           handles_after <= handles_before + 2, "no handle leak after races");
+    linux_tty_start(&vm);
+    thread = CreateThread(NULL, 0, race_stop, &vm, 0, NULL);
+    thread2 = CreateThread(NULL, 0, race_stop, &vm, 0, NULL);
+    check(thread && thread2, "two concurrent stop threads");
+    WaitForSingleObject(thread, INFINITE);
+    WaitForSingleObject(thread2, INFINITE);
+    CloseHandle(thread);
+    CloseHandle(thread2);
+    check(vm.linux_tty_capture == NULL, "concurrent stops detach once");
     DeleteFileW(path);
     RemoveDirectoryW(dir);
     puts("linux_tty_test: PASS");
