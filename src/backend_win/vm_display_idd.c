@@ -234,6 +234,9 @@ struct VmDisplayIdd {
     volatile LONG            video_path_failure_hr;
     volatile LONG            video_failure_logged;
     UINT                     fallback_count;
+    VmVideoDecodeCapability  hevc444_capability;
+    BOOL                     hevc444_probe_done;
+    BOOL                     hevc444_probe_ok;
     ID3D11VideoDevice       *video_device;
     ID3D11VideoContext      *video_context;
     ID3D11VideoProcessorEnumerator *video_enum;
@@ -663,6 +666,29 @@ static void idd_mark_video_path_failed(VmDisplayIdd *d, const char *reason,
                 L"reconnecting=1 hresult=0x%08lX", d->fallback_count,
                 reason ? reason : "hevc-video-path-failed", (unsigned long)hr);
     }
+}
+
+static BOOL idd_probe_hevc444_capability(VmDisplayIdd *d, BOOL force)
+{
+    if (!d || !d->device) return FALSE;
+    if (d->hevc444_probe_done && !force)
+        return d->hevc444_probe_ok;
+    d->hevc444_probe_done = TRUE;
+    d->hevc444_probe_ok = FALSE;
+    ZeroMemory(&d->hevc444_capability, sizeof(d->hevc444_capability));
+    d->hevc444_capability.decoded_format = DXGI_FORMAT_UNKNOWN;
+    d->hevc444_probe_ok = vm_video_decode_probe_builtin_hevc444(
+        d->device, &d->hevc444_capability);
+    if (d->hevc444_probe_ok) {
+        idd_log(d,
+                L"hevc444-actual-probe=PASS decoder_index=%u decoder=%s "
+                L"ayuv=1 gpu_surface=1",
+                d->hevc444_capability.decoder_index,
+                d->hevc444_capability.decoder_name);
+    } else {
+        idd_log(d, L"hevc444-actual-probe=BLOCKED reason=no-validated-mft");
+    }
+    return d->hevc444_probe_ok;
 }
 
 /* ---- Send input packet to guest ---- */
@@ -2424,14 +2450,16 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             requested_hevc444 = d->vm &&
                 d->vm->display_profile == ASB_DISPLAY_PROFILE_HIGH_PERFORMANCE;
             if (requested_hevc444) {
-                BOOL production_gate = d->vm &&
+                BOOL profile_contract = d->vm &&
                     _wcsicmp(d->os_type, L"Linux") == 0 &&
                     d->vm->gpu_mode != GPU_NONE &&
                     strstr(d->vm->guest_caps, "display-profile-v1") != NULL &&
-                    strstr(d->vm->guest_caps, "hevc444-v1") != NULL &&
-                    strstr(d->vm->guest_caps, "production-4k60-v1") != NULL;
-                if (!d->hevc_disabled && production_gate &&
-                    vm_video_decode_supported_profile(d->device, VM_VIDEO_HEVC444))
+                    strstr(d->vm->guest_caps, "hevc444-v1") != NULL;
+                /* The guest's production gate is intentionally independent
+                   from negotiation. A real host probe is the only source of
+                   HEVC444 capability here; production-4k60 remains false. */
+                if (!d->hevc_disabled && profile_contract &&
+                    idd_probe_hevc444_capability(d, FALSE))
                     hello.capabilities |= ASB_DISPLAY_CAP_HEVC444_D3D11_HW_DECODE;
             } else if (!d->hevc_disabled &&
                        vm_video_decode_supported_profile(d->device, VM_VIDEO_HEVC420)) {
@@ -2442,7 +2470,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             advertised_hevc = requested_hevc444 ? advertised_hevc444 :
                 (hello.capabilities & ASB_DISPLAY_CAP_HEVC420_D3D11_HW_DECODE) != 0;
             if (requested_hevc444 && !advertised_hevc444 && !d->hevc_disabled &&
-                d->vm && strstr(d->vm->guest_caps, "production-4k60-v1") != NULL)
+                d->vm && strstr(d->vm->guest_caps, "hevc444-v1") != NULL)
                 idd_publish_display_runtime(d, ASB_DISPLAY_BACKEND_UNKNOWN,
                     ASB_DISPLAY_PROFILE_STATE_UNAVAILABLE,
                     "host-no-hevc444-decoder");
@@ -2525,6 +2553,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             if (magic == ASB_DISPLAY_VIDEO_CONFIG_MAGIC) {
                 AsbEncodedVideoConfig config;
                 BYTE *extradata = NULL;
+                BOOL config_444 = FALSE;
                 config.magic = magic;
                 if (!recv_exact_display(d, s, (BYTE *)&config + sizeof(UINT32),
                                 sizeof(config) - sizeof(UINT32))) break;
@@ -2539,7 +2568,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     break;
                 }
                 {
-                    const BOOL config_444 =
+                    config_444 =
                         (config.flags & ASB_DISPLAY_VIDEO_CONFIG_HEVC444) != 0;
                     const BOOL config_420 =
                         (config.flags & ASB_DISPLAY_VIDEO_CONFIG_HEVC420) != 0;
@@ -2565,9 +2594,22 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 }
                 EnterCriticalSection(&d->frame_cs);
                 if (d->video_decoder) vm_video_decoder_destroy(d->video_decoder);
-                d->video_decoder = vm_video_decoder_create(d->device,
+                d->video_decoder = vm_video_decoder_create_with_capability(
+                    d->device,
                     config.width, config.height, config.fps_num, config.fps_den,
-                    extradata, config.extradata_size, d->video_profile);
+                    extradata, config.extradata_size, d->video_profile,
+                    config_444 ? &d->hevc444_capability : NULL);
+                if (!d->video_decoder && config_444 &&
+                    idd_probe_hevc444_capability(d, TRUE)) {
+                    /* The cached MFT identity became invalid. Re-probe is
+                       allowed, but production still receives only the newly
+                       actual-tested selector. */
+                    d->video_decoder = vm_video_decoder_create_with_capability(
+                        d->device, config.width, config.height,
+                        config.fps_num, config.fps_den, extradata,
+                        config.extradata_size, d->video_profile,
+                        &d->hevc444_capability);
+                }
                 if (d->decoded_tex) {
                     ID3D11Texture2D_Release(d->decoded_tex);
                     d->decoded_tex = NULL;

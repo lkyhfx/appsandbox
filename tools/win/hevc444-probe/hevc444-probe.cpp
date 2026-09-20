@@ -843,14 +843,10 @@ static bool probe_ayuv_to_rgb(const D3D11Context &d3d11,
         return false;
     }
 
-    hr = d3d11.video_context1->VideoProcessorSetStreamColorSpace1(
+    d3d11.video_context1->VideoProcessorSetStreamColorSpace1(
         processor.Get(), 0, DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709);
-    if (SUCCEEDED(hr)) hr = d3d11.video_context1->VideoProcessorSetOutputColorSpace1(
+    d3d11.video_context1->VideoProcessorSetOutputColorSpace1(
         processor.Get(), DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
-    if (FAILED(hr)) {
-        print_hr("host-ayuv-to-rgb-color-space", hr);
-        return false;
-    }
     D3D11_VIDEO_PROCESSOR_STREAM stream = {};
     stream.Enable = TRUE;
     stream.pInputSurface = input_view.Get();

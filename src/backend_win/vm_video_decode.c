@@ -11,8 +11,10 @@
 #include <mferror.h>
 #include <mfobjects.h>
 #include <dxgi1_2.h>
+#include <wchar.h>
 
 #include "vm_video_decode.h"
+#include "vm_hevc444_probe_sample.h"
 
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mfuuid.lib")
@@ -34,10 +36,37 @@ static const GUID *output_subtype(VmVideoDecodeProfile profile)
     return profile == VM_VIDEO_HEVC444 ? &MFVideoFormat_AYUV : &MFVideoFormat_NV12;
 }
 
+static BOOL capture_decoder_identity(IMFActivate *activate,
+                                     VmVideoDecodeCapability *out)
+{
+    GUID clsid = GUID_NULL;
+    WCHAR *name = NULL;
+    UINT32 name_length = 0;
+    HRESULT clsid_hr;
+    HRESULT name_hr;
+
+    if (!activate || !out) return FALSE;
+    clsid_hr = IMFActivate_GetGUID(activate, &MFT_TRANSFORM_CLSID_Attribute,
+                                   &clsid);
+    name_hr = IMFActivate_GetAllocatedString(
+        activate, &MFT_FRIENDLY_NAME_Attribute, &name, &name_length);
+    if (SUCCEEDED(clsid_hr)) out->decoder_clsid = clsid;
+    if (SUCCEEDED(name_hr) && name) {
+        wcsncpy_s(out->decoder_name, ARRAYSIZE(out->decoder_name), name,
+                  _TRUNCATE);
+    }
+    if (name) CoTaskMemFree(name);
+    out->decoder_identity_valid =
+        !IsEqualGUID(&out->decoder_clsid, &GUID_NULL) ||
+        out->decoder_name[0] != L'\0';
+    return out->decoder_identity_valid;
+}
+
 static BOOL probe_ayuv_video_processor(ID3D11Device *device, UINT width,
                                        UINT height)
 {
     ID3D11VideoDevice *video_device = NULL;
+    ID3D11DeviceContext *device_context = NULL;
     ID3D11VideoContext *video_context = NULL;
     ID3D11VideoProcessorEnumerator *enumerator = NULL;
     ID3D11VideoProcessor *processor = NULL;
@@ -55,9 +84,16 @@ static BOOL probe_ayuv_video_processor(ID3D11Device *device, UINT width,
     if (!device) return FALSE;
     hr = ID3D11Device_QueryInterface(device, &IID_ID3D11VideoDevice,
                                      (void **)&video_device);
+    if (SUCCEEDED(hr)) {
+        /* ID3D11VideoContext is implemented by the immediate context, not
+           by ID3D11Device. Querying the device can succeed on some drivers
+           only for unrelated interfaces and is never the valid video path. */
+        ID3D11Device_GetImmediateContext(device, &device_context);
+        if (!device_context) hr = E_NOINTERFACE;
+    }
     if (SUCCEEDED(hr))
-        hr = ID3D11Device_QueryInterface(device, &IID_ID3D11VideoContext,
-                                         (void **)&video_context);
+        hr = ID3D11DeviceContext_QueryInterface(
+            device_context, &IID_ID3D11VideoContext, (void **)&video_context);
     if (FAILED(hr)) goto done;
 
     ZeroMemory(&content, sizeof(content));
@@ -122,6 +158,7 @@ done:
     if (processor) ID3D11VideoProcessor_Release(processor);
     if (enumerator) ID3D11VideoProcessorEnumerator_Release(enumerator);
     if (video_context) ID3D11VideoContext_Release(video_context);
+    if (device_context) ID3D11DeviceContext_Release(device_context);
     if (video_device) ID3D11VideoDevice_Release(video_device);
     return ok;
 }
@@ -210,6 +247,8 @@ static BOOL probe_one_decoder(ID3D11Device *device, IMFActivate *activate,
     HRESULT hr;
     BOOL ok = FALSE;
 
+    capture_decoder_identity(activate, out);
+
     hr = IMFActivate_ActivateObject(activate, &IID_IMFTransform,
                                     (void **)&transform);
     if (FAILED(hr)) goto done;
@@ -294,7 +333,8 @@ static BOOL probe_one_decoder(ID3D11Device *device, IMFActivate *activate,
                                 ? DXGI_FORMAT_AYUV : DXGI_FORMAT_NV12)) {
                 out->ayuv_video_processor = profile == VM_VIDEO_HEVC444
                     ? probe_ayuv_video_processor(device, width, height) : TRUE;
-                out->available = out->ayuv_video_processor;
+                out->available = out->decoder_identity_valid &&
+                    out->ayuv_video_processor;
                 out->decoder_index = decoder_index;
                 ok = out->available;
             }
@@ -361,6 +401,7 @@ static HRESULT activate_configured_decoder(ID3D11Device *device,
                                            const BYTE *extradata,
                                            UINT extradata_size,
                                            VmVideoDecodeProfile profile,
+                                           const VmVideoDecodeCapability *capability,
                                            IMFTransform **result)
 {
     MFT_REGISTER_TYPE_INFO mft_input = { MFMediaType_Video, MFVideoFormat_HEVC };
@@ -384,6 +425,29 @@ static HRESULT activate_configured_decoder(ID3D11Device *device,
         IMFMediaType *input = NULL, *output = NULL, *available = NULL;
         GUID subtype;
         UINT type_index;
+        if (capability && !capability->decoder_identity_valid) continue;
+        if (capability) {
+            GUID clsid = GUID_NULL;
+            WCHAR *name = NULL;
+            UINT32 name_length = 0;
+            HRESULT identity_hr = IMFActivate_GetGUID(
+                activates[i], &MFT_TRANSFORM_CLSID_Attribute, &clsid);
+            if (!IsEqualGUID(&capability->decoder_clsid, &GUID_NULL)) {
+                if (FAILED(identity_hr) ||
+                    !IsEqualGUID(&clsid, &capability->decoder_clsid))
+                    continue;
+            } else {
+                identity_hr = IMFActivate_GetAllocatedString(
+                    activates[i], &MFT_FRIENDLY_NAME_Attribute, &name,
+                    &name_length);
+                if (FAILED(identity_hr) || !name ||
+                    wcscmp(name, capability->decoder_name) != 0) {
+                    if (name) CoTaskMemFree(name);
+                    continue;
+                }
+            }
+            if (name) CoTaskMemFree(name);
+        }
         HRESULT candidate_hr = IMFActivate_ActivateObject(
             activates[i], &IID_IMFTransform, (void **)&candidate);
         if (FAILED(candidate_hr)) continue;
@@ -492,6 +556,17 @@ BOOL vm_video_decode_probe_profile(ID3D11Device *device,
     return found;
 }
 
+BOOL vm_video_decode_probe_builtin_hevc444(ID3D11Device *device,
+                                           VmVideoDecodeCapability *out)
+{
+    return vm_video_decode_probe_profile(
+        device, ASB_HEVC444_PROBE_WIDTH, ASB_HEVC444_PROBE_HEIGHT,
+        ASB_HEVC444_PROBE_FPS_NUM, ASB_HEVC444_PROBE_FPS_DEN,
+        asb_hevc444_probe_sample, ASB_HEVC444_PROBE_EXTRADATA_SIZE,
+        asb_hevc444_probe_sample + ASB_HEVC444_PROBE_ACCESS_UNIT_OFFSET,
+        ASB_HEVC444_PROBE_ACCESS_UNIT_SIZE, VM_VIDEO_HEVC444, out);
+}
+
 BOOL vm_video_decode_supported_profile(ID3D11Device *device,
                                        VmVideoDecodeProfile profile)
 {
@@ -519,12 +594,14 @@ BOOL vm_video_decode_supported_profile(ID3D11Device *device,
     return SUCCEEDED(hr);
 }
 
-VmVideoDecoder *vm_video_decoder_create(ID3D11Device *device,
+VmVideoDecoder *vm_video_decoder_create_with_capability(
+                                        ID3D11Device *device,
                                         UINT width, UINT height,
                                         UINT fps_num, UINT fps_den,
                                         const BYTE *extradata,
                                         UINT extradata_size,
-                                        VmVideoDecodeProfile profile)
+                                        VmVideoDecodeProfile profile,
+                                        const VmVideoDecodeCapability *capability)
 {
     VmVideoDecoder *d = NULL;
     HRESULT hr = MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET);
@@ -541,7 +618,7 @@ VmVideoDecoder *vm_video_decoder_create(ID3D11Device *device,
         hr = IMFDXGIDeviceManager_ResetDevice(d->manager, (IUnknown *)device, d->reset_token);
     if (SUCCEEDED(hr)) hr = activate_configured_decoder(
         device, d->manager, width, height, fps_num, fps_den,
-        extradata, extradata_size, profile, &d->transform);
+        extradata, extradata_size, profile, capability, &d->transform);
     if (SUCCEEDED(hr)) hr = IMFTransform_ProcessMessage(d->transform,
                                       MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
     if (SUCCEEDED(hr)) hr = IMFTransform_ProcessMessage(d->transform,
@@ -558,6 +635,18 @@ VmVideoDecoder *vm_video_decoder_create(ID3D11Device *device,
 
     if (FAILED(hr)) { vm_video_decoder_destroy(d); return NULL; }
     return d;
+}
+
+VmVideoDecoder *vm_video_decoder_create(ID3D11Device *device,
+                                        UINT width, UINT height,
+                                        UINT fps_num, UINT fps_den,
+                                        const BYTE *extradata,
+                                        UINT extradata_size,
+                                        VmVideoDecodeProfile profile)
+{
+    return vm_video_decoder_create_with_capability(
+        device, width, height, fps_num, fps_den, extradata, extradata_size,
+        profile, NULL);
 }
 
 HRESULT vm_video_decoder_decode(VmVideoDecoder *d,

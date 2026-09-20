@@ -30,3 +30,13 @@ jobs:
         run: >-
           msbuild tools\win\hevc444-probe\hevc444-probe.vcxproj
           /t:Build /p:Configuration=Release /p:Platform=x64 /m
+      - name: Build the native D3D12 encode capability probe
+        shell: pwsh
+        run: >-
+          msbuild tools\win\hevc444-encode-probe\hevc444-encode-probe.vcxproj
+          /t:Build /p:Configuration=Release /p:Platform=x64 /m
+      - name: Build the optional NVENC probe stub
+        shell: pwsh
+        run: >-
+          msbuild tools\win\nvenc-hevc444-probe\nvenc-hevc444-probe.vcxproj
+          /t:Build /p:Configuration=Release /p:Platform=x64 /m
