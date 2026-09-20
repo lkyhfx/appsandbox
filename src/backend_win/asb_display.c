@@ -16,6 +16,7 @@
 #include "asb_core.h"
 #include "hcs_vm.h"
 #include "ui.h"
+#include "../core/display_protocol.h"
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -41,11 +42,11 @@ static const GUID INPUT_SERVICE_GUID =
 
 /* ---- Frame protocol ---- */
 
-#define FRAME_MAGIC         0x52465341  /* "ASFR" */
-#define DEFAULT_WIDTH       1920
-#define DEFAULT_HEIGHT      1080
-#define MAX_DIRTY_RECTS     64
-#define MAX_FRAME_DATA_SIZE (DEFAULT_WIDTH * DEFAULT_HEIGHT * 4)
+#define FRAME_MAGIC         ASB_DISPLAY_RAW_MAGIC
+#define DEFAULT_WIDTH       ASB_DISPLAY_DEFAULT_WIDTH
+#define DEFAULT_HEIGHT      ASB_DISPLAY_DEFAULT_HEIGHT
+#define MAX_DIRTY_RECTS     ASB_DISPLAY_MAX_DIRTY_RECTS
+#define MAX_FRAME_DATA_SIZE ASB_DISPLAY_MAX_FRAME_DATA_SIZE
 
 /* ---- Input protocol ---- */
 
@@ -66,14 +67,7 @@ typedef struct {
     UINT32 param3;
 } InputPacket;
 
-typedef struct {
-    UINT32 magic;
-    UINT32 width;
-    UINT32 height;
-    UINT32 stride;
-    UINT64 frame_seq;
-    UINT32 dirty_rect_count;
-} FrameHeader;
+typedef AsbDisplayFrameHeader FrameHeader;
 
 /* Cursor header — we skip cursor data in headless mode */
 #define CURSOR_MAGIC        0x52435341  /* "ASCR" */
@@ -200,6 +194,21 @@ static void send_input(AsbDisplay *d, UINT32 type, UINT32 p1, UINT32 p2, UINT32 
     }
 }
 
+static BOOL checked_raw_frame_layout(UINT width, UINT height, UINT stride,
+                                     SIZE_T *bytes_out)
+{
+    ULONGLONG bytes;
+    if (!width || !height || width > ASB_DISPLAY_RAW_MAX_WIDTH ||
+        height > ASB_DISPLAY_RAW_MAX_HEIGHT || width > UINT_MAX / 4 ||
+        stride < width * 4)
+        return FALSE;
+    bytes = (ULONGLONG)stride * height;
+    if (bytes > ASB_DISPLAY_MAX_FRAME_DATA_SIZE || bytes > (ULONGLONG)SIZE_MAX)
+        return FALSE;
+    if (bytes_out) *bytes_out = (SIZE_T)bytes;
+    return TRUE;
+}
+
 /* ---- Frame receive thread ---- */
 
 static DWORD WINAPI display_recv_thread(LPVOID param)
@@ -207,11 +216,12 @@ static DWORD WINAPI display_recv_thread(LPVOID param)
     AsbDisplay *d = (AsbDisplay *)param;
     WSADATA wsa;
     BYTE *recv_buf = NULL;
+    SIZE_T recv_capacity = (SIZE_T)DEFAULT_WIDTH * DEFAULT_HEIGHT * 4;
     SOCKET input_s = INVALID_SOCKET;
 
     WSAStartup(MAKEWORD(2, 2), &wsa);
 
-    recv_buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, MAX_FRAME_DATA_SIZE);
+    recv_buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, recv_capacity);
     if (!recv_buf) return 1;
 
     while (!d->stop) {
@@ -254,8 +264,10 @@ static DWORD WINAPI display_recv_thread(LPVOID param)
 
         /* Receive loop */
         while (!d->stop) {
-            RECT dirty_rects[MAX_DIRTY_RECTS];
+            AsbDisplayRect dirty_rects[MAX_DIRTY_RECTS];
             UINT32 data_size, rect_count, i, magic;
+            SIZE_T wire_frame_bytes;
+            ULONGLONG expected_data_size;
 
             if (!recv_exact(s, &magic, sizeof(magic)))
                 break;
@@ -290,23 +302,49 @@ static DWORD WINAPI display_recv_thread(LPVOID param)
                             sizeof(FrameHeader) - sizeof(UINT32)))
                 break;
 
-            if (hdr.width == 0 || hdr.height == 0 ||
-                hdr.width > 7680 || hdr.height > 4320 ||
-                hdr.stride < hdr.width * 4)
+            if (!checked_raw_frame_layout(hdr.width, hdr.height, hdr.stride,
+                                          &wire_frame_bytes))
                 break;
 
             rect_count = hdr.dirty_rect_count;
             if (rect_count > MAX_DIRTY_RECTS) break;
 
             if (rect_count > 0) {
-                if (!recv_exact(s, dirty_rects, (int)(rect_count * sizeof(RECT))))
+                if (!recv_exact(s, dirty_rects,
+                                (int)(rect_count * sizeof(AsbDisplayRect))))
                     break;
             }
+
+            expected_data_size = rect_count ? 0 : wire_frame_bytes;
+            for (i = 0; i < rect_count; i++) {
+                ULONGLONG width, height;
+                if (dirty_rects[i].left < 0 || dirty_rects[i].top < 0 ||
+                    dirty_rects[i].right <= dirty_rects[i].left ||
+                    dirty_rects[i].bottom <= dirty_rects[i].top ||
+                    (UINT32)dirty_rects[i].right > hdr.width ||
+                    (UINT32)dirty_rects[i].bottom > hdr.height)
+                    break;
+                width = (UINT32)(dirty_rects[i].right - dirty_rects[i].left);
+                height = (UINT32)(dirty_rects[i].bottom - dirty_rects[i].top);
+                expected_data_size += width * height * 4;
+                if (expected_data_size > ASB_DISPLAY_MAX_FRAME_DATA_SIZE)
+                    break;
+            }
+            if (i != rect_count || expected_data_size > UINT32_MAX)
+                break;
 
             if (!recv_exact(s, &data_size, 4))
                 break;
 
-            if (data_size > MAX_FRAME_DATA_SIZE) break;
+            if ((ULONGLONG)data_size != expected_data_size) break;
+
+            if ((SIZE_T)data_size > recv_capacity) {
+                BYTE *larger = (BYTE *)HeapReAlloc(GetProcessHeap(), 0,
+                                                   recv_buf, data_size);
+                if (!larger) break;
+                recv_buf = larger;
+                recv_capacity = data_size;
+            }
 
             if (data_size > 0) {
                 if (!recv_exact(s, recv_buf, (int)data_size))
@@ -318,7 +356,12 @@ static DWORD WINAPI display_recv_thread(LPVOID param)
 
             if (hdr.width != d->frame_width || hdr.height != d->frame_height) {
                 UINT new_stride = hdr.width * 4;
-                UINT new_size   = new_stride * hdr.height;
+                SIZE_T new_size;
+                if (!checked_raw_frame_layout(hdr.width, hdr.height,
+                                              new_stride, &new_size)) {
+                    LeaveCriticalSection(&d->frame_cs);
+                    break;
+                }
                 BYTE *new_buf   = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, new_size);
                 if (new_buf) {
                     if (d->frame_buf) HeapFree(GetProcessHeap(), 0, d->frame_buf);

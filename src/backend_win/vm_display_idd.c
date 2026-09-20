@@ -37,6 +37,7 @@
 #include "hcs_vm.h"
 #include "ui.h"
 #include "resource.h"
+#include "../core/display_protocol.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "d3d11.lib")
@@ -100,11 +101,11 @@ typedef struct AudioFrameHeader {
 
 /* ---- Frame protocol constants ---- */
 
-#define FRAME_MAGIC         0x52465341  /* "ASFR" little-endian */
-#define DEFAULT_WIDTH       1920
-#define DEFAULT_HEIGHT      1080
-#define MAX_DIRTY_RECTS     64
-#define MAX_FRAME_DATA_SIZE (DEFAULT_WIDTH * DEFAULT_HEIGHT * 4)
+#define FRAME_MAGIC         ASB_DISPLAY_RAW_MAGIC
+#define DEFAULT_WIDTH       ASB_DISPLAY_DEFAULT_WIDTH
+#define DEFAULT_HEIGHT      ASB_DISPLAY_DEFAULT_HEIGHT
+#define MAX_DIRTY_RECTS     ASB_DISPLAY_MAX_DIRTY_RECTS
+#define MAX_FRAME_DATA_SIZE ASB_DISPLAY_MAX_FRAME_DATA_SIZE
 
 /* ---- Window messages ---- */
 
@@ -117,6 +118,14 @@ typedef struct AudioFrameHeader {
 /* Timer for Present cadence when no frames arrive */
 #define IDT_PRESENT     2001
 #define PRESENT_MS      16   /* ~60 fps */
+#define IDT_FULLSCREEN_TOOLBAR 2002
+#define IDM_ENTER_FULLSCREEN 0x1030
+#define TOOLBAR_POLL_MS 100
+#define TOOLBAR_HIDE_MS 700
+#define TOOLBAR_HOTZONE_DIP 4
+#define TOOLBAR_HEIGHT_DIP 44
+#define TOOLBAR_WIDTH_DIP 176
+#define TOOLBAR_EDGE_MARGIN_DIP 8
 
 /* Debug log window */
 #define IDC_LOG_LIST      3001
@@ -145,14 +154,7 @@ static const char g_ps_hlsl[] =
 /* ---- Frame header from wire ---- */
 
 #pragma pack(push, 1)
-typedef struct FrameHeader {
-    UINT32 magic;
-    UINT32 width;
-    UINT32 height;
-    UINT32 stride;
-    UINT64 frame_seq;
-    UINT32 dirty_rect_count;
-} FrameHeader;
+typedef AsbDisplayFrameHeader FrameHeader;
 
 /* ---- Cursor header from wire (must match VDD_WIRE_CURSOR_HEADER) ---- */
 
@@ -186,6 +188,15 @@ struct VmDisplayIdd {
     HINSTANCE    hInstance;
     HWND         main_hwnd;
     HWND         hwnd;
+    BOOL         fullscreen;
+    WINDOWPLACEMENT windowed_placement;
+    LONG_PTR     windowed_style;
+    LONG_PTR     windowed_ex_style;
+    HWND         fullscreen_toolbar;
+    BOOL         fullscreen_toolbar_visible;
+    BOOL         fullscreen_toolbar_pressed;
+    BOOL         suppress_f11_up;
+    ULONGLONG    toolbar_leave_tick;
     volatile BOOL open;
     volatile BOOL stop;
 
@@ -207,6 +218,17 @@ struct VmDisplayIdd {
     UINT           frame_stride;
     CRITICAL_SECTION frame_cs;
     volatile BOOL  frame_dirty;
+    RECT           pending_dirty[MAX_DIRTY_RECTS];
+    UINT           pending_dirty_count;
+    BOOL           pending_full_upload;
+
+    /* Host-side upload counters. These are intentionally cheap counters and
+     * are logged from the render thread at a low cadence. */
+    ULONGLONG      host_full_uploads;
+    ULONGLONG      host_partial_uploads;
+    ULONGLONG      host_gpu_upload_bytes;
+    ULONGLONG      host_stats_start_ms;
+    ULONGLONG      host_stats_last_log_ms;
 
     UINT           render_count;     /* number of renders (for one-shot logging) */
     volatile UINT  recv_count;       /* number of frames received over HvSocket */
@@ -275,6 +297,12 @@ static DWORD WINAPI     idd_recv_thread_proc(LPVOID param);
 static void idd_update_relative_mouse(VmDisplayIdd *d);
 static void idd_resume_absolute_mouse(VmDisplayIdd *d, const InputPacket *reply);
 static void idd_poll_mouse_position(VmDisplayIdd *d);
+static LRESULT CALLBACK idd_fullscreen_toolbar_proc(HWND hwnd, UINT msg,
+                                                     WPARAM wp, LPARAM lp);
+static void idd_register_fullscreen_toolbar_class(HINSTANCE hInst);
+static void idd_enter_fullscreen(VmDisplayIdd *d);
+static void idd_exit_fullscreen(VmDisplayIdd *d);
+static void idd_show_fullscreen_toolbar(VmDisplayIdd *d);
 static void window_to_vm_coords(HWND hwnd, int wx, int wy, UINT vm_w, UINT vm_h,
                                 UINT *vx, UINT *vy);
 
@@ -283,6 +311,7 @@ static void window_to_vm_coords(HWND hwnd, int wx, int wy, UINT vm_w, UINT vm_h,
 static const wchar_t *IDD_DISPLAY_CLASS = L"AppSandboxIddDisplay";
 static const wchar_t *IDD_RENDER_CLASS  = L"AppSandboxIddRender";
 static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
+static const wchar_t *IDD_TOOLBAR_CLASS = L"AppSandboxIddFullscreenToolbar";
 
 /* System menu command IDs — must be < 0xF000 and have low 4 bits clear */
 #define IDM_AUDIO_MUTE     0x1000
@@ -410,6 +439,98 @@ static LRESULT CALLBACK idd_render_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+/* Mouse-only host overlay.  This is intentionally not a standard BUTTON:
+   clicking it must not move keyboard focus away from the IDD window while
+   fullscreen input is being captured for the guest. */
+static LRESULT CALLBACK idd_fullscreen_toolbar_proc(HWND hwnd, UINT msg,
+                                                     WPARAM wp, LPARAM lp)
+{
+    VmDisplayIdd *d = (VmDisplayIdd *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+
+    if (msg == WM_NCCREATE) {
+        CREATESTRUCTW *cs = (CREATESTRUCTW *)lp;
+        d = (VmDisplayIdd *)cs->lpCreateParams;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)d);
+    }
+
+    switch (msg) {
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+
+    case WM_SETCURSOR:
+        SetCursor(LoadCursorW(NULL, IDC_ARROW));
+        return TRUE;
+
+    case WM_MOUSEMOVE:
+        if (d) {
+            d->toolbar_leave_tick = 0;
+            idd_show_fullscreen_toolbar(d);
+        }
+        SetCursor(LoadCursorW(NULL, IDC_ARROW));
+        return 0;
+
+    case WM_LBUTTONDOWN:
+        if (d) {
+            d->fullscreen_toolbar_pressed = TRUE;
+            SetCapture(hwnd);
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
+
+    case WM_LBUTTONUP:
+        if (d) {
+            POINT pt = { (int)(short)LOWORD(lp), (int)(short)HIWORD(lp) };
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            d->fullscreen_toolbar_pressed = FALSE;
+            if (GetCapture() == hwnd) ReleaseCapture();
+            InvalidateRect(hwnd, NULL, FALSE);
+            if (PtInRect(&rc, pt) && d->fullscreen)
+                idd_exit_fullscreen(d);
+        }
+        return 0;
+
+    case WM_CAPTURECHANGED:
+        if (d) {
+            d->fullscreen_toolbar_pressed = FALSE;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
+
+    case WM_MOUSEWHEEL:
+    case WM_MOUSEHWHEEL:
+        /* Never let wheel input bubble from the host overlay to the guest. */
+        return 0;
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT:
+    {
+        PAINTSTRUCT ps;
+        RECT rc;
+        HBRUSH bg, border;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        GetClientRect(hwnd, &rc);
+        bg = CreateSolidBrush(d && d->fullscreen_toolbar_pressed
+                                  ? RGB(64, 64, 68) : RGB(45, 45, 48));
+        border = CreateSolidBrush(RGB(130, 130, 136));
+        FillRect(hdc, &rc, bg);
+        FrameRect(hdc, &rc, border);
+        DeleteObject(bg);
+        DeleteObject(border);
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, RGB(240, 240, 242));
+        DrawTextW(hdc, L"Exit Fullscreen", -1, &rc,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    }
+
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
 static void ensure_idd_class(HINSTANCE hInst)
 {
     WNDCLASSEXW wc;
@@ -450,9 +571,26 @@ static void ensure_idd_class(HINSTANCE hInst)
     wc.lpszClassName = IDD_LOG_CLASS;
     RegisterClassExW(&wc);
 
+    idd_register_fullscreen_toolbar_class(hInst);
     g_idd_class_registered = TRUE;
 }
 
+
+
+/* Mouse-only host overlay used by borderless fullscreen. */
+static void idd_register_fullscreen_toolbar_class(HINSTANCE hInst)
+{
+    WNDCLASSEXW wc;
+    ZeroMemory(&wc, sizeof(wc));
+    wc.cbSize        = sizeof(wc);
+    wc.style         = CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc   = idd_fullscreen_toolbar_proc;
+    wc.hInstance     = hInst;
+    wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
+    wc.hbrBackground = NULL;
+    wc.lpszClassName = IDD_TOOLBAR_CLASS;
+    RegisterClassExW(&wc);
+}
 
 
 /* ---- Debug log panel ---- */
@@ -552,6 +690,48 @@ static void idd_cancel_mouse_sync(VmDisplayIdd *d)
                   d->guest_cursor ? d->guest_cursor : LoadCursorW(NULL, IDC_ARROW));
 }
 
+static UINT idd_dip_to_px(HWND hwnd, int dip)
+{
+    UINT dpi = hwnd ? GetDpiForWindow(hwnd) : 96;
+    UINT px;
+    if (!dpi) dpi = 96;
+    px = (UINT)MulDiv(dip, (int)dpi, 96);
+    return px ? px : 1;
+}
+
+/* While the overlay is visible, keep the whole top strip out of relative
+   capture.  This lets the pointer travel from the render surface into the
+   toolbar even when the guest cursor is hidden. */
+static BOOL idd_point_in_fullscreen_toolbar_region(VmDisplayIdd *d, POINT pt)
+{
+    RECT rc;
+    int top;
+    if (!d->fullscreen || !d->fullscreen_toolbar_visible || !d->hwnd)
+        return FALSE;
+    if (!GetClientRect(d->hwnd, &rc) || !ScreenToClient(d->hwnd, &pt))
+        return FALSE;
+    top = (int)idd_dip_to_px(d->hwnd, TOOLBAR_HEIGHT_DIP + TOOLBAR_EDGE_MARGIN_DIP);
+    return pt.x >= 0 && pt.x < rc.right && pt.y >= 0 && pt.y <= top;
+}
+
+/* Temporarily release raw/relative capture without changing the user's
+   relative-mouse preference.  Used when the host overlay or fullscreen
+   transition needs the real cursor back. */
+static void idd_suspend_relative_mouse_capture(VmDisplayIdd *d)
+{
+    AcquireSRWLockExclusive(&g_mouse_capture_lock);
+    if (g_mouse_capture_hwnd == d->hwnd) {
+        RAWINPUTDEVICE mouse = { 0x01, 0x02, RIDEV_REMOVE, NULL };
+        RegisterRawInputDevices(&mouse, 1, sizeof(mouse));
+        ClipCursor(NULL);
+        g_mouse_capture_hwnd = NULL;
+    }
+    d->relative_mouse = FALSE;
+    d->raw_absolute_valid = FALSE;
+    ReleaseSRWLockExclusive(&g_mouse_capture_lock);
+    idd_cancel_mouse_sync(d);
+}
+
 static void idd_update_relative_mouse(VmDisplayIdd *d)
 {
     POINT pt = {0};
@@ -560,7 +740,8 @@ static void idd_update_relative_mouse(VmDisplayIdd *d)
                    d->input_socket != INVALID_SOCKET && d->input_focused &&
                    !d->input_menu_active && !d->input_sizing &&
                    GetForegroundWindow() == d->hwnd && !IsIconic(d->hwnd) &&
-                   GetCursorPos(&pt) && WindowFromPoint(pt) == d->render_hwnd;
+                   GetCursorPos(&pt) && WindowFromPoint(pt) == d->render_hwnd &&
+                   !idd_point_in_fullscreen_toolbar_region(d, pt);
     BOOL capture = active && !d->cursor_visible;
     BOOL sync_absolute = FALSE;
     if (!active || capture) idd_cancel_mouse_sync(d);
@@ -707,6 +888,11 @@ static BOOL idd_is_reserved_hotkey(DWORD vk, BOOL alt_down)
     }
 }
 
+static BOOL idd_capture_all_keys(const VmDisplayIdd *d)
+{
+    return d->fullscreen || d->transmit_hotkeys;
+}
+
 /* Forward a key event to the guest and track held state so a later focus
    change can release anything still down. Runs on the window thread only. */
 static void idd_forward_key(VmDisplayIdd *d, DWORD vk, DWORD scan, BOOL ext, BOOL up)
@@ -788,8 +974,13 @@ static LRESULT CALLBACK idd_ll_keyboard_proc(int code, WPARAM wp, LPARAM lp)
         BOOL up = (wp == WM_KEYUP || wp == WM_SYSKEYUP);
         BOOL ext = (k->flags & LLKHF_EXTENDED) != 0;
         BOOL focused = d->input_focused && GetForegroundWindow() == d->hwnd;
+        if (focused && d->suppress_f11_up && up && k->vkCode == VK_F11) {
+            d->suppress_f11_up = FALSE;
+            return 1;
+        }
         if (d->keyboard_version != INPUT_KEYBOARD_VERSION) {
-            if (focused && d->transmit_hotkeys) {
+            if (focused && idd_capture_all_keys(d) &&
+                (d->fullscreen || k->vkCode != VK_F11)) {
                 idd_forward_key(d, k->vkCode, k->scanCode, ext, up);
                 return 1;
             }
@@ -808,7 +999,9 @@ static LRESULT CALLBACK idd_ll_keyboard_proc(int code, WPARAM wp, LPARAM lp)
             if (!route) {
                 if (up && scan != 0xF1 && scan != 0xF2)
                     return CallNextHookEx(NULL, code, wp, lp);
-                if (d->transmit_hotkeys) {
+                if (!d->fullscreen && k->vkCode == VK_F11) {
+                    route = KEY_ROUTE_HOST;
+                } else if (idd_capture_all_keys(d)) {
                     route = KEY_ROUTE_GUEST;
                 } else if (idd_is_reserved_hotkey(k->vkCode, (k->flags & LLKHF_ALTDOWN) != 0) ||
                            (GetAsyncKeyState(VK_LWIN) & 0x8000) ||
@@ -859,7 +1052,7 @@ static void idd_remove_kbd_hook(VmDisplayIdd *d)
 
 static void idd_update_kbd_hook(VmDisplayIdd *d)
 {
-    if (d->transmit_hotkeys || d->keyboard_version == INPUT_KEYBOARD_VERSION)
+    if (idd_capture_all_keys(d) || d->keyboard_version == INPUT_KEYBOARD_VERSION)
         idd_install_kbd_hook(d);
     else
         idd_remove_kbd_hook(d);
@@ -1373,6 +1566,108 @@ static BOOL d3d_compile_shader(const char *hlsl, const char *entry,
     return TRUE;
 }
 
+static BOOL checked_raw_frame_layout(UINT width, UINT height, UINT stride,
+                                     SIZE_T *bytes_out)
+{
+    ULONGLONG bytes;
+    if (!width || !height || width > ASB_DISPLAY_RAW_MAX_WIDTH ||
+        height > ASB_DISPLAY_RAW_MAX_HEIGHT || width > UINT_MAX / 4 ||
+        stride < width * 4)
+        return FALSE;
+    bytes = (ULONGLONG)stride * height;
+    if (bytes > ASB_DISPLAY_MAX_FRAME_DATA_SIZE || bytes > (ULONGLONG)SIZE_MAX)
+        return FALSE;
+    if (bytes_out) *bytes_out = (SIZE_T)bytes;
+    return TRUE;
+}
+
+static void pending_mark_full_locked(VmDisplayIdd *d)
+{
+    d->pending_full_upload = TRUE;
+    d->pending_dirty_count = 0;
+    d->frame_dirty = TRUE;
+}
+
+static void pending_add_rect_locked(VmDisplayIdd *d, RECT rect)
+{
+    UINT i;
+
+    if (d->pending_full_upload) return;
+    if (rect.left < 0) rect.left = 0;
+    if (rect.top < 0) rect.top = 0;
+    if (rect.right > (LONG)d->frame_width) rect.right = (LONG)d->frame_width;
+    if (rect.bottom > (LONG)d->frame_height) rect.bottom = (LONG)d->frame_height;
+    if (rect.left >= rect.right || rect.top >= rect.bottom) return;
+
+    /* Merge overlapping or touching regions. A bounding-box union is safe:
+     * the CPU backing buffer already contains the newest pixels everywhere
+     * inside the union, so uploading a little extra never loses an update. */
+    for (;;) {
+        BOOL merged = FALSE;
+        for (i = 0; i < d->pending_dirty_count; i++) {
+            RECT *old = &d->pending_dirty[i];
+            if (rect.right < old->left || old->right < rect.left ||
+                rect.bottom < old->top || old->bottom < rect.top)
+                continue;
+            if (rect.left > old->left) rect.left = old->left;
+            if (rect.top > old->top) rect.top = old->top;
+            if (rect.right < old->right) rect.right = old->right;
+            if (rect.bottom < old->bottom) rect.bottom = old->bottom;
+            d->pending_dirty[i] = d->pending_dirty[--d->pending_dirty_count];
+            merged = TRUE;
+            break;
+        }
+        if (!merged) break;
+    }
+    if (d->pending_dirty_count >= MAX_DIRTY_RECTS) {
+        pending_mark_full_locked(d);
+        return;
+    }
+    d->pending_dirty[d->pending_dirty_count++] = rect;
+    d->frame_dirty = TRUE;
+}
+
+static void pending_add_wire_rects_locked(VmDisplayIdd *d,
+                                          const AsbDisplayRect *rects,
+                                          UINT count)
+{
+    UINT i;
+    for (i = 0; i < count; i++) {
+        RECT rect;
+        rect.left = rects[i].left;
+        rect.top = rects[i].top;
+        rect.right = rects[i].right;
+        rect.bottom = rects[i].bottom;
+        pending_add_rect_locked(d, rect);
+        if (d->pending_full_upload) return;
+    }
+}
+
+static void maybe_log_host_stats(VmDisplayIdd *d)
+{
+    ULONGLONG now = GetTickCount64();
+    ULONGLONG elapsed;
+    double mib_per_sec;
+
+    if (!d->host_stats_start_ms) d->host_stats_start_ms = now;
+    if (d->host_stats_last_log_ms && now - d->host_stats_last_log_ms < 5000)
+        return;
+    d->host_stats_last_log_ms = now;
+    elapsed = now - d->host_stats_start_ms;
+    mib_per_sec = elapsed
+        ? (double)d->host_gpu_upload_bytes * 1000.0 /
+          ((double)elapsed * 1024.0 * 1024.0) : 0.0;
+    idd_log(d, L"display_stats scope=host resolution=%ux%u logical_refresh_hz=60 "
+            L"host_full_uploads=%llu host_partial_uploads=%llu "
+            L"host_gpu_upload_bytes=%llu host_gpu_upload_mib_per_sec=%.3f "
+            L"recv_fps=%.2f present_fps=%.2f lost_dirty_updates=0",
+            d->frame_width, d->frame_height,
+            d->host_full_uploads, d->host_partial_uploads,
+            d->host_gpu_upload_bytes, mib_per_sec,
+            elapsed ? (double)d->recv_count * 1000.0 / elapsed : 0.0,
+            elapsed ? (double)d->render_count * 1000.0 / elapsed : 0.0);
+}
+
 static BOOL d3d_init(VmDisplayIdd *d)
 {
     DXGI_SWAP_CHAIN_DESC scd;
@@ -1426,17 +1721,17 @@ static BOOL d3d_init(VmDisplayIdd *d)
         }
     }
 
-    /* Create frame texture (dynamic, CPU-writable) */
+    /* Create frame texture. Raw frames are copied through UpdateSubresource;
+     * the default-usage resource is required for efficient partial uploads. */
     ZeroMemory(&td, sizeof(td));
-    td.Width              = DEFAULT_WIDTH;
-    td.Height             = DEFAULT_HEIGHT;
+    td.Width              = d->frame_width;
+    td.Height             = d->frame_height;
     td.MipLevels          = 1;
     td.ArraySize          = 1;
     td.Format             = DXGI_FORMAT_B8G8R8A8_UNORM;
     td.SampleDesc.Count   = 1;
-    td.Usage              = D3D11_USAGE_DYNAMIC;
+    td.Usage              = D3D11_USAGE_DEFAULT;
     td.BindFlags          = D3D11_BIND_SHADER_RESOURCE;
-    td.CPUAccessFlags     = D3D11_CPU_ACCESS_WRITE;
 
     hr = d->device->lpVtbl->CreateTexture2D(d->device, &td, NULL, &d->frame_tex);
     if (FAILED(hr)) {
@@ -1499,6 +1794,8 @@ static BOOL d3d_init(VmDisplayIdd *d)
         return FALSE;
     }
 
+    d->pending_full_upload = TRUE;
+    d->frame_dirty = TRUE;
     return TRUE;
 }
 
@@ -1539,12 +1836,60 @@ static void d3d_resize_swap_chain(VmDisplayIdd *d)
     }
 }
 
+static BOOL d3d_ensure_raw_frame_texture(VmDisplayIdd *d)
+{
+    D3D11_TEXTURE2D_DESC current, desc;
+    D3D11_SHADER_RESOURCE_VIEW_DESC view;
+    HRESULT hr;
+
+    if (d->frame_tex) {
+        ID3D11Texture2D_GetDesc(d->frame_tex, &current);
+        if (current.Width == d->frame_width &&
+            current.Height == d->frame_height &&
+            current.Usage == D3D11_USAGE_DEFAULT)
+            return TRUE;
+    }
+
+    if (d->frame_srv) {
+        d->frame_srv->lpVtbl->Release(d->frame_srv);
+        d->frame_srv = NULL;
+    }
+    if (d->frame_tex) {
+        d->frame_tex->lpVtbl->Release(d->frame_tex);
+        d->frame_tex = NULL;
+    }
+
+    ZeroMemory(&desc, sizeof(desc));
+    desc.Width = d->frame_width;
+    desc.Height = d->frame_height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    hr = d->device->lpVtbl->CreateTexture2D(d->device, &desc, NULL, &d->frame_tex);
+    if (FAILED(hr)) return FALSE;
+
+    ZeroMemory(&view, sizeof(view));
+    view.Format = desc.Format;
+    view.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    view.Texture2D.MipLevels = 1;
+    hr = d->device->lpVtbl->CreateShaderResourceView(
+        d->device, (ID3D11Resource *)d->frame_tex, &view, &d->frame_srv);
+    if (FAILED(hr)) {
+        d->frame_tex->lpVtbl->Release(d->frame_tex);
+        d->frame_tex = NULL;
+        return FALSE;
+    }
+    pending_mark_full_locked(d);
+    return TRUE;
+}
+
 static void d3d_render_frame(VmDisplayIdd *d)
 {
-    D3D11_MAPPED_SUBRESOURCE mapped;
     D3D11_VIEWPORT vp;
     RECT rc;
-    HRESULT hr;
     float clear_color[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
     BOOL frame_uploaded = FALSE;
 
@@ -1554,28 +1899,45 @@ static void d3d_render_frame(VmDisplayIdd *d)
     /* Upload frame data to GPU texture if dirty */
     if (d->frame_dirty) {
         EnterCriticalSection(&d->frame_cs);
-        hr = d->ctx->lpVtbl->Map(d->ctx,
-                (ID3D11Resource *)d->frame_tex, 0,
-                D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-        if (SUCCEEDED(hr)) {
-            UINT row;
-            UINT copy_stride = d->frame_width * 4;
-            if (copy_stride > mapped.RowPitch)
-                copy_stride = mapped.RowPitch;
-            if (copy_stride > d->frame_stride)
-                copy_stride = d->frame_stride;
-
-            for (row = 0; row < d->frame_height && row < DEFAULT_HEIGHT; row++) {
-                memcpy((BYTE *)mapped.pData + row * mapped.RowPitch,
-                       d->frame_buf + row * d->frame_stride,
-                       copy_stride);
+        if (d3d_ensure_raw_frame_texture(d)) {
+            if (d->pending_full_upload) {
+                d->ctx->lpVtbl->UpdateSubresource(
+                    d->ctx, (ID3D11Resource *)d->frame_tex, 0, NULL,
+                    d->frame_buf, d->frame_stride,
+                    d->frame_stride * d->frame_height);
+                d->host_full_uploads++;
+                d->host_gpu_upload_bytes +=
+                    (ULONGLONG)d->frame_width * d->frame_height * 4;
+            } else {
+                UINT i;
+                for (i = 0; i < d->pending_dirty_count; i++) {
+                    RECT *r = &d->pending_dirty[i];
+                    D3D11_BOX box;
+                    UINT width = (UINT)(r->right - r->left);
+                    UINT height = (UINT)(r->bottom - r->top);
+                    const BYTE *src = d->frame_buf +
+                        (SIZE_T)r->top * d->frame_stride + (SIZE_T)r->left * 4;
+                    ZeroMemory(&box, sizeof(box));
+                    box.left = (UINT)r->left;
+                    box.top = (UINT)r->top;
+                    box.right = (UINT)r->right;
+                    box.bottom = (UINT)r->bottom;
+                    box.back = 1;
+                    d->ctx->lpVtbl->UpdateSubresource(
+                        d->ctx, (ID3D11Resource *)d->frame_tex, 0, &box,
+                        src, d->frame_stride, d->frame_stride * height);
+                    d->host_gpu_upload_bytes += (ULONGLONG)width * height * 4;
+                }
+                if (d->pending_dirty_count)
+                    d->host_partial_uploads++;
             }
-            d->ctx->lpVtbl->Unmap(d->ctx,
-                    (ID3D11Resource *)d->frame_tex, 0);
+            d->pending_full_upload = FALSE;
+            d->pending_dirty_count = 0;
+            d->frame_dirty = FALSE;
+            frame_uploaded = TRUE;
         }
-        d->frame_dirty = FALSE;
         LeaveCriticalSection(&d->frame_cs);
-        frame_uploaded = TRUE;
+        maybe_log_host_stats(d);
     }
 
     /* Compute letterboxed viewport within client area */
@@ -1849,11 +2211,12 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
     VmDisplayIdd *d = (VmDisplayIdd *)param;
     WSADATA wsa;
     BYTE *recv_buf = NULL;
+    SIZE_T recv_capacity = (SIZE_T)DEFAULT_WIDTH * DEFAULT_HEIGHT * 4;
 
     WSAStartup(MAKEWORD(2, 2), &wsa);
 
     /* Allocate receive buffer for frame pixel data */
-    recv_buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, MAX_FRAME_DATA_SIZE);
+    recv_buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, recv_capacity);
     if (!recv_buf) {
         ui_log(L"IDD recv: failed to allocate receive buffer");
         return 1;
@@ -1914,11 +2277,13 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
 
         /* Receive loop — reads magic first to dispatch frame vs cursor */
         while (!d->stop) {
-            RECT dirty_rects[MAX_DIRTY_RECTS];
+            AsbDisplayRect dirty_rects[MAX_DIRTY_RECTS];
             UINT32 data_size;
             UINT32 rect_count;
             UINT32 i;
             UINT32 magic;
+            SIZE_T wire_frame_bytes;
+            ULONGLONG expected_data_size;
 
             /* Peek at magic to determine message type */
             if (!recv_exact(s, &magic, sizeof(magic)))
@@ -1985,9 +2350,8 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 break;
 
             /* Sanity checks */
-            if (hdr.width == 0 || hdr.height == 0 ||
-                hdr.width > 7680 || hdr.height > 4320 ||
-                hdr.stride < hdr.width * 4) {
+            if (!checked_raw_frame_layout(hdr.width, hdr.height, hdr.stride,
+                                          &wire_frame_bytes)) {
                 idd_log(d, L"Invalid frame dimensions %ux%u stride %u.",
                        hdr.width, hdr.height, hdr.stride);
                 break;
@@ -2001,17 +2365,49 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
 
             /* Read dirty rects */
             if (rect_count > 0) {
-                if (!recv_exact(s, dirty_rects, (int)(rect_count * sizeof(RECT))))
+                if (!recv_exact(s, dirty_rects,
+                                (int)(rect_count * sizeof(AsbDisplayRect))))
                     break;
             }
+
+            expected_data_size = rect_count ? 0 : wire_frame_bytes;
+            for (i = 0; i < rect_count; i++) {
+                ULONGLONG width, height;
+                if (dirty_rects[i].left < 0 || dirty_rects[i].top < 0 ||
+                    dirty_rects[i].right <= dirty_rects[i].left ||
+                    dirty_rects[i].bottom <= dirty_rects[i].top ||
+                    (UINT32)dirty_rects[i].right > hdr.width ||
+                    (UINT32)dirty_rects[i].bottom > hdr.height) {
+                    idd_log(d, L"Invalid dirty rect %d: (%d,%d)-(%d,%d).",
+                            i, dirty_rects[i].left, dirty_rects[i].top,
+                            dirty_rects[i].right, dirty_rects[i].bottom);
+                    break;
+                }
+                width = (UINT32)(dirty_rects[i].right - dirty_rects[i].left);
+                height = (UINT32)(dirty_rects[i].bottom - dirty_rects[i].top);
+                expected_data_size += width * height * 4;
+                if (expected_data_size > ASB_DISPLAY_MAX_FRAME_DATA_SIZE)
+                    break;
+            }
+            if (i != rect_count || expected_data_size > UINT32_MAX)
+                break;
 
             /* Read data_size */
             if (!recv_exact(s, &data_size, 4))
                 break;
 
-            if (data_size > MAX_FRAME_DATA_SIZE) {
-                idd_log(d, L"Frame data too large (%u bytes), reconnecting.", data_size);
+            if ((ULONGLONG)data_size != expected_data_size) {
+                idd_log(d, L"Frame data size mismatch: got %u expected %llu.",
+                        data_size, expected_data_size);
                 break;
+            }
+
+            if ((SIZE_T)data_size > recv_capacity) {
+                BYTE *larger = (BYTE *)HeapReAlloc(GetProcessHeap(), 0,
+                                                   recv_buf, data_size);
+                if (!larger) break;
+                recv_buf = larger;
+                recv_capacity = data_size;
             }
 
             /* Read pixel data */
@@ -2026,7 +2422,12 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             /* Reallocate frame_buf if resolution changed */
             if (hdr.width != d->frame_width || hdr.height != d->frame_height) {
                 UINT new_stride = hdr.width * 4;
-                UINT new_size   = new_stride * hdr.height;
+                SIZE_T new_size;
+                if (!checked_raw_frame_layout(hdr.width, hdr.height,
+                                              new_stride, &new_size)) {
+                    LeaveCriticalSection(&d->frame_cs);
+                    break;
+                }
                 BYTE *new_buf   = (BYTE *)HeapAlloc(GetProcessHeap(),
                                                      HEAP_ZERO_MEMORY, new_size);
                 if (new_buf) {
@@ -2038,7 +2439,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     d->frame_stride = new_stride;
                     idd_log(d, L"Frame resolution changed: %ux%u (stride=%u)",
                             hdr.width, hdr.height, hdr.stride);
-                    idd_log(d, L"Resolution changed to %ux%u.", hdr.width, hdr.height);
+                    pending_mark_full_locked(d);
                 } else {
                     LeaveCriticalSection(&d->frame_cs);
                     break;
@@ -2100,7 +2501,10 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 }
             }
 
-            d->frame_dirty = TRUE;
+            if (rect_count == 0)
+                pending_mark_full_locked(d);
+            else
+                pending_add_wire_rects_locked(d, dirty_rects, rect_count);
             d->recv_count++;
             LeaveCriticalSection(&d->frame_cs);
             if (!d->frame_connected) {
@@ -2170,6 +2574,120 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
  * Window thread — creates window, initializes D3D11, runs message pump
  * ================================================================== */
 
+static void idd_layout_fullscreen_toolbar(VmDisplayIdd *d)
+{
+    RECT rc;
+    int width, height, x;
+    if (!d->fullscreen_toolbar || !GetClientRect(d->hwnd, &rc)) return;
+    width = (int)idd_dip_to_px(d->hwnd, TOOLBAR_WIDTH_DIP);
+    height = (int)idd_dip_to_px(d->hwnd, TOOLBAR_HEIGHT_DIP);
+    if (width > rc.right) width = rc.right;
+    if (height > rc.bottom) height = rc.bottom;
+    x = (rc.right - width) / 2;
+    SetWindowPos(d->fullscreen_toolbar, HWND_TOP, x, 0, width, height,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
+
+static void idd_hide_fullscreen_toolbar(VmDisplayIdd *d)
+{
+    if (!d->fullscreen_toolbar_visible) return;
+    d->fullscreen_toolbar_visible = FALSE;
+    d->fullscreen_toolbar_pressed = FALSE;
+    d->toolbar_leave_tick = 0;
+    KillTimer(d->hwnd, IDT_FULLSCREEN_TOOLBAR);
+    if (d->fullscreen_toolbar)
+        ShowWindow(d->fullscreen_toolbar, SW_HIDE);
+    if (d->fullscreen)
+        idd_update_relative_mouse(d);
+}
+
+static void idd_show_fullscreen_toolbar(VmDisplayIdd *d)
+{
+    if (!d || !d->fullscreen || d->stop || !d->hwnd) return;
+    if (!d->fullscreen_toolbar) {
+        d->fullscreen_toolbar = CreateWindowExW(
+            WS_EX_NOACTIVATE, IDD_TOOLBAR_CLASS, NULL,
+            WS_CHILD | WS_CLIPSIBLINGS,
+            0, 0, 1, 1, d->hwnd, NULL, d->hInstance, d);
+        if (!d->fullscreen_toolbar) {
+            idd_log(d, L"Fullscreen toolbar creation failed (err %lu).",
+                    GetLastError());
+            return;
+        }
+    }
+    d->fullscreen_toolbar_visible = TRUE;
+    d->toolbar_leave_tick = 0;
+    idd_flush_mouse_buttons(d);
+    idd_suspend_relative_mouse_capture(d);
+    SetCursor(LoadCursorW(NULL, IDC_ARROW));
+    idd_layout_fullscreen_toolbar(d);
+    SetTimer(d->hwnd, IDT_FULLSCREEN_TOOLBAR, TOOLBAR_POLL_MS, NULL);
+}
+
+static void idd_enter_fullscreen(VmDisplayIdd *d)
+{
+    WINDOWPLACEMENT placement;
+    MONITORINFO mi;
+    LONG_PTR style;
+    HMONITOR monitor;
+    HWND hwnd;
+
+    if (!d || !d->hwnd || d->fullscreen) return;
+    hwnd = d->hwnd;
+    ZeroMemory(&placement, sizeof(placement));
+    placement.length = sizeof(placement);
+    if (!GetWindowPlacement(hwnd, &placement)) return;
+    monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    ZeroMemory(&mi, sizeof(mi));
+    mi.cbSize = sizeof(mi);
+    if (!monitor || !GetMonitorInfoW(monitor, &mi)) return;
+
+    d->windowed_placement = placement;
+    d->windowed_style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    d->windowed_ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    idd_suspend_relative_mouse_capture(d);
+
+    style = d->windowed_style;
+    style &= ~(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX |
+               WS_MAXIMIZEBOX | WS_SYSMENU);
+    style |= WS_POPUP | WS_CLIPCHILDREN;
+    SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, d->windowed_ex_style);
+    d->fullscreen = TRUE;
+    d->fullscreen_toolbar_visible = FALSE;
+    d->toolbar_leave_tick = 0;
+
+    SetWindowPos(hwnd, HWND_TOP,
+                 mi.rcMonitor.left, mi.rcMonitor.top,
+                 mi.rcMonitor.right - mi.rcMonitor.left,
+                 mi.rcMonitor.bottom - mi.rcMonitor.top,
+                 SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+    idd_update_kbd_hook(d);
+    idd_update_relative_mouse(d);
+    idd_log(d, L"Entered borderless fullscreen.");
+}
+
+static void idd_exit_fullscreen(VmDisplayIdd *d)
+{
+    HWND hwnd;
+    if (!d || !d->hwnd || !d->fullscreen) return;
+    hwnd = d->hwnd;
+
+    idd_suspend_relative_mouse_capture(d);
+    idd_flush_held_keys(d);
+    d->fullscreen = FALSE;
+    idd_hide_fullscreen_toolbar(d);
+    SetWindowLongPtrW(hwnd, GWL_STYLE, d->windowed_style);
+    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, d->windowed_ex_style);
+    SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                 SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    SetWindowPlacement(hwnd, &d->windowed_placement);
+    idd_update_kbd_hook(d);
+    idd_update_relative_mouse(d);
+    idd_log(d, L"Exited borderless fullscreen.");
+}
+
 static DWORD WINAPI idd_window_thread_proc(LPVOID param)
 {
     VmDisplayIdd *d = (VmDisplayIdd *)param;
@@ -2214,6 +2732,7 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
             AppendMenuW(sysmenu, MF_STRING, IDM_AUDIO_MUTE, L"Mute audio");
             AppendMenuW(sysmenu, MF_STRING, IDM_XMIT_HOTKEYS, L"Transmit Keyboard Hotkeys");
             AppendMenuW(sysmenu, MF_STRING, IDM_SHOW_LOG, L"Show Log");
+            AppendMenuW(sysmenu, MF_STRING, IDM_ENTER_FULLSCREEN, L"Enter Fullscreen");
             CheckMenuItem(sysmenu, IDM_XMIT_HOTKEYS,
                           MF_BYCOMMAND | (d->transmit_hotkeys ? MF_CHECKED : MF_UNCHECKED));
         }
@@ -2336,6 +2855,10 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     switch (msg) {
     case WM_SYSCOMMAND:
+        if (d && (wp & 0xFFF0) == IDM_ENTER_FULLSCREEN) {
+            if (!d->fullscreen) idd_enter_fullscreen(d);
+            return 0;
+        }
         if (d && (wp & 0xFFF0) == IDM_AUDIO_MUTE) {
             HMENU sysmenu = GetSystemMenu(hwnd, FALSE);
             wchar_t title[300];
@@ -2453,6 +2976,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_DESTROY:
         KillTimer(hwnd, IDT_PRESENT);
+        KillTimer(hwnd, IDT_FULLSCREEN_TOOLBAR);
         if (d) idd_remove_kbd_hook(d);  /* safety net if WM_CLOSE was bypassed */
         if (d) {
             d->stop = TRUE;
@@ -2484,12 +3008,40 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
+    case WM_DPICHANGED:
+        if (d) {
+            RECT *suggested = (RECT *)lp;
+            if (d->fullscreen) {
+                HMONITOR monitor = MonitorFromRect(suggested, MONITOR_DEFAULTTONEAREST);
+                MONITORINFO mi = { sizeof(mi) };
+                if (monitor && GetMonitorInfoW(monitor, &mi)) {
+                    SetWindowPos(hwnd, NULL,
+                                 mi.rcMonitor.left, mi.rcMonitor.top,
+                                 mi.rcMonitor.right - mi.rcMonitor.left,
+                                 mi.rcMonitor.bottom - mi.rcMonitor.top,
+                                 SWP_NOZORDER | SWP_NOACTIVATE |
+                                 SWP_NOOWNERZORDER);
+                }
+            } else if (suggested) {
+                SetWindowPos(hwnd, NULL,
+                             suggested->left, suggested->top,
+                             suggested->right - suggested->left,
+                             suggested->bottom - suggested->top,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            if (d->fullscreen_toolbar_visible)
+                idd_layout_fullscreen_toolbar(d);
+        }
+        return 0;
+
     case WM_SIZE:
         if (d) {
             RECT rc;
             GetClientRect(hwnd, &rc);
             if (d->render_hwnd)
                 MoveWindow(d->render_hwnd, 0, 0, rc.right, rc.bottom, TRUE);
+            if (d->fullscreen_toolbar_visible)
+                idd_layout_fullscreen_toolbar(d);
             d3d_resize_swap_chain(d);
             if (d->relative_mouse) {
                 AcquireSRWLockExclusive(&g_mouse_capture_lock);
@@ -2527,6 +3079,19 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
 
     case WM_TIMER:
+        if (wp == IDT_FULLSCREEN_TOOLBAR && d) {
+            POINT pt;
+            BOOL in_region = GetCursorPos(&pt) &&
+                             idd_point_in_fullscreen_toolbar_region(d, pt);
+            if (in_region) {
+                d->toolbar_leave_tick = 0;
+            } else if (!d->toolbar_leave_tick) {
+                d->toolbar_leave_tick = GetTickCount64();
+            } else if (GetTickCount64() - d->toolbar_leave_tick >= TOOLBAR_HIDE_MS) {
+                idd_hide_fullscreen_toolbar(d);
+            }
+            return 0;
+        }
         if (wp == IDT_PRESENT && d) {
             if (d->mouse_sync_pending) idd_poll_mouse_position(d);
             if (d->frame_dirty)
@@ -2664,6 +3229,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_MOUSEMOVE:
         if (d) {
+            POINT screen_pt;
             if (!d->tracking && d->render_hwnd) {
                 TRACKMOUSEEVENT tme;
                 tme.cbSize = sizeof(tme);
@@ -2673,6 +3239,24 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 TrackMouseEvent(&tme);
                 d->tracking = TRUE;
             }
+
+            if (d->fullscreen &&
+                (int)(short)HIWORD(lp) <=
+                    (int)idd_dip_to_px(d->hwnd, TOOLBAR_HOTZONE_DIP))
+                idd_show_fullscreen_toolbar(d);
+
+            /* While the host overlay is active, the whole top interaction
+               strip belongs to the host. Do not leak absolute motion into
+               the guest after relative capture has been suspended. Keeping
+               mouse_in false also blocks guest button and wheel forwarding. */
+            if (d->fullscreen_toolbar_visible &&
+                GetCursorPos(&screen_pt) &&
+                idd_point_in_fullscreen_toolbar_region(d, screen_pt)) {
+                d->mouse_in = FALSE;
+                SetCursor(LoadCursorW(NULL, IDC_ARROW));
+                return 0;
+            }
+
             d->mouse_in = TRUE;
             if (!d->relative_mouse && !d->cursor_visible)
                 idd_update_relative_mouse(d);
@@ -2697,6 +3281,14 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_SETCURSOR:
         if (LOWORD(lp) == HTCLIENT) {
+            if (d && d->fullscreen_toolbar_visible) {
+                POINT pt;
+                if (GetCursorPos(&pt) &&
+                    idd_point_in_fullscreen_toolbar_region(d, pt)) {
+                    SetCursor(LoadCursorW(NULL, IDC_ARROW));
+                    return TRUE;
+                }
+            }
             if (d && (!d->cursor_visible || d->mouse_sync_pending))
                 SetCursor(NULL);
             else if (d && d->guest_cursor)
@@ -2769,7 +3361,20 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         BOOL ext = (lp & (1 << 24)) != 0;
         BOOL up  = (msg == WM_KEYUP || msg == WM_SYSKEYUP);
         if (!d) break;
-        if (!d->transmit_hotkeys &&
+        if (wp == VK_F11) {
+            if (!up && !d->fullscreen) {
+                d->suppress_f11_up = TRUE;
+                idd_enter_fullscreen(d);
+                return 0;
+            }
+            if (up && d->suppress_f11_up) {
+                d->suppress_f11_up = FALSE;
+                return 0;
+            }
+            if (up && !d->fullscreen)
+                return 0;
+        }
+        if (!idd_capture_all_keys(d) &&
             idd_is_reserved_hotkey((DWORD)wp, (GetKeyState(VK_MENU) & 0x8000) != 0))
             break;  /* Default mode: let the host handle this hotkey. */
         if (d->kbd_hook && d->keyboard_version == INPUT_KEYBOARD_VERSION)

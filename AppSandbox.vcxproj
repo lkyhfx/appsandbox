@@ -208,6 +208,7 @@ xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\x64\*.dll" "$(OutDir)resou
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\app_win\resource.h" />
+    <ClInclude Include="src\core\display_protocol.h" />
     <ClInclude Include="src\app_win\ui.h" />
     <ClInclude Include="src\backend_win\asb_core.h" />
     <ClInclude Include="src\backend_win\asb_display.h" />

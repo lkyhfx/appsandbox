@@ -32,6 +32,9 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="src\core\display_protocol.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
     <ClInclude Include="src\app_win\resource.h">
       <Filter>Headers</Filter>
     </ClInclude>

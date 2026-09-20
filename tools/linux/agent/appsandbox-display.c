@@ -37,24 +37,21 @@
 #include <xf86drmMode.h>
 #include <drm_fourcc.h>
 
+#include "../../../src/core/display_protocol.h"
+
 #define VSOCK_PORT      2
-#define FRAME_MAGIC     0x52465341u   /* 'ASFR' little-endian */
-#define CURSOR_MAGIC    0x52435341u   /* 'ASCR' little-endian */
+#define FRAME_MAGIC     ASB_DISPLAY_RAW_MAGIC
+#define CURSOR_MAGIC    ASB_DISPLAY_CURSOR_MAGIC
 #define TARGET_FPS      60
 #define FRAME_INTERVAL_NS (1000000000L / TARGET_FPS)
+#define MAX_DIRTY_RECTS ASB_DISPLAY_MAX_DIRTY_RECTS
+#define TILE_SIZE       ASB_DISPLAY_TILE_SIZE
 
 #define CURSOR_TYPE_MASKED_COLOR  1
 #define CURSOR_TYPE_ALPHA         2
 
 #pragma pack(push, 1)
-struct frame_header {
-    uint32_t magic;
-    uint32_t width;
-    uint32_t height;
-    uint32_t stride;
-    uint64_t frame_seq;
-    uint32_t dirty_rect_count;
-};
+typedef AsbDisplayFrameHeader frame_header;
 
 struct cursor_header {
     uint32_t magic;            /* CURSOR_MAGIC */
@@ -133,7 +130,115 @@ struct capture_ctx {
     uint8_t *mem;        /* mmapped framebuffer (read-only) */
     size_t   mem_size;
     int      dma_fd;
+
+    /* The current DRM userspace interface exposes the active framebuffer but
+     * not reliable compositor damage clips. Keep a compact shadow and use a
+     * 64x64 tile fallback until a trustworthy damage source is available. */
+    uint8_t  *shadow;
+    size_t    shadow_size;
+    uint32_t  shadow_stride;
+    uint32_t  shadow_width;
+    uint32_t  shadow_height;
+    uint8_t  *dirty_tiles;
+    size_t    dirty_tiles_cap;
+    AsbDisplayRect *work_rects;
+    size_t    work_rects_cap;
+    int       force_full;
+
+    struct {
+        uint64_t frames_scanned;
+        uint64_t frames_sent;
+        uint64_t full_frames_sent;
+        uint64_t dirty_frames_sent;
+        uint64_t unchanged_frames_skipped;
+        uint64_t dirty_rects_total;
+        uint64_t dirty_area_sum;
+        uint64_t wire_bytes_total;
+        uint64_t ratio_buckets[101];
+        uint64_t start_ns;
+        uint64_t last_log_ns;
+    } stats;
 };
+
+static uint64_t monotonic_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static int checked_frame_size(uint32_t stride, uint32_t height, size_t *out)
+{
+    uint64_t size;
+
+    if (!stride || !height) return -1;
+    size = (uint64_t)stride * height;
+    if (size > ASB_DISPLAY_MAX_FRAME_DATA_SIZE || size > SIZE_MAX)
+        return -1;
+    *out = (size_t)size;
+    return 0;
+}
+
+static int ensure_tile_buffers(struct capture_ctx *c)
+{
+    uint64_t cols = ((uint64_t)c->width + TILE_SIZE - 1) / TILE_SIZE;
+    uint64_t rows = ((uint64_t)c->height + TILE_SIZE - 1) / TILE_SIZE;
+    uint64_t tiles = cols * rows;
+    uint8_t *tile_buf;
+    AsbDisplayRect *rect_buf;
+
+    if (!cols || !rows || tiles > SIZE_MAX ||
+        tiles > SIZE_MAX / sizeof(*c->work_rects))
+        return -1;
+
+    if ((size_t)tiles > c->dirty_tiles_cap) {
+        tile_buf = (uint8_t *)realloc(c->dirty_tiles, (size_t)tiles);
+        if (!tile_buf) return -1;
+        c->dirty_tiles = tile_buf;
+        c->dirty_tiles_cap = (size_t)tiles;
+    }
+    if ((size_t)tiles > c->work_rects_cap) {
+        rect_buf = (AsbDisplayRect *)realloc(c->work_rects,
+                                             (size_t)tiles * sizeof(*rect_buf));
+        if (!rect_buf) return -1;
+        c->work_rects = rect_buf;
+        c->work_rects_cap = (size_t)tiles;
+    }
+    return 0;
+}
+
+static void free_capture_buffers(struct capture_ctx *c)
+{
+    free(c->shadow);
+    free(c->dirty_tiles);
+    free(c->work_rects);
+    c->shadow = NULL;
+    c->dirty_tiles = NULL;
+    c->work_rects = NULL;
+    c->shadow_size = c->dirty_tiles_cap = c->work_rects_cap = 0;
+}
+
+static int prepare_shadow(struct capture_ctx *c, size_t size)
+{
+    if (c->shadow_width == c->width && c->shadow_height == c->height &&
+        c->shadow_stride == c->stride && c->shadow_size == size && c->shadow)
+        return 0;
+
+    free(c->shadow);
+    c->shadow = (uint8_t *)malloc(size);
+    if (!c->shadow) {
+        c->shadow_size = 0;
+        c->force_full = 1;
+        return -1;
+    }
+    c->shadow_size = size;
+    c->shadow_stride = c->stride;
+    c->shadow_width = c->width;
+    c->shadow_height = c->height;
+    memset(c->shadow, 0, size);
+    c->force_full = 1;
+    return 0;
+}
 
 static void drm_release_fb(struct capture_ctx *c)
 {
@@ -193,7 +298,8 @@ static int drm_acquire_fb(struct capture_ctx *c)
             goto out;
         }
 
-        drmModeFB2 *fb2 = drmModeGetFB2(c->fd, p->fb_id);
+        uint32_t fb_id = p->fb_id;
+        drmModeFB2 *fb2 = drmModeGetFB2(c->fd, fb_id);
         drmModeFreePlane(p);
         if (!fb2) continue;
 
@@ -209,13 +315,20 @@ static int drm_acquire_fb(struct capture_ctx *c)
         uint32_t height = fb2->height;
         uint32_t width  = fb2->width;
         drmModeFreeFB2(fb2);
-        if (!handle || !pitch || !height) continue;
+        if (!handle || !pitch || !height || !width ||
+            width > ASB_DISPLAY_RAW_MAX_WIDTH ||
+            height > ASB_DISPLAY_RAW_MAX_HEIGHT ||
+            (uint64_t)width * 4 > pitch)
+            continue;
+
+        size_t size;
+        if (checked_frame_size(pitch, height, &size) < 0)
+            continue;
 
         int dma_fd = -1;
         if (drmPrimeHandleToFD(c->fd, handle, DRM_CLOEXEC | O_RDONLY, &dma_fd) < 0) {
             continue;
         }
-        size_t size = (size_t)pitch * height;
         void *m = mmap(NULL, size, PROT_READ, MAP_SHARED, dma_fd, 0);
         if (m == MAP_FAILED) {
             close(dma_fd);
@@ -223,13 +336,15 @@ static int drm_acquire_fb(struct capture_ctx *c)
         }
 
         drm_release_fb(c);
-        c->fb_id_last = p->fb_id;
+        c->fb_id_last = fb_id;
         c->width  = width;
         c->height = height;
         c->stride = pitch;
         c->mem      = (uint8_t *)m;
         c->mem_size = size;
         c->dma_fd   = dma_fd;
+        (void)prepare_shadow(c, size);
+        (void)ensure_tile_buffers(c);
         rc = 0;
         goto out;
     }
@@ -483,25 +598,234 @@ static int cursor_tick(int client_fd, int drm_fd, struct cursor_state *cur)
 
 /* ---- Main capture loop ---- */
 
-static int send_frame(int client_fd, struct capture_ctx *c, uint64_t seq)
+static int scan_dirty_tiles(struct capture_ctx *c, AsbDisplayRect *rects,
+                            uint32_t *rect_count, int *full,
+                            uint64_t *dirty_area)
 {
-    struct frame_header h;
-    h.magic            = FRAME_MAGIC;
-    h.width            = c->width;
-    h.height           = c->height;
-    h.stride           = c->stride;
-    h.frame_seq        = seq;
-    h.dirty_rect_count = 0;
+    uint64_t cols = ((uint64_t)c->width + TILE_SIZE - 1) / TILE_SIZE;
+    uint64_t rows = ((uint64_t)c->height + TILE_SIZE - 1) / TILE_SIZE;
+    uint64_t total_area = (uint64_t)c->width * c->height;
+    size_t work_count = 0;
+    uint32_t ty;
 
-    if (send_all(client_fd, &h, sizeof(h)) < 0) return -1;
-
-    uint32_t data_size = c->stride * c->height;
-    if (send_all(client_fd, &data_size, sizeof(data_size)) < 0) return -1;
-
-    if (data_size > 0) {
-        if (send_all(client_fd, c->mem, data_size) < 0) return -1;
+    *rect_count = 0;
+    *dirty_area = 0;
+    *full = c->force_full || !c->shadow;
+    if (*full) {
+        *dirty_area = total_area;
+        return 0;
     }
+    if (ensure_tile_buffers(c) < 0) {
+        *full = 1;
+        *dirty_area = total_area;
+        return 0;
+    }
+
+    memset(c->dirty_tiles, 0, (size_t)(cols * rows));
+    for (ty = 0; ty < rows; ty++) {
+        uint32_t tx;
+        uint32_t top = ty * TILE_SIZE;
+        uint32_t bottom = top + TILE_SIZE < c->height
+            ? top + TILE_SIZE : c->height;
+        for (tx = 0; tx < cols; tx++) {
+            uint32_t left = tx * TILE_SIZE;
+            uint32_t right = left + TILE_SIZE < c->width
+                ? left + TILE_SIZE : c->width;
+            uint32_t y;
+            int changed = 0;
+
+            for (y = top; y < bottom && !changed; y++) {
+                const uint8_t *now = c->mem + (size_t)y * c->stride + left * 4;
+                const uint8_t *old = c->shadow + (size_t)y * c->shadow_stride + left * 4;
+                if (memcmp(now, old, (size_t)(right - left) * 4) != 0)
+                    changed = 1;
+            }
+            if (changed) {
+                c->dirty_tiles[(size_t)ty * cols + tx] = 1;
+                *dirty_area += (uint64_t)(right - left) * (bottom - top);
+            }
+        }
+    }
+
+    if (!*dirty_area) return 0;
+
+    /* Once the changed area is close to the full desktop, one contiguous
+     * upload is cheaper and avoids producing a pathological rect list. */
+    if (*dirty_area * 100 >= total_area * 60) {
+        *full = 1;
+        *dirty_area = total_area;
+        return 0;
+    }
+
+    /* Build horizontal tile runs and vertically coalesce equal runs. */
+    for (ty = 0; ty < rows; ty++) {
+        uint32_t tx = 0;
+        uint32_t top = ty * TILE_SIZE;
+        uint32_t bottom = top + TILE_SIZE < c->height
+            ? top + TILE_SIZE : c->height;
+        while (tx < cols) {
+            uint32_t start;
+            uint32_t end;
+            AsbDisplayRect run;
+
+            while (tx < cols && !c->dirty_tiles[(size_t)ty * cols + tx]) tx++;
+            if (tx == cols) break;
+            start = tx++;
+            while (tx < cols && c->dirty_tiles[(size_t)ty * cols + tx]) tx++;
+            end = tx;
+            run.left = (int32_t)(start * TILE_SIZE);
+            run.top = (int32_t)top;
+            run.right = (int32_t)(end * TILE_SIZE < c->width
+                ? end * TILE_SIZE : c->width);
+            run.bottom = (int32_t)bottom;
+
+            if (work_count > 0 &&
+                c->work_rects[work_count - 1].left == run.left &&
+                c->work_rects[work_count - 1].right == run.right &&
+                c->work_rects[work_count - 1].bottom == run.top) {
+                c->work_rects[work_count - 1].bottom = run.bottom;
+            } else {
+                if (work_count >= c->work_rects_cap) {
+                    *full = 1;
+                    *dirty_area = total_area;
+                    return 0;
+                }
+                c->work_rects[work_count++] = run;
+            }
+        }
+    }
+
+    if (work_count > MAX_DIRTY_RECTS) {
+        *full = 1;
+        *dirty_area = total_area;
+        return 0;
+    }
+    memcpy(rects, c->work_rects, work_count * sizeof(*rects));
+    *rect_count = (uint32_t)work_count;
     return 0;
+}
+
+static void shadow_apply(struct capture_ctx *c, const AsbDisplayRect *rects,
+                         uint32_t rect_count, int full)
+{
+    uint32_t i;
+    if (!c->shadow) return;
+    if (full) {
+        uint32_t y;
+        size_t row_bytes = (size_t)c->width * 4;
+        for (y = 0; y < c->height; y++)
+            memcpy(c->shadow + (size_t)y * c->shadow_stride,
+                   c->mem + (size_t)y * c->stride, row_bytes);
+    } else {
+        for (i = 0; i < rect_count; i++) {
+            uint32_t y;
+            uint32_t width = (uint32_t)(rects[i].right - rects[i].left);
+            uint32_t height = (uint32_t)(rects[i].bottom - rects[i].top);
+            size_t row_bytes = (size_t)width * 4;
+            for (y = 0; y < height; y++)
+                memcpy(c->shadow + (size_t)(rects[i].top + y) * c->shadow_stride
+                                      + (size_t)rects[i].left * 4,
+                       c->mem + (size_t)(rects[i].top + y) * c->stride
+                                + (size_t)rects[i].left * 4,
+                       row_bytes);
+        }
+    }
+    c->force_full = 0;
+}
+
+static int send_frame(int client_fd, struct capture_ctx *c, uint64_t seq,
+                      const AsbDisplayRect *rects, uint32_t rect_count,
+                      int full, uint64_t *wire_bytes)
+{
+    frame_header h;
+    uint64_t data_size64 = full ? c->mem_size : 0;
+    uint32_t i;
+    uint32_t data_size;
+    uint64_t sent = sizeof(h) + sizeof(data_size) +
+                    (uint64_t)rect_count * sizeof(*rects);
+
+    if (!full) {
+        for (i = 0; i < rect_count; i++) {
+            uint64_t width = (uint64_t)(rects[i].right - rects[i].left);
+            uint64_t height = (uint64_t)(rects[i].bottom - rects[i].top);
+            data_size64 += width * height * 4;
+        }
+    }
+    if (data_size64 > UINT32_MAX || data_size64 > ASB_DISPLAY_MAX_FRAME_DATA_SIZE)
+        return -1;
+
+    h.magic = FRAME_MAGIC;
+    h.width = c->width;
+    h.height = c->height;
+    h.stride = c->stride;
+    h.frame_seq = seq;
+    h.dirty_rect_count = full ? 0 : rect_count;
+    data_size = (uint32_t)data_size64;
+
+    if (send_all(client_fd, &h, sizeof(h)) < 0 ||
+        (rect_count && send_all(client_fd, rects,
+                                (size_t)rect_count * sizeof(*rects)) < 0) ||
+        send_all(client_fd, &data_size, sizeof(data_size)) < 0)
+        return -1;
+
+    if (full) {
+        if (send_all(client_fd, c->mem, c->mem_size) < 0) return -1;
+    } else {
+        for (i = 0; i < rect_count; i++) {
+            uint32_t y;
+            uint32_t width = (uint32_t)(rects[i].right - rects[i].left);
+            uint32_t height = (uint32_t)(rects[i].bottom - rects[i].top);
+            size_t row_bytes = (size_t)width * 4;
+            for (y = 0; y < height; y++) {
+                const uint8_t *row = c->mem +
+                    (size_t)(rects[i].top + y) * c->stride +
+                    (size_t)rects[i].left * 4;
+                if (send_all(client_fd, row, row_bytes) < 0) return -1;
+            }
+        }
+    }
+    *wire_bytes = sent + data_size64;
+    return 0;
+}
+
+static void maybe_log_stats(struct capture_ctx *c)
+{
+    uint64_t now = monotonic_ns();
+    uint64_t total = c->stats.frames_scanned;
+    uint64_t target, seen = 0, p95_bucket = 100;
+    double seconds, avg, mib_per_sec;
+    int i;
+
+    if (!c->stats.start_ns) c->stats.start_ns = now;
+    if (c->stats.last_log_ns && now - c->stats.last_log_ns < 5000000000ULL)
+        return;
+    c->stats.last_log_ns = now;
+    if (!total) return;
+    target = (total * 95 + 99) / 100;
+    for (i = 0; i <= 100; i++) {
+        seen += c->stats.ratio_buckets[i];
+        if (seen >= target) { p95_bucket = (uint64_t)i; break; }
+    }
+    seconds = (double)(now - c->stats.start_ns) / 1000000000.0;
+    avg = (double)c->stats.dirty_area_sum /
+          ((double)total * c->width * c->height);
+    mib_per_sec = seconds > 0.0
+        ? (double)c->stats.wire_bytes_total / seconds / (1024.0 * 1024.0)
+        : 0.0;
+    agent_log("display_stats scope=guest resolution=%ux%u logical_refresh_hz=%u "
+              "frames_scanned=%llu frames_sent=%llu full_frames_sent=%llu "
+              "dirty_frames_sent=%llu unchanged_frames_skipped=%llu "
+              "dirty_rects_total=%llu dirty_area_ratio_avg=%.5f "
+              "dirty_area_ratio_p95=%.2f wire_bytes_total=%llu wire_mib_per_sec=%.3f",
+              c->width, c->height, TARGET_FPS,
+              (unsigned long long)c->stats.frames_scanned,
+              (unsigned long long)c->stats.frames_sent,
+              (unsigned long long)c->stats.full_frames_sent,
+              (unsigned long long)c->stats.dirty_frames_sent,
+              (unsigned long long)c->stats.unchanged_frames_skipped,
+              (unsigned long long)c->stats.dirty_rects_total, avg,
+              (double)p95_bucket / 100.0,
+              (unsigned long long)c->stats.wire_bytes_total, mib_per_sec);
 }
 
 static void capture_loop(int client_fd)
@@ -660,14 +984,39 @@ have_card:
                 last_status = -1;
             }
         } else {
+            AsbDisplayRect rects[MAX_DIRTY_RECTS];
+            uint32_t rect_count = 0;
+            uint64_t dirty_area = 0;
+            uint64_t wire_bytes = 0;
+            uint64_t total_area = (uint64_t)ctx.width * ctx.height;
+            int full = 0;
+
             if (last_status != 1) {
                 agent_log("capturing %ux%u stride=%u", ctx.width, ctx.height, ctx.stride);
                 last_status = 1;
             }
-            if (send_frame(client_fd, &ctx, ++seq) < 0) {
-                agent_log("client disconnected");
-                break;
+            ctx.stats.frames_scanned++;
+            (void)scan_dirty_tiles(&ctx, rects, &rect_count, &full, &dirty_area);
+            if (!full && rect_count == 0) {
+                ctx.stats.unchanged_frames_skipped++;
+            } else {
+                if (send_frame(client_fd, &ctx, ++seq, rects, rect_count,
+                               full, &wire_bytes) < 0) {
+                    agent_log("client disconnected");
+                    break;
+                }
+                shadow_apply(&ctx, rects, rect_count, full);
+                ctx.stats.frames_sent++;
+                ctx.stats.wire_bytes_total += wire_bytes;
+                ctx.stats.dirty_rects_total += rect_count;
+                if (full) ctx.stats.full_frames_sent++;
+                else      ctx.stats.dirty_frames_sent++;
             }
+            if (dirty_area > total_area) dirty_area = total_area;
+            ctx.stats.dirty_area_sum += dirty_area;
+            ctx.stats.ratio_buckets[total_area
+                ? (dirty_area * 100 / total_area) : 0]++;
+            maybe_log_stats(&ctx);
         }
 
         /* Emit cursor update if its position/shape changed since last tick.
@@ -687,6 +1036,7 @@ have_card:
     }
 
     drm_release_fb(&ctx);
+    free_capture_buffers(&ctx);
     close(ctx.fd);
 }
 
