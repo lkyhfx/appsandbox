@@ -204,6 +204,11 @@ xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\x64\*.dll" "$(OutDir)resou
     <ClCompile Include="src\backend_win\vm_display.c" />
     <ClCompile Include="src\backend_win\vm_display_idd.c" />
     <ClCompile Include="src\backend_win\vm_video_decode.c" />
+    <ClCompile Include="src\backend_win\vm_video_decode_d3d12.cpp">
+      <CompileAs>CompileAsCpp</CompileAs>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <ExceptionHandling>Sync</ExceptionHandling>
+    </ClCompile>
     <ClCompile Include="src\app_win\webview2_bridge.c" />
     <ClCompile Include="src\app_win\headless.c" />
   </ItemGroup>

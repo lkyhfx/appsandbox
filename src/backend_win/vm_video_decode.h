@@ -4,6 +4,11 @@
 
 #include <windows.h>
 #include <d3d11.h>
+#include "vm_video_decode_policy.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 typedef struct VmVideoDecoder VmVideoDecoder;
 
@@ -13,6 +18,9 @@ typedef enum VmVideoDecodeProfile {
 } VmVideoDecodeProfile;
 
 typedef struct VmVideoDecodeCapability {
+    VmVideoDecodeBackend backend;
+    LUID adapter_luid;
+    const void *device_identity; /* borrowed identity; cache lives with device */
     BOOL available;
     UINT decoder_index;
     GUID decoder_clsid;
@@ -21,6 +29,7 @@ typedef struct VmVideoDecodeCapability {
     BOOL actual_decode;
     BOOL gpu_surface;
     DXGI_FORMAT decoded_format;
+    DXGI_FORMAT presentation_format; /* D3D11 texture returned to the renderer */
     BOOL ayuv_video_processor;
 } VmVideoDecodeCapability;
 
@@ -49,7 +58,8 @@ VmVideoDecoder *vm_video_decoder_create_with_capability(
     ID3D11Device *device, UINT width, UINT height,
     UINT fps_num, UINT fps_den, const BYTE *extradata, UINT extradata_size,
     VmVideoDecodeProfile profile, const VmVideoDecodeCapability *capability);
-/* S_OK returns a GPU NV12/AYUV texture with one caller-owned reference. S_FALSE
+/* S_OK returns a GPU NV12/AYUV texture (MF), or GPU-converted BGRA (D3D12),
+ * with one caller-owned reference. S_FALSE
  * means the decoder accepted input but needs more data before output. */
 HRESULT vm_video_decoder_decode(VmVideoDecoder *decoder,
                                 const BYTE *data, UINT size,
@@ -58,4 +68,7 @@ HRESULT vm_video_decoder_decode(VmVideoDecoder *decoder,
                                 UINT *subresource);
 void vm_video_decoder_destroy(VmVideoDecoder *decoder);
 
+#ifdef __cplusplus
+}
+#endif
 #endif

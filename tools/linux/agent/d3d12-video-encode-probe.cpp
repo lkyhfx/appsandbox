@@ -2263,8 +2263,10 @@ static bool encode_consumer_main(
         if (hevc444_session) {
             picture_data1.Flags = encoder.hevc444_picture_defaults.flags;
             picture_data1.FrameType =
-                D3D12_VIDEO_ENCODER_FRAME_TYPE_HEVC_I_FRAME;
-            picture_data1.PictureOrderCountNumber = static_cast<UINT>(frame);
+                D3D12_VIDEO_ENCODER_FRAME_TYPE_HEVC_IDR_FRAME;
+            // HEVC444 transport and the initial host D3D12 backend use one
+            // independent IDR per packet; I_FRAME alone does not imply IRAP.
+            picture_data1.PictureOrderCountNumber = 0;
             picture_data1.diff_cu_chroma_qp_offset_depth =
                 encoder.hevc444_picture_defaults.diff_cu_chroma_qp_offset_depth;
             picture_data1.log2_sao_offset_scale_luma =

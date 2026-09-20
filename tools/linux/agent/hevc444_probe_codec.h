@@ -720,8 +720,10 @@ inline bool parse_pps(const std::vector<std::uint8_t> &nal_bytes,
             out->cr_qp_offset_list[i] = static_cast<std::int8_t>(cr);
         }
     }
-    if (!reader.ue(&value) || !reader.ue(&value))
-        return false;
+    if (!reader.ue(&value) || value > 6) return false;
+    out->log2_sao_offset_scale_luma = static_cast<std::uint8_t>(value);
+    if (!reader.ue(&value) || value > 6) return false;
+    out->log2_sao_offset_scale_chroma = static_cast<std::uint8_t>(value);
     return true;
 }
 

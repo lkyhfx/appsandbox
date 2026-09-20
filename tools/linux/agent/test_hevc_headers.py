@@ -266,8 +266,8 @@ int main() {
             self.assertIn(token, source)
         self.assertIn("stream.first_irap.bytes", source)
         self.assertNotIn("std::memcpy(destination, stream.bytes.data()", source)
-        self.assertIn("d3d12_actual_decode=not-tested", source)
-        self.assertIn("const bool d3d12_path = false", source)
+        self.assertNotIn("d3d12_actual_decode=not-tested", source)
+        self.assertIn("d3d12_ok && d3d12.actual_decode", source)
 
 
 if __name__ == "__main__":

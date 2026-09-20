@@ -26,6 +26,7 @@
 #include <dxgi.h>
 #include <d3dcompiler.h>
 #include <d3d11_1.h>
+#include <d3d11_4.h>
 #pragma warning(pop)
 
 #include <stdio.h>
@@ -686,7 +687,7 @@ static BOOL idd_probe_hevc444_capability(VmDisplayIdd *d, BOOL force)
                 d->hevc444_capability.decoder_index,
                 d->hevc444_capability.decoder_name);
     } else {
-        idd_log(d, L"hevc444-actual-probe=BLOCKED reason=no-validated-mft");
+        idd_log(d, L"hevc444-actual-probe=BLOCKED reason=no-validated-decoder-backend");
     }
     return d->hevc444_probe_ok;
 }
@@ -1705,13 +1706,23 @@ static BOOL d3d_init(VmDisplayIdd *d)
     scd.SwapEffect                         = DXGI_SWAP_EFFECT_DISCARD;
 
     hr = D3D11CreateDeviceAndSwapChain(
-        NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
+        NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
         NULL, 0, D3D11_SDK_VERSION,
         &scd, &d->swap_chain, &d->device, &feature_level, &d->ctx);
 
     if (FAILED(hr)) {
         ui_log(L"IDD: D3D11CreateDeviceAndSwapChain failed (0x%08X)", hr);
         return FALSE;
+    }
+    {
+        ID3D11Multithread *multithread = NULL;
+        hr = ID3D11DeviceContext_QueryInterface(d->ctx, &IID_ID3D11Multithread,
+                                               (void **)&multithread);
+        if (FAILED(hr)) return FALSE;
+        /* The receive thread probes decode/presentation while the window
+           thread renders through the same immediate context. */
+        ID3D11Multithread_SetMultithreadProtected(multithread, TRUE);
+        ID3D11Multithread_Release(multithread);
     }
 
     /* Create render target view from back buffer */
@@ -1906,7 +1917,9 @@ static BOOL d3d_render_video_frame(VmDisplayIdd *d)
     ZeroMemory(&texture_desc, sizeof(texture_desc));
     ID3D11Texture2D_GetDesc(texture, &texture_desc);
     if ((d->video_profile == VM_VIDEO_HEVC444 &&
-         texture_desc.Format != DXGI_FORMAT_AYUV) ||
+         texture_desc.Format != DXGI_FORMAT_AYUV &&
+         !(d->hevc444_capability.backend == VM_VIDEO_DECODE_BACKEND_D3D12 &&
+           texture_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM)) ||
         (d->video_profile == VM_VIDEO_HEVC420 &&
          texture_desc.Format != DXGI_FORMAT_NV12)) {
         failure_reason = d->video_profile == VM_VIDEO_HEVC444
@@ -2005,6 +2018,14 @@ static BOOL d3d_render_video_frame(VmDisplayIdd *d)
     ID3D11VideoContext_VideoProcessorSetStreamDestRect(
         d->video_context, d->video_processor, 0, TRUE, &destination);
     {
+        D3D11_VIDEO_PROCESSOR_COLOR_SPACE color;
+        ZeroMemory(&color, sizeof(color));
+        color.YCbCr_Matrix = 1; /* BT.709; ignored for RGB input. */
+        color.Nominal_Range = texture_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ? 2 : 1;
+        ID3D11VideoContext_VideoProcessorSetStreamColorSpace(
+            d->video_context, d->video_processor, 0, &color);
+    }
+    {
         D3D11_VIDEO_PROCESSOR_STREAM stream;
         ZeroMemory(&stream, sizeof(stream));
         stream.Enable = TRUE;
@@ -2018,10 +2039,15 @@ static BOOL d3d_render_video_frame(VmDisplayIdd *d)
         goto fail;
     }
     if (SUCCEEDED(hr)) {
-        IDXGISwapChain_Present(d->swap_chain, 0, 0);
-        idd_publish_display_runtime(d,
+        hr = IDXGISwapChain_Present(d->swap_chain, 0, 0);
+        if (FAILED(hr)) {
+            failure_reason = "hevc-present-failed";
+            goto fail;
+        }
+        if (hr == S_OK) idd_publish_display_runtime(d,
             d->video_profile == VM_VIDEO_HEVC444
-                ? ASB_DISPLAY_BACKEND_HEVC444_D3D11
+                ? (d->hevc444_capability.backend == VM_VIDEO_DECODE_BACKEND_D3D12
+                    ? ASB_DISPLAY_BACKEND_HEVC444_D3D12 : ASB_DISPLAY_BACKEND_HEVC444_D3D11)
                 : ASB_DISPLAY_BACKEND_HEVC420_D3D11,
             ASB_DISPLAY_PROFILE_STATE_READY, "");
     }
@@ -2137,6 +2163,9 @@ static void d3d_render_frame(VmDisplayIdd *d)
 
 static void d3d_cleanup(VmDisplayIdd *d)
 {
+    d->hevc444_probe_done = FALSE;
+    d->hevc444_probe_ok = FALSE;
+    ZeroMemory(&d->hevc444_capability, sizeof(d->hevc444_capability));
     if (d->video_decoder) { vm_video_decoder_destroy(d->video_decoder); d->video_decoder = NULL; }
     if (d->decoded_tex) { ID3D11Texture2D_Release(d->decoded_tex); d->decoded_tex = NULL; }
     if (d->video_processor) { ID3D11VideoProcessor_Release(d->video_processor); d->video_processor = NULL; }
@@ -2631,7 +2660,9 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                                         "hevc420-awaiting-frame");
                 session_saw_hevc = TRUE;
                 idd_log(d, L"display_protocol=v2 display_backend=%s fallback=0 generation=%llu mode=%ux%u fps=%u/%u",
-                        d->video_profile == VM_VIDEO_HEVC444 ? L"hevc444-d3d11" : L"hevc420-d3d11",
+                        d->video_profile == VM_VIDEO_HEVC444
+                            ? (d->hevc444_capability.backend == VM_VIDEO_DECODE_BACKEND_D3D12
+                                ? L"hevc444-d3d12" : L"hevc444-d3d11") : L"hevc420-d3d11",
                         config.generation, config.width, config.height,
                         config.fps_num, config.fps_den);
                 continue;

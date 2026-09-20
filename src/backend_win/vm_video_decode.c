@@ -15,11 +15,14 @@
 
 #include "vm_video_decode.h"
 #include "vm_hevc444_probe_sample.h"
+#include "vm_video_decode_d3d12.h"
 
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mfuuid.lib")
 
 struct VmVideoDecoder {
+    VmD3D12Decoder *d3d12;
+    BOOL mf_started;
     ID3D11Device *device;
     IMFDXGIDeviceManager *manager;
     IMFTransform *transform;
@@ -30,6 +33,20 @@ struct VmVideoDecoder {
     DWORD output_stream;
     BOOL provides_samples;
 };
+
+static BOOL device_adapter_luid(ID3D11Device *device, LUID *luid)
+{
+    IDXGIDevice *dxgi = NULL;
+    IDXGIAdapter *adapter = NULL;
+    DXGI_ADAPTER_DESC desc;
+    HRESULT hr = ID3D11Device_QueryInterface(device, &IID_IDXGIDevice, (void **)&dxgi);
+    if (SUCCEEDED(hr)) hr = IDXGIDevice_GetAdapter(dxgi, &adapter);
+    if (SUCCEEDED(hr)) hr = IDXGIAdapter_GetDesc(adapter, &desc);
+    if (SUCCEEDED(hr)) *luid = desc.AdapterLuid;
+    if (adapter) IDXGIAdapter_Release(adapter);
+    if (dxgi) IDXGIDevice_Release(dxgi);
+    return SUCCEEDED(hr);
+}
 
 static const GUID *output_subtype(VmVideoDecodeProfile profile)
 {
@@ -63,7 +80,7 @@ static BOOL capture_decoder_identity(IMFActivate *activate,
 }
 
 static BOOL probe_ayuv_video_processor(ID3D11Device *device, UINT width,
-                                       UINT height)
+                                       UINT height, ID3D11Texture2D *decoded)
 {
     ID3D11VideoDevice *video_device = NULL;
     ID3D11DeviceContext *device_context = NULL;
@@ -121,8 +138,12 @@ static BOOL probe_ayuv_video_processor(ID3D11Device *device, UINT width,
     texture_desc.Usage = D3D11_USAGE_DEFAULT;
     texture_desc.BindFlags = D3D11_BIND_DECODER;
     texture_desc.Format = DXGI_FORMAT_AYUV;
-    hr = ID3D11Device_CreateTexture2D(device, &texture_desc, NULL,
-                                      &input_texture);
+    if (decoded) {
+        input_texture = decoded;
+        ID3D11Texture2D_AddRef(input_texture);
+        hr = S_OK;
+    } else hr = ID3D11Device_CreateTexture2D(device, &texture_desc, NULL,
+                                             &input_texture);
     if (FAILED(hr)) goto done;
     texture_desc.BindFlags = D3D11_BIND_RENDER_TARGET;
     texture_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -161,6 +182,16 @@ done:
     if (device_context) ID3D11DeviceContext_Release(device_context);
     if (video_device) ID3D11VideoDevice_Release(video_device);
     return ok;
+}
+
+BOOL vm_video_decode_probe_ayuv_surface(ID3D11Device *device,
+                                       ID3D11Texture2D *texture)
+{
+    D3D11_TEXTURE2D_DESC desc;
+    if (!texture) return FALSE;
+    ID3D11Texture2D_GetDesc(texture, &desc);
+    return (desc.Format == DXGI_FORMAT_AYUV || desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM) &&
+        probe_ayuv_video_processor(device, desc.Width, desc.Height, texture);
 }
 
 static HRESULT make_probe_input_sample(const BYTE *data, UINT size,
@@ -329,13 +360,17 @@ static BOOL probe_one_decoder(ID3D11Device *device, IMFActivate *activate,
             out->actual_decode = TRUE;
             out->gpu_surface = TRUE;
             out->decoded_format = desc.Format;
+            out->presentation_format = desc.Format;
             if (desc.Format == (profile == VM_VIDEO_HEVC444
                                 ? DXGI_FORMAT_AYUV : DXGI_FORMAT_NV12)) {
                 out->ayuv_video_processor = profile == VM_VIDEO_HEVC444
-                    ? probe_ayuv_video_processor(device, width, height) : TRUE;
+                    ? probe_ayuv_video_processor(device, width, height, texture) : TRUE;
                 out->available = out->decoder_identity_valid &&
                     out->ayuv_video_processor;
                 out->decoder_index = decoder_index;
+                out->backend = VM_VIDEO_DECODE_BACKEND_MF_D3D11;
+                out->device_identity = device;
+                if (!device_adapter_luid(device, &out->adapter_luid)) out->available = FALSE;
                 ok = out->available;
             }
         }
@@ -559,12 +594,15 @@ BOOL vm_video_decode_probe_profile(ID3D11Device *device,
 BOOL vm_video_decode_probe_builtin_hevc444(ID3D11Device *device,
                                            VmVideoDecodeCapability *out)
 {
-    return vm_video_decode_probe_profile(
+    BOOL mf_ok = vm_video_decode_probe_profile(
         device, ASB_HEVC444_PROBE_WIDTH, ASB_HEVC444_PROBE_HEIGHT,
         ASB_HEVC444_PROBE_FPS_NUM, ASB_HEVC444_PROBE_FPS_DEN,
         asb_hevc444_probe_sample, ASB_HEVC444_PROBE_EXTRADATA_SIZE,
         asb_hevc444_probe_sample + ASB_HEVC444_PROBE_ACCESS_UNIT_OFFSET,
         ASB_HEVC444_PROBE_ACCESS_UNIT_SIZE, VM_VIDEO_HEVC444, out);
+    BOOL d3d12_ok = FALSE;
+    if (!mf_ok) d3d12_ok = vm_d3d12_probe(device, out);
+    return vm_video_decode_select_backend(mf_ok, d3d12_ok) != VM_VIDEO_DECODE_BACKEND_NONE;
 }
 
 BOOL vm_video_decode_supported_profile(ID3D11Device *device,
@@ -604,10 +642,36 @@ VmVideoDecoder *vm_video_decoder_create_with_capability(
                                         const VmVideoDecodeCapability *capability)
 {
     VmVideoDecoder *d = NULL;
-    HRESULT hr = MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET);
+    HRESULT hr;
+    LUID luid;
+    if (!device || !width || !height || !fps_num || !fps_den) return NULL;
+    if (profile == VM_VIDEO_HEVC444 &&
+        (!capability || !capability->available || !capability->actual_decode ||
+         !capability->gpu_surface || !capability->ayuv_video_processor ||
+         capability->decoded_format != DXGI_FORMAT_AYUV ||
+         capability->device_identity != device || !capability->decoder_identity_valid))
+        return NULL;
+    if (profile == VM_VIDEO_HEVC444 &&
+        (!device_adapter_luid(device, &luid) ||
+         luid.LowPart != capability->adapter_luid.LowPart ||
+         luid.HighPart != capability->adapter_luid.HighPart)) return NULL;
+    if (profile == VM_VIDEO_HEVC444 && capability->backend == VM_VIDEO_DECODE_BACKEND_D3D12) {
+        if (capability->presentation_format != DXGI_FORMAT_B8G8R8A8_UNORM) return NULL;
+        d = (VmVideoDecoder *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*d));
+        if (!d) return NULL;
+        d->d3d12 = vm_d3d12_create(device, width, height, fps_num, fps_den, extradata, extradata_size);
+        if (!d->d3d12) { HeapFree(GetProcessHeap(), 0, d); return NULL; }
+        return d;
+    }
+    if (profile == VM_VIDEO_HEVC444 && capability->backend != VM_VIDEO_DECODE_BACKEND_MF_D3D11)
+        return NULL;
+    if (profile == VM_VIDEO_HEVC444 && capability->presentation_format != DXGI_FORMAT_AYUV)
+        return NULL;
+    hr = MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET);
     if (FAILED(hr)) return NULL;
     d = (VmVideoDecoder *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*d));
     if (!d) { MFShutdown(); return NULL; }
+    d->mf_started = TRUE;
     d->width = width; d->height = height;
     d->fps_num = fps_num; d->fps_den = fps_den;
     d->profile = profile;
@@ -662,8 +726,10 @@ HRESULT vm_video_decoder_decode(VmVideoDecoder *d,
     MFT_OUTPUT_DATA_BUFFER output = {0};
     DWORD status = 0;
     HRESULT hr;
+    if (!texture || !subresource) return E_POINTER;
     *texture = NULL; *subresource = 0;
     if (!d || !data || !size) return E_INVALIDARG;
+    if (d->d3d12) return vm_d3d12_decode(d->d3d12, data, size, texture);
 
     hr = MFCreateSample(&input_sample);
     if (SUCCEEDED(hr)) hr = MFCreateMemoryBuffer(size, &buffer);
@@ -743,6 +809,7 @@ HRESULT vm_video_decoder_decode(VmVideoDecoder *d,
 void vm_video_decoder_destroy(VmVideoDecoder *d)
 {
     if (!d) return;
+    if (d->d3d12) vm_d3d12_destroy(d->d3d12);
     if (d->transform) {
         IMFTransform_ProcessMessage(d->transform, MFT_MESSAGE_COMMAND_FLUSH, 0);
         IMFTransform_ProcessMessage(d->transform, MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
@@ -750,6 +817,6 @@ void vm_video_decoder_destroy(VmVideoDecoder *d)
     }
     if (d->manager) IMFDXGIDeviceManager_Release(d->manager);
     if (d->device) ID3D11Device_Release(d->device);
+    if (d->mf_started) MFShutdown();
     HeapFree(GetProcessHeap(), 0, d);
-    MFShutdown();
 }

@@ -1026,7 +1026,7 @@ function updateStatusCell(td, vm) {
    updated in place (rather than recreated) so the spinner animation survives. */
 function displayProfileLabel(vm) {
     if (vm.displayProfile !== 1) return '1080p60';
-    if (vm.displayProfileState === 1 && vm.displayBackend === 3)
+    if (vm.displayProfileState === 1 && (vm.displayBackend === 3 || vm.displayBackend === 4))
         return '4K60 · HEVC 4:4:4';
     if (vm.displayProfileState === 3)
         return '4K60 · degraded (raw fallback)';

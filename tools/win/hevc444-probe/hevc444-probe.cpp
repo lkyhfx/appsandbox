@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "hevc_access_unit_probe.h"
+#include "../../../src/backend_win/vm_hevc444_probe_sample.h"
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3d12.lib")
@@ -673,6 +674,15 @@ static bool probe_d3d12_decode(const D3D11Context &d3d11,
                                const HevcAnnexBStream &stream,
                                D3D12Result *result)
 {
+    // This diagnostic's DXVA parameters and golden checksums describe only
+    // the bundled stream. Reject other syntax instead of decoding it with
+    // hard-coded picture parameters.
+    if (stream.sequence_header.size() != ASB_HEVC444_PROBE_EXTRADATA_SIZE ||
+        std::memcmp(stream.sequence_header.data(), asb_hevc444_probe_sample,
+                    ASB_HEVC444_PROBE_EXTRADATA_SIZE) != 0) {
+        std::puts("d3d12_actual_decode=BLOCKED reason=non-bundled-sequence");
+        return false;
+    }
     ComPtr<ID3D12Device> device;
     HRESULT hr = D3D12CreateDevice(d3d11.adapter.Get(), D3D_FEATURE_LEVEL_11_0,
                                    IID_PPV_ARGS(&device));
@@ -1163,7 +1173,8 @@ static bool probe_d3d12_decode(const D3D11Context &d3d11,
         }
     }
     output_readback->Unmap(0, nullptr);
-    result->decoded_gpu_surface = decode_status_ok && nonzero;
+    result->decoded_gpu_surface = decode_status_ok && nonzero &&
+        checksum == 0x8d9d27c278740383ull;
     result->actual_decode = decode_status_ok && result->decoded_gpu_surface;
     result->decode_cpu_frame_copy = false;
     std::printf("d3d12_decoded_ayuv_checksum=0x%016llx\n",
@@ -1442,7 +1453,7 @@ static bool probe_d3d12_ayuv_to_rgb(ID3D12Device *device,
                 checksum *= 1099511628211ull;
             }
         }
-        rgb_evidence = checksum != 1469598103934665603ull;
+        rgb_evidence = checksum == 0xa3e0e636ed338383ull;
         readback->Unmap(0, nullptr);
     }
     if (FAILED(hr)) {

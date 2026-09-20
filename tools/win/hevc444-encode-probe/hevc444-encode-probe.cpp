@@ -17,6 +17,7 @@
 #include "../hevc444-probe/hevc_access_unit_probe.h"
 #include "../../linux/agent/hevc444_probe_codec.h"
 #include "d3d12video_hevc1_compat.h"
+#include "hevc444_encode_validation.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -591,15 +592,16 @@ static bool run_actual_encode(ID3D12Device *device, ID3D12VideoDevice3 *video,
     bitstream_readback->Unmap(0, nullptr);
 
     std::vector<hevc_access_unit_probe::Nal> nals;
-    const bool split_ok = hevc_access_unit_probe::split(stream, &nals);
-    bool have_vcl = false, have_irap = false;
-    for (const auto &nal : nals) {
-        /* D3D12's encoder payload is intentionally validated separately from
-           the application-generated VPS/SPS/PPS sequence header.  Drivers
-           are allowed to omit those headers from the frame payload. */
-        have_vcl |= hevc_access_unit_probe::is_vcl(nal.type);
-        have_irap |= hevc_access_unit_probe::is_irap(nal.type);
-    }
+    const bool split_ok = stream.size() >= 6 && stream[0] == 0 && stream[1] == 0 &&
+        (stream[2] == 1 || (stream[2] == 0 && stream[3] == 1)) &&
+        hevc_access_unit_probe::split(stream, &nals);
+    /* D3D12's encoder payload is intentionally validated separately from the
+       application-generated VPS/SPS/PPS sequence header. Drivers are allowed
+       to omit those headers from the frame payload, but the requested IDR
+       contract must still be visible in the payload. */
+    const auto payload = appsandbox_hevc444_encode::validate_encoder_payload(
+        split_ok, nals);
+    const bool have_irap = payload.have_idr;
     appsandbox_hevc444_probe::SequenceConfig sequence_config = {};
     sequence_config.width = kWidth;
     sequence_config.height = kHeight;
@@ -646,17 +648,22 @@ static bool run_actual_encode(ID3D12Device *device, ID3D12VideoDevice3 *video,
     const bool parsed_sequence = generated_header &&
         appsandbox_hevc444_probe::parse_hevc444_sequence_headers(
             generated_sequence_header, &parsed);
-    const bool sequence_header_ok = parsed_sequence &&
-        parsed.width == kWidth && parsed.height == kHeight &&
-        parsed.configuration_flags == sequence_config.configuration_flags &&
-        parsed.picture_flags == sequence_config.picture.flags;
-    const bool encoder_payload_ok = split_ok && have_vcl && have_irap;
+    const bool sequence_header_ok =
+        appsandbox_hevc444_encode::validate_main444_sequence_header(
+            parsed_sequence, parsed.profile_idc, parsed.level_idc,
+            parsed.chroma_format_idc, parsed.bit_depth_luma_minus8,
+            parsed.bit_depth_chroma_minus8, parsed.width, parsed.height,
+            kWidth, kHeight, parsed.configuration_flags,
+            sequence_config.configuration_flags, parsed.picture_flags,
+            sequence_config.picture.flags);
+    const bool encoder_payload_ok = payload.valid();
     const bool stream_ok = sequence_header_ok && encoder_payload_ok;
     std::printf("host_d3d12_hevc444_sequence_header_444=%u\n",
                 sequence_header_ok ? 1U : 0U);
     std::printf("host_d3d12_hevc444_encoder_payload=%u\n",
                 encoder_payload_ok ? 1U : 0U);
     std::printf("host_d3d12_hevc444_irap=%u\n", have_irap ? 1U : 0U);
+    std::printf("host_d3d12_hevc444_idr=%u\n", payload.have_idr ? 1U : 0U);
     std::printf("host_d3d12_hevc444_encode_submission=%u\n", stream_ok ? 1U : 0U);
     return stream_ok;
 }
@@ -761,14 +768,22 @@ static bool query_capability(ID3D12Device *device, ID3D12VideoDevice3 *video)
         D3D12_FEATURE_VIDEO_ENCODER_PROFILE_LEVEL, &profile_level,
         sizeof(profile_level));
     const bool profile_ok = SUCCEEDED(hr) && profile_level.IsSupported != FALSE;
+    std::printf("host_d3d12_hevc444_profile_state=%s hresult=0x%08lx\n",
+        FAILED(hr) ? "ERROR" : profile_ok ? "PASS" : "UNSUPPORTED", hr);
     std::printf("host_d3d12_hevc444_profile=%u\n", profile_ok ? 1U : 0U);
     const bool level_51_supported = profile_ok &&
-        static_cast<unsigned>(max_level.Level) >=
-            static_cast<unsigned>(D3D12_VIDEO_ENCODER_LEVELS_HEVC_51);
-    std::printf("host_d3d12_hevc444_min_level=%u\n",
-                static_cast<unsigned>(min_level.Level));
-    std::printf("host_d3d12_hevc444_max_level=%u\n",
-                static_cast<unsigned>(max_level.Level));
+        appsandbox_hevc444_encode::supports_hevc_level_51(
+            static_cast<unsigned>(max_level.Level),
+            static_cast<unsigned>(D3D12_VIDEO_ENCODER_LEVELS_HEVC_51));
+    if (profile_ok) {
+        std::printf("host_d3d12_hevc444_min_level=%u\n",
+                    static_cast<unsigned>(min_level.Level));
+        std::printf("host_d3d12_hevc444_max_level=%u\n",
+                    static_cast<unsigned>(max_level.Level));
+    } else {
+        std::puts("host_d3d12_hevc444_min_level=UNKNOWN");
+        std::puts("host_d3d12_hevc444_max_level=UNKNOWN");
+    }
     std::printf("host_d3d12_hevc444_level_51_supported=%u\n",
                 level_51_supported ? 1U : 0U);
     if (FAILED(hr)) print_hr("host-d3d12-hevc444-profile", hr);
@@ -781,6 +796,8 @@ static bool query_capability(ID3D12Device *device, ID3D12VideoDevice3 *video)
     hr = video->CheckFeatureSupport(
         D3D12_FEATURE_VIDEO_ENCODER_INPUT_FORMAT, &input, sizeof(input));
     const bool ayuv_ok = SUCCEEDED(hr) && input.IsSupported != FALSE;
+    std::printf("host_d3d12_hevc444_ayuv_state=%s hresult=0x%08lx\n",
+        FAILED(hr) ? "ERROR" : ayuv_ok ? "PASS" : "UNSUPPORTED", hr);
     std::printf("host_d3d12_hevc444_ayuv=%u\n", ayuv_ok ? 1U : 0U);
     if (FAILED(hr)) print_hr("host-d3d12-hevc444-ayuv", hr);
 
@@ -790,6 +807,9 @@ static bool query_capability(ID3D12Device *device, ID3D12VideoDevice3 *video)
         video, profile, &requested_config, &picture_defaults);
     std::printf("host_d3d12_hevc444_codec_configuration=%u\n",
                 config_ok ? 1U : 0U);
+    std::printf("host_d3d12_hevc444_codec_configuration_state=%s\n",
+                config_ok ? "PASS" :
+                (profile_ok ? "BLOCKED_BY_CONFIGURATION" : "BLOCKED_BY_PROFILE"));
 
     D3D12_FEATURE_DATA_VIDEO_ENCODER_RESOURCE_REQUIREMENTS requirements = {};
     requirements.NodeIndex = 0;
@@ -801,6 +821,8 @@ static bool query_capability(ID3D12Device *device, ID3D12VideoDevice3 *video)
         D3D12_FEATURE_VIDEO_ENCODER_RESOURCE_REQUIREMENTS, &requirements,
         sizeof(requirements));
     const bool resource_ok = SUCCEEDED(hr) && requirements.IsSupported != FALSE;
+    std::printf("host_d3d12_hevc444_resource_state=%s hresult=0x%08lx\n",
+        FAILED(hr) ? "ERROR" : resource_ok ? "PASS" : "UNSUPPORTED", hr);
     std::printf("host_d3d12_hevc444_resource_requirements=%u\n",
                 resource_ok ? 1U : 0U);
     if (FAILED(hr)) print_hr("host-d3d12-hevc444-resource-requirements", hr);
@@ -808,8 +830,12 @@ static bool query_capability(ID3D12Device *device, ID3D12VideoDevice3 *video)
     D3D12_VIDEO_ENCODER_VALIDATION_FLAGS combined_validation_flags =
         D3D12_VIDEO_ENCODER_VALIDATION_FLAG_NONE;
     bool combined_4k60 = false;
-    if (!config_ok) {
+    if (!profile_ok || !config_ok || !level_51_supported)
+        std::puts("host_d3d12_hevc444_combined_validation_flags=NOT_RUN");
+    if (!profile_ok) {
         std::puts("host_d3d12_hevc444_combined_state=BLOCKED_BY_PROFILE");
+    } else if (!config_ok) {
+        std::puts("host_d3d12_hevc444_combined_state=BLOCKED_BY_CONFIGURATION");
     } else if (!level_51_supported) {
         std::puts("host_d3d12_hevc444_combined_state=BLOCKED_BY_LEVEL");
     } else {
@@ -818,8 +844,9 @@ static bool query_capability(ID3D12Device *device, ID3D12VideoDevice3 *video)
         std::printf("host_d3d12_hevc444_combined_state=%s\n",
                     combined_4k60 ? "PASS" : "UNSUPPORTED");
     }
-    const bool four_k60 = codec_ok && profile_ok && ayuv_ok && config_ok &&
-        resource_ok && combined_4k60;
+    const bool four_k60 = appsandbox_hevc444_encode::four_k60_ready(
+        codec_ok, profile_ok, ayuv_ok, config_ok, resource_ok,
+        level_51_supported, combined_4k60);
     std::printf("host_d3d12_hevc444_4k60=%u\n", four_k60 ? 1U : 0U);
     if (!four_k60) {
         std::printf("host_d3d12_hevc444_actual_encode=BLOCKED "

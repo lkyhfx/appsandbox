@@ -5,11 +5,17 @@ on:
     paths:
       - "tools/linux/agent/**"
       - "tools/win/hevc444-probe/**"
+      - "tools/win/hevc444-encode-probe/**"
+      - "src/backend_win/vm_video_decode*"
+      - "src/backend_win/vm_hevc444*"
       - ".github/workflows/hevc444-probe.yml"
   pull_request:
     paths:
       - "tools/linux/agent/**"
       - "tools/win/hevc444-probe/**"
+      - "tools/win/hevc444-encode-probe/**"
+      - "src/backend_win/vm_video_decode*"
+      - "src/backend_win/vm_hevc444*"
       - ".github/workflows/hevc444-probe.yml"
 
 jobs:
@@ -19,12 +25,26 @@ jobs:
       - uses: actions/checkout@v4
       - name: Run CPU-only HEVC parser and builder tests
         run: python3 tools/linux/agent/test_hevc_headers.py
+      - name: Run executable decoder and encoder behavior tests
+        run: |
+          python3 tools/win/hevc444-probe/test_backend_policy.py
+          python3 tools/win/hevc444-encode-probe/test_encode_validation.py
 
   windows-compile-only:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: ilammy/msvc-dev-cmd@v1
+      - name: Compile production D3D12 backend and hardware harness
+        shell: pwsh
+        run: ./tools/win/hevc444-probe/build-production-probe.ps1
+      - name: Run executable decoder and encoder behavior tests
+        shell: pwsh
+        run: |
+          python tools/win/hevc444-probe/test_backend_policy.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python tools/win/hevc444-encode-probe/test_encode_validation.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Build the standalone Windows probe
         shell: pwsh
         run: >-
