@@ -12,16 +12,35 @@ typedef enum VmVideoDecodeProfile {
     VM_VIDEO_HEVC444 = 1
 } VmVideoDecodeProfile;
 
+typedef struct VmVideoDecodeCapability {
+    BOOL available;
+    UINT decoder_index;
+    BOOL actual_decode;
+    BOOL gpu_surface;
+    DXGI_FORMAT decoded_format;
+    BOOL ayuv_video_processor;
+} VmVideoDecodeCapability;
+
 BOOL vm_video_decode_supported(ID3D11Device *device);
 BOOL vm_video_decode_supported_profile(ID3D11Device *device,
                                        VmVideoDecodeProfile profile);
+/* Probe every hardware MFT with a real HEVC access unit. A missing access unit
+ * intentionally returns unavailable: registration/activation alone is not
+ * production evidence and must never enable HEVC444 HostHello negotiation. */
+BOOL vm_video_decode_probe_profile(ID3D11Device *device,
+                                   UINT width, UINT height,
+                                   UINT fps_num, UINT fps_den,
+                                   const BYTE *extradata, UINT extradata_size,
+                                   const BYTE *access_unit, UINT access_unit_size,
+                                   VmVideoDecodeProfile profile,
+                                   VmVideoDecodeCapability *out);
 VmVideoDecoder *vm_video_decoder_create(ID3D11Device *device,
                                         UINT width, UINT height,
                                         UINT fps_num, UINT fps_den,
                                         const BYTE *extradata,
                                         UINT extradata_size,
                                         VmVideoDecodeProfile profile);
-/* S_OK returns a GPU NV12 texture with one caller-owned reference. S_FALSE
+/* S_OK returns a GPU NV12/AYUV texture with one caller-owned reference. S_FALSE
  * means the decoder accepted input but needs more data before output. */
 HRESULT vm_video_decoder_decode(VmVideoDecoder *decoder,
                                 const BYTE *data, UINT size,

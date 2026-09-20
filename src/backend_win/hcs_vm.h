@@ -3,6 +3,7 @@
 
 #include <windows.h>
 #include "gpu_enum.h"
+#include "../core/asb_types.h"
 
 /* DLL export/import */
 #ifndef ASB_API
@@ -134,9 +135,21 @@ typedef struct {
 
     /* Desired profile is persisted; active profile is guest-reported. */
     int         display_profile;
+    volatile int guest_display_profile;
     volatile int active_display_profile;
     volatile BOOL display_profile_pending;
+    volatile int display_backend;
+    volatile int display_profile_state;
     char        display_profile_reason[96];
+
+    /* A newly created VM may perform one automatic guest restart after the
+       first profile switch. Existing VMs require an explicit Restart Now. */
+    BOOL        display_profile_auto_reboot_allowed;
+    volatile BOOL display_profile_reboot_issued;
+    int         display_profile_reboot_target;
+    UINT64      display_profile_generation;
+    UINT64      display_profile_reboot_generation;
+    volatile LONG display_profile_reconcile_inflight;
 
     /* Host update state; durable transaction state remains in the guest. */
     volatile int update_state;

@@ -17,6 +17,7 @@ let diskSpacePending = false;
 let diskDirectoryBeforeEdit = null;
 let rowCache = {};          /* vm.name -> <tr> — persistent rows so the status spinner doesn't reset on every update */
 let rowSigCache = {};       /* vm.name -> last render signature; skip rebuild when unchanged */
+let displayRestartPrompted = new Map();
 
 /* ---- Collapsible sections ---- */
 function toggleSection(id) {
@@ -1023,6 +1024,20 @@ function updateStatusCell(td, vm) {
 
 /* Build the list of <td> cells for a row. The status cell is passed in and
    updated in place (rather than recreated) so the spinner animation survives. */
+function displayProfileLabel(vm) {
+    if (vm.displayProfile !== 1) return '1080p60';
+    if (vm.displayProfileState === 1 && vm.displayBackend === 3)
+        return '4K60 · HEVC 4:4:4';
+    if (vm.displayProfileState === 3)
+        return '4K60 · degraded (raw fallback)';
+    if (vm.displayProfileState === 4 ||
+        (vm.activeDisplayProfile === -1 && !vm.agentOnline))
+        return '4K60 · unavailable';
+    if (vm.rebootRequired || vm.displayProfileReason === 'guest-restart-required')
+        return '4K60 · pending reboot';
+    return '4K60 · pending';
+}
+
 function buildRowCells(vm, i, statusTd) {
     updateStatusCell(statusTd, vm);
 
@@ -1072,7 +1087,8 @@ function buildRowCells(vm, i, statusTd) {
         : '1080p60';
     if (vm.displayProfile === 1 && vm.activeDisplayProfile === -1 && !vm.agentOnline)
         profileText = '4K60 · unavailable';
-    var profileTitle = 'Desired/active display profile; pending means the guest has not reconciled it yet';
+    profileText = displayProfileLabel(vm);
+    var profileTitle = 'Desired/guest/backend display state; High Performance is ready only after HEVC444 GPU presentation succeeds';
     if (vm.displayProfilePending && vm.displayProfileReason)
         profileTitle += ' Reason: ' + vm.displayProfileReason;
     var cells = [
@@ -1104,6 +1120,23 @@ function buildRowCells(vm, i, statusTd) {
         makeIconCell('edit', '\u270F\uFE0F', !bld, function() { openEditVmModal(i); }, '', 'Edit VM configuration; Display Mode may be changed while running'),
     );
     return cells;
+}
+
+function maybePromptDisplayRestart(vm, idx) {
+    if (!vm || !vm.running || !vm.rebootRequired ||
+        vm.displayProfileReason !== 'guest-restart-required' || pendingConfirm)
+        return;
+    var key = String(vm.displayProfile) + ':' + String(vm.guestDisplayProfile) + ':' +
+        vm.displayProfileReason;
+    if (displayRestartPrompted.get(vm.name) === key) return;
+    displayRestartPrompted.set(vm.name, key);
+    showModal('Display mode change',
+        'Display mode change requires a guest restart. Restart now or choose Later to keep the pending change.',
+        'Restart Now', { confirmClass: 'primary', cancelText: 'Later' }).then(function(restart) {
+            var current = vms[idx];
+            if (restart && current && current.name === vm.name)
+                sendCmd('restartVm', {vmIndex: idx});
+        });
 }
 
 function renderVmTable() {
@@ -1152,6 +1185,7 @@ function renderVmTable() {
     /* Skip the cell rebuild when button-relevant fields are unchanged; the
      * install progress tick would otherwise destroy the button DOM mid-click. */
     vms.forEach(function(vm, i) {
+        maybePromptDisplayRestart(vm, i);
         var tr = rowCache[vm.name];
         var firstBuild = !tr;
         if (!tr) {
@@ -1171,7 +1205,9 @@ function renderVmTable() {
             vm.updateState, vm.updateProgress, vm.updateActive, vm.updateRebootRequired, vm.updateError,
             vm.osType, vm.ramMb, vm.hddGb, vm.cpuCores,
             vm.gpuMode, vm.gpuId, vm.gpuName, vm.networkMode,
-            vm.displayProfile, vm.activeDisplayProfile, vm.displayProfilePending,
+            vm.displayProfile, vm.guestDisplayProfile, vm.activeDisplayProfile,
+            vm.displayProfilePending, vm.displayBackend, vm.displayProfileState,
+            vm.rebootRequired,
             vm.displayProfileReason || '',
             selectedSnap.get(vm.name) || 'current',
             /* Snapshot tree: take/delete/rename/branch must trigger a row rebuild
@@ -1791,6 +1827,8 @@ function showModal(title, message, confirmText, opts) {
     var confirmBtn = document.getElementById('modal-confirm-btn');
     confirmBtn.textContent = confirmText || 'Confirm';
     confirmBtn.className = (opts && opts.confirmClass) || 'danger';
+    var cancelBtn = document.querySelector('#modal-overlay .modal-buttons button:first-child');
+    if (cancelBtn) cancelBtn.textContent = (opts && opts.cancelText) || 'Cancel';
     var cb = document.getElementById('modal-dont-show');
     if (cb) cb.parentElement.style.display = 'none';
     var inputRow = document.getElementById('modal-input-row');

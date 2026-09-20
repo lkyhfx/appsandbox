@@ -35,6 +35,21 @@ typedef enum AsbDisplayProfile {
     ASB_DISPLAY_PROFILE_UNKNOWN = -1
 } AsbDisplayProfile;
 
+typedef enum AsbDisplayBackend {
+    ASB_DISPLAY_BACKEND_UNKNOWN = 0,
+    ASB_DISPLAY_BACKEND_RAW_ASFR = 1,
+    ASB_DISPLAY_BACKEND_HEVC420_D3D11 = 2,
+    ASB_DISPLAY_BACKEND_HEVC444_D3D11 = 3
+} AsbDisplayBackend;
+
+typedef enum AsbDisplayProfileState {
+    ASB_DISPLAY_PROFILE_STATE_UNKNOWN = 0,
+    ASB_DISPLAY_PROFILE_STATE_READY = 1,
+    ASB_DISPLAY_PROFILE_STATE_PENDING = 2,
+    ASB_DISPLAY_PROFILE_STATE_DEGRADED = 3,
+    ASB_DISPLAY_PROFILE_STATE_UNAVAILABLE = 4
+} AsbDisplayProfileState;
+
 /* ---- VM configuration (inputs to create_vm) ---- */
 
 typedef struct CoreVmConfig {
@@ -66,8 +81,12 @@ typedef struct CoreVmInfo {
     int         cpu_cores;
     int         gpu_mode;
     int         display_profile;
+    int         guest_display_profile;
     int         active_display_profile;
     int         display_profile_pending;
+    int         display_backend;
+    int         display_profile_state;
+    char        display_profile_reason[CORE_VM_STATUS_MAX];
     char        gpu_name[64];
     int         network_mode;
     int         install_complete;

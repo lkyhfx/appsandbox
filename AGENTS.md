@@ -1,5 +1,5 @@
 <!-- CODEGRAPH_START -->
-## CodeGraph
+# CodeGraph
 
 In repositories indexed by CodeGraph (a `.codegraph/` directory exists at the repo root), reach for it BEFORE grep/find or reading files when you need to understand or locate code:
 
@@ -9,9 +9,11 @@ In repositories indexed by CodeGraph (a `.codegraph/` directory exists at the re
 If there is no `.codegraph/` directory, skip CodeGraph entirely — indexing is the user's decision.
 <!-- CODEGRAPH_END -->
 
+# 子代理
 For non-trivial tasks, delegate independent exploration,
 code-path tracing, test discovery, and verification to parallel
 Luna subagents. Keep planning, architectural decisions,
 integration, and final validation in the primary agent.
-
-GPU Guest = ssh yunsen@192.168.42.2 
+# 环境
+GPU Guest 在 ssh yunsen@192.168.42.2 
+使用 $vsDevShell = 'C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\Launch-VsDevShell.ps1' 配置 MSVC

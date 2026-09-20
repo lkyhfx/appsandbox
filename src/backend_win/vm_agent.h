@@ -54,8 +54,8 @@ ASB_API void vm_agent_reconcile_display_profile(VmInstance *instance);
 /* Post an agent/update status notification to the registered UI window. */
 void vm_agent_notify_status(VmInstance *instance);
 
-BOOL vm_agent_shutdown(VmInstance *instance);
-BOOL vm_agent_restart(VmInstance *instance);
-BOOL vm_agent_ping(VmInstance *instance);
+ASB_API BOOL vm_agent_shutdown(VmInstance *instance);
+ASB_API BOOL vm_agent_restart(VmInstance *instance);
+ASB_API BOOL vm_agent_ping(VmInstance *instance);
 
 #endif /* VM_AGENT_H */

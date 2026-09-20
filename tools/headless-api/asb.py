@@ -105,6 +105,10 @@ class Client:
         if branch_name:        body["branchName"] = branch_name
         return self._req("POST", "/vms/%s/start" % name, body or None)
     def shutdown(self, name): return self._req("POST", "/vms/%s/shutdown" % name)   # graceful
+    def restart_guest(self, name):
+        """Request the existing guest-agent restart used by a pending display
+        profile change. This never changes desired configuration."""
+        return self._req("POST", "/vms/%s/restart" % name)
     def stop(self, name):     return self._req("POST", "/vms/%s/stop" % name)       # force
     def delete_vm(self, name):return self._req("POST", "/vms/%s/delete" % name)
 

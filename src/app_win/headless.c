@@ -32,6 +32,7 @@
 #include "webview2_bridge.h"   /* json_get_string/int/bool for request bodies */
 #include "prereq.h"            /* prereq_check_all -> VirtualMachinePlatform check */
 #include "vm_display_idd.h"    /* IDD display window, opened on demand via the API */
+#include "vm_agent.h"           /* explicit guest restart for pending profiles */
 
 #pragma comment(lib, "httpapi.lib")
 
@@ -254,7 +255,9 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
         ",\"state\":\"%s\",\"running\":%s,\"agentOnline\":%s,\"installComplete\":%s,"
         "\"building\":%s,\"progress\":%d,\"sshState\":%d,\"sshPort\":%lu,"
         "\"ramMb\":%lu,\"hddGb\":%lu,\"cpuCores\":%lu,\"gpuMode\":%d,"
-        "\"displayProfile\":%d,\"activeDisplayProfile\":%d,\"displayProfilePending\":%s,\"networkMode\":%d,"
+        "\"displayProfile\":%d,\"guestDisplayProfile\":%d,\"activeDisplayProfile\":%d,"
+        "\"displayProfilePending\":%s,\"displayBackend\":%d,\"displayProfileState\":%d,"
+        "\"rebootRequired\":%s,\"networkMode\":%d,"
         "\"displayOpen\":%s",
         derive_state(v),
         v->running ? "true" : "false", v->agent_online ? "true" : "false",
@@ -263,8 +266,14 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
         (v->ssh_key_deployed && v->ssh_state == 2) ? 4 : v->ssh_state,   /* 4 = ready + key deployed */
         (unsigned long)v->ssh_port,
         (unsigned long)v->ram_mb, (unsigned long)v->hdd_gb, (unsigned long)v->cpu_cores,
-        v->gpu_mode, v->display_profile, v->active_display_profile,
-        v->display_profile_pending ? "true" : "false", v->network_mode,
+        v->gpu_mode, v->display_profile, v->guest_display_profile,
+        v->active_display_profile, v->display_profile_pending ? "true" : "false",
+        v->display_backend, v->display_profile_state,
+        (v->display_profile_pending &&
+         (!strcmp(v->display_profile_reason, "guest-restart-required") ||
+          !strcmp(v->display_profile_reason, "guest-restart-issued")))
+            ? "true" : "false",
+        v->network_mode,
         display_is_open(v->unique_id) ? "true" : "false");
     pos += sprintf_s(out + pos, cap - pos, ",\"displayProfileReason\":");
     pos = append_json_str(out, cap, pos, v->display_profile_reason);
@@ -709,7 +718,14 @@ static int handle_request(PHTTP_REQUEST req)
                 }
             }
             if (json_get_int(body, L"networkMode", &iv)) cfg.network_mode = iv;
-            if (json_get_int(body, L"displayProfile", &iv)) cfg.display_profile = iv;
+            if (json_has_key(body, L"displayProfile")) {
+                if (!json_get_int(body, L"displayProfile", &iv)) {
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                             "displayProfile must be an integer (0 or 1)");
+                    return 0;
+                }
+                cfg.display_profile = iv;
+            }
             if (json_get_bool(body, L"testMode", &bv)) cfg.test_mode = bv;
             if (json_get_bool(body, L"sshEnabled", &bv)) cfg.ssh_enabled = bv;
             if (json_get_bool(body, L"sshDeployKey", &bv)) cfg.ssh_deploy_key = bv;
@@ -822,7 +838,8 @@ static int handle_request(PHTTP_REQUEST req)
             }
             if (verb == HttpVerbPUT) {   /* edit (PUT instead of PATCH: PATCH isn't in the http.sys verb enum) */
                 wchar_t body[8192], gpu_id[512] = {0};
-                int iv, gpu_mode = GPU_DEFAULT, display_profile;
+                int iv, gpu_mode = GPU_DEFAULT,
+                    display_profile = ASB_DISPLAY_PROFILE_STANDARD;
                 BOOL has_gpu, has_profile, has_resource_fields;
                 HRESULT hr = S_OK;
                 if (!body_to_wide(req, body, ARRAYSIZE(body))) {
@@ -878,7 +895,12 @@ static int handle_request(PHTTP_REQUEST req)
                     if (iv < 0 || iv > 3) { send_err(req->RequestId, 400, "Bad Request", "invalid_arg", "networkMode must be 0 (None), 1 (NAT), 2 (External), or 3 (Internal)"); return 0; }
                     hr = asb_vm_set_network(vm, iv);
                 }
-                if (has_profile && json_get_int(body, L"displayProfile", &display_profile))
+                if (has_profile && !json_get_int(body, L"displayProfile", &display_profile)) {
+                    send_err(req->RequestId, 400, "Bad Request", "invalid_arg",
+                             "displayProfile must be an integer (0 or 1)");
+                    return 0;
+                }
+                if (has_profile)
                     hr = asb_vm_set_display_profile(vm, display_profile);
                 asb_save();
                 if (SUCCEEDED(hr)) {
@@ -909,6 +931,18 @@ static int handle_request(PHTTP_REQUEST req)
         }
         if (verb == HttpVerbPOST && wcscmp(sub, L"shutdown") == 0)
             { send_hr(req->RequestId, "shutdown", nu, asb_vm_shutdown(vm)); return 0; }
+        if (verb == HttpVerbPOST && wcscmp(sub, L"restart") == 0) {
+            VmInstance *ri = asb_vm_instance(vm);
+            if (!ri || !ri->running || !ri->display_profile_pending ||
+                (strcmp(ri->display_profile_reason, "guest-restart-required") != 0 &&
+                 strcmp(ri->display_profile_reason, "guest-restart-issued") != 0)) {
+                send_err(req->RequestId, 409, "Conflict", "restart_not_required",
+                         "the VM has no pending display-profile guest restart");
+                return 0;
+            }
+            send_hr(req->RequestId, "restart", nu, vm_agent_restart(ri) ? S_OK : E_FAIL);
+            return 0;
+        }
         if (verb == HttpVerbPOST && wcscmp(sub, L"stop") == 0)
             { send_hr(req->RequestId, "stop", nu, asb_vm_stop(vm)); return 0; }
         if (verb == HttpVerbPOST && wcscmp(sub, L"delete") == 0) {

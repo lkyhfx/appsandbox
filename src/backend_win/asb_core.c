@@ -662,8 +662,14 @@ static void load_vm_list(void)
             vm = &g_vms[g_vm_count];
             ZeroMemory(vm, sizeof(VmInstance));
             vm->unique_id = g_next_vm_id++;
+            vm->guest_display_profile = ASB_DISPLAY_PROFILE_UNKNOWN;
             vm->active_display_profile = ASB_DISPLAY_PROFILE_UNKNOWN;
             vm->display_profile_pending = TRUE;
+            vm->display_backend = ASB_DISPLAY_BACKEND_UNKNOWN;
+            vm->display_profile_state = ASB_DISPLAY_PROFILE_STATE_PENDING;
+            strcpy_s(vm->display_profile_reason, sizeof(vm->display_profile_reason),
+                     "guest-offline");
+            vm->display_profile_generation = 1;
             g_vm_count++;
             continue;
         }
@@ -769,7 +775,16 @@ static void load_vm_list(void)
                 g_vms[i].display_profile != ASB_DISPLAY_PROFILE_HIGH_PERFORMANCE)
                 g_vms[i].display_profile = ASB_DISPLAY_PROFILE_STANDARD;
             g_vms[i].active_display_profile = ASB_DISPLAY_PROFILE_UNKNOWN;
+            g_vms[i].guest_display_profile = ASB_DISPLAY_PROFILE_UNKNOWN;
             g_vms[i].display_profile_pending = TRUE;
+            g_vms[i].display_backend = ASB_DISPLAY_BACKEND_UNKNOWN;
+            g_vms[i].display_profile_state = ASB_DISPLAY_PROFILE_STATE_PENDING;
+            strcpy_s(g_vms[i].display_profile_reason,
+                     sizeof(g_vms[i].display_profile_reason), "guest-offline");
+            g_vms[i].display_profile_auto_reboot_allowed = FALSE;
+            g_vms[i].display_profile_reboot_issued = FALSE;
+            g_vms[i].display_profile_generation = 1;
+            g_vms[i].display_profile_reboot_generation = 0;
             if (resolve_vm_gpu_selection(&g_vms[i])) gpu_changed = TRUE;
             if (vm_load_state_json(g_vms[i].vhdx_path))
                 g_vms[i].install_complete = TRUE;
@@ -3304,8 +3319,16 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     ZeroMemory(inst, sizeof(VmInstance));
     inst->unique_id = g_next_vm_id++;
     inst->display_profile = cfg.display_profile;
+    inst->guest_display_profile = ASB_DISPLAY_PROFILE_UNKNOWN;
     inst->active_display_profile = ASB_DISPLAY_PROFILE_UNKNOWN;
     inst->display_profile_pending = TRUE;
+    inst->display_backend = ASB_DISPLAY_BACKEND_UNKNOWN;
+    inst->display_profile_state = ASB_DISPLAY_PROFILE_STATE_PENDING;
+    strcpy_s(inst->display_profile_reason, sizeof(inst->display_profile_reason),
+             "guest-offline");
+    inst->display_profile_auto_reboot_allowed =
+        cfg.display_profile == ASB_DISPLAY_PROFILE_HIGH_PERFORMANCE;
+    inst->display_profile_generation = 1;
 
     /* Net adapter */
     if (config->net_adapter && config->net_adapter[0] != L'\0' &&
@@ -4076,6 +4099,12 @@ ASB_API int asb_vm_display_profile(AsbVm vm)
     return inst ? inst->display_profile : ASB_DISPLAY_PROFILE_STANDARD;
 }
 
+ASB_API int asb_vm_guest_display_profile(AsbVm vm)
+{
+    VmInstance *inst = vm_inst(vm);
+    return inst ? inst->guest_display_profile : ASB_DISPLAY_PROFILE_UNKNOWN;
+}
+
 ASB_API int asb_vm_active_display_profile(AsbVm vm)
 {
     VmInstance *inst = vm_inst(vm);
@@ -4086,6 +4115,24 @@ ASB_API BOOL asb_vm_display_profile_pending(AsbVm vm)
 {
     VmInstance *inst = vm_inst(vm);
     return inst ? inst->display_profile_pending : FALSE;
+}
+
+ASB_API int asb_vm_display_backend(AsbVm vm)
+{
+    VmInstance *inst = vm_inst(vm);
+    return inst ? inst->display_backend : ASB_DISPLAY_BACKEND_UNKNOWN;
+}
+
+ASB_API int asb_vm_display_profile_state(AsbVm vm)
+{
+    VmInstance *inst = vm_inst(vm);
+    return inst ? inst->display_profile_state : ASB_DISPLAY_PROFILE_STATE_UNKNOWN;
+}
+
+ASB_API const char *asb_vm_display_profile_reason(AsbVm vm)
+{
+    VmInstance *inst = vm_inst(vm);
+    return inst ? inst->display_profile_reason : "";
 }
 
 ASB_API BOOL asb_vm_ssh_enabled(AsbVm vm)
@@ -4200,8 +4247,17 @@ ASB_API HRESULT asb_vm_set_display_profile(AsbVm vm, int profile)
     /* Unlike resource sizing, this is desired guest state and is safe to
        change while the VM is running. The agent reconnect path reconciles it. */
     inst->display_profile = profile;
+    inst->display_profile_generation++;
+    inst->display_profile_reboot_issued = FALSE;
+    inst->display_profile_reboot_target = ASB_DISPLAY_PROFILE_UNKNOWN;
+    inst->display_profile_reboot_generation = 0;
     inst->display_profile_pending =
         inst->active_display_profile != profile;
+    inst->display_backend = ASB_DISPLAY_BACKEND_UNKNOWN;
+    inst->display_profile_state = ASB_DISPLAY_PROFILE_STATE_PENDING;
+    strncpy_s(inst->display_profile_reason, sizeof(inst->display_profile_reason),
+              inst->display_profile_pending ? "profile-change-pending" :
+              "profile-already-active", _TRUNCATE);
     save_vm_list();
     if (g_state_cb) g_state_cb(vm, inst->running, g_state_ud);
     if (inst->agent_online)

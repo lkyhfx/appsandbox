@@ -230,6 +230,9 @@ struct VmDisplayIdd {
     BOOL                     video_active;
     VmVideoDecodeProfile     video_profile;
     BOOL                     hevc_disabled;
+    volatile LONG            video_path_failed;
+    volatile LONG            video_path_failure_hr;
+    volatile LONG            video_failure_logged;
     UINT                     fallback_count;
     ID3D11VideoDevice       *video_device;
     ID3D11VideoContext      *video_context;
@@ -628,6 +631,38 @@ static void idd_log(VmDisplayIdd *d, const wchar_t *fmt, ...)
     /* Scroll to bottom and force repaint even when not focused */
     SendMessageW(d->log_list_hwnd, LB_SETTOPINDEX, (WPARAM)(count - 1), 0);
     UpdateWindow(d->log_list_hwnd);
+}
+
+static void idd_publish_display_runtime(VmDisplayIdd *d, int backend,
+                                         int state, const char *reason)
+{
+    VmInstance *vm;
+    if (!d || !(vm = d->vm)) return;
+    InterlockedExchange((volatile LONG *)&vm->display_backend, backend);
+    InterlockedExchange((volatile LONG *)&vm->display_profile_state, state);
+    if (reason)
+        strncpy_s(vm->display_profile_reason,
+                  sizeof(vm->display_profile_reason), reason, _TRUNCATE);
+}
+
+static void idd_mark_video_path_failed(VmDisplayIdd *d, const char *reason,
+                                       HRESULT hr)
+{
+    LONG first;
+    if (!d) return;
+    InterlockedExchange(&d->video_path_failure_hr, (LONG)hr);
+    InterlockedExchange(&d->video_path_failed, 1);
+    InterlockedExchange((volatile LONG *)&d->hevc_disabled, TRUE);
+    idd_publish_display_runtime(d, ASB_DISPLAY_BACKEND_UNKNOWN,
+                                ASB_DISPLAY_PROFILE_STATE_DEGRADED, reason);
+    first = InterlockedCompareExchange(&d->video_failure_logged, 1, 0);
+    if (first == 0) {
+        d->fallback_count++;
+        idd_log(d, L"display_protocol=v2 display_backend=raw-asfr fallback=1 "
+                L"fallback_count=%u fallback_reason=%S "
+                L"reconnecting=1 hresult=0x%08lX", d->fallback_count,
+                reason ? reason : "hevc-video-path-failed", (unsigned long)hr);
+    }
 }
 
 /* ---- Send input packet to guest ---- */
@@ -1219,6 +1254,36 @@ static BOOL recv_exact(SOCKET s, void *buf, int len)
     return TRUE;
 }
 
+/* Frame-channel variant that lets the receive thread observe a fatal render
+   failure without the render thread touching or closing its socket. */
+static BOOL recv_exact_display(VmDisplayIdd *d, SOCKET s, void *buf, int len)
+{
+    char *p = (char *)buf;
+    int remaining = len;
+    while (remaining > 0) {
+        fd_set rfds;
+        struct timeval tv;
+        int ready;
+        if (!d || d->stop ||
+            InterlockedCompareExchange(&d->video_path_failed, 0, 0))
+            return FALSE;
+        FD_ZERO(&rfds);
+        FD_SET(s, &rfds);
+        tv.tv_sec = 0;
+        tv.tv_usec = 200000;
+        ready = select(0, &rfds, NULL, NULL, &tv);
+        if (ready == SOCKET_ERROR) return FALSE;
+        if (ready == 0) continue;
+        {
+            int n = recv(s, p, remaining, 0);
+            if (n <= 0) return FALSE;
+            p += n;
+            remaining -= n;
+        }
+    }
+    return TRUE;
+}
+
 static BOOL send_exact_socket(SOCKET s, const void *buf, int len)
 {
     const char *p = (const char *)buf;
@@ -1799,6 +1864,7 @@ static BOOL d3d_render_video_frame(VmDisplayIdd *d)
     UINT subresource = 0;
     HRESULT hr;
     D3D11_TEXTURE2D_DESC texture_desc;
+    const char *failure_reason = "hevc-video-processor-failed";
     float clear[4] = {0, 0, 0, 1};
 
     EnterCriticalSection(&d->frame_cs);
@@ -1817,8 +1883,9 @@ static BOOL d3d_render_video_frame(VmDisplayIdd *d)
          texture_desc.Format != DXGI_FORMAT_AYUV) ||
         (d->video_profile == VM_VIDEO_HEVC420 &&
          texture_desc.Format != DXGI_FORMAT_NV12)) {
-        idd_log(d, L"display_protocol=v2 display_backend=raw-asfr fallback=1 "
-                L"fallback_reason=profile-surface-mismatch format=%u", texture_desc.Format);
+        failure_reason = d->video_profile == VM_VIDEO_HEVC444
+            ? "hevc444-surface-format-mismatch" : "hevc420-surface-format-mismatch";
+        idd_mark_video_path_failed(d, failure_reason, E_INVALIDARG);
         ID3D11Texture2D_Release(texture);
         return FALSE;
     }
@@ -1829,7 +1896,13 @@ static BOOL d3d_render_video_frame(VmDisplayIdd *d)
     if (!d->video_context)
         ID3D11DeviceContext_QueryInterface(d->ctx, &IID_ID3D11VideoContext,
                                            (void **)&d->video_context);
-    if (!d->video_device || !d->video_context) goto fail;
+    if (!d->video_device || !d->video_context) {
+        failure_reason = d->video_profile == VM_VIDEO_HEVC444
+            ? "hevc444-video-processor-create-failed" :
+              "hevc420-video-processor-create-failed";
+        hr = E_NOINTERFACE;
+        goto fail;
+    }
     if (!d->video_enum || d->video_processor_width != d->frame_width ||
         d->video_processor_height != d->frame_height) {
         if (d->video_processor) { ID3D11VideoProcessor_Release(d->video_processor); d->video_processor = NULL; }
@@ -1845,29 +1918,51 @@ static BOOL d3d_render_video_frame(VmDisplayIdd *d)
         content.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
         hr = ID3D11VideoDevice_CreateVideoProcessorEnumerator(
             d->video_device, &content, &d->video_enum);
-        if (FAILED(hr)) goto fail;
+        if (FAILED(hr)) {
+            failure_reason = d->video_profile == VM_VIDEO_HEVC444
+                ? "hevc444-video-processor-create-failed" :
+                  "hevc420-video-processor-create-failed";
+            goto fail;
+        }
         hr = ID3D11VideoDevice_CreateVideoProcessor(d->video_device,
                                                      d->video_enum, 0,
                                                      &d->video_processor);
-        if (FAILED(hr)) goto fail;
+        if (FAILED(hr)) {
+            failure_reason = d->video_profile == VM_VIDEO_HEVC444
+                ? "hevc444-video-processor-create-failed" :
+                  "hevc420-video-processor-create-failed";
+            goto fail;
+        }
         d->video_processor_width = d->frame_width;
         d->video_processor_height = d->frame_height;
     }
 
     hr = IDXGISwapChain_GetBuffer(d->swap_chain, 0, &IID_ID3D11Texture2D,
                                   (void **)&back_buffer);
-    if (FAILED(hr)) goto fail;
+    if (FAILED(hr)) {
+        failure_reason = d->video_profile == VM_VIDEO_HEVC444
+            ? "hevc444-rgb-output-view-failed" : "hevc420-rgb-output-view-failed";
+        goto fail;
+    }
     ZeroMemory(&input_desc, sizeof(input_desc));
     input_desc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
     input_desc.Texture2D.ArraySlice = subresource;
     hr = ID3D11VideoDevice_CreateVideoProcessorInputView(d->video_device,
         (ID3D11Resource *)texture, d->video_enum, &input_desc, &input_view);
-    if (FAILED(hr)) goto fail;
+    if (FAILED(hr)) {
+        failure_reason = d->video_profile == VM_VIDEO_HEVC444
+            ? "hevc444-ayuv-input-view-failed" : "hevc420-input-view-failed";
+        goto fail;
+    }
     ZeroMemory(&output_desc, sizeof(output_desc));
     output_desc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
     hr = ID3D11VideoDevice_CreateVideoProcessorOutputView(d->video_device,
         (ID3D11Resource *)back_buffer, d->video_enum, &output_desc, &output_view);
-    if (FAILED(hr)) goto fail;
+    if (FAILED(hr)) {
+        failure_reason = d->video_profile == VM_VIDEO_HEVC444
+            ? "hevc444-rgb-output-view-failed" : "hevc420-rgb-output-view-failed";
+        goto fail;
+    }
 
     GetClientRect(d->render_hwnd, &client);
     SetRect(&source, 0, 0, (int)d->frame_width, (int)d->frame_height);
@@ -1891,7 +1986,19 @@ static BOOL d3d_render_video_frame(VmDisplayIdd *d)
         hr = ID3D11VideoContext_VideoProcessorBlt(d->video_context,
             d->video_processor, output_view, d->recv_count, 1, &stream);
     }
-    if (SUCCEEDED(hr)) IDXGISwapChain_Present(d->swap_chain, 0, 0);
+    if (FAILED(hr)) {
+        failure_reason = d->video_profile == VM_VIDEO_HEVC444
+            ? "hevc444-video-processor-blt-failed" : "hevc420-video-processor-blt-failed";
+        goto fail;
+    }
+    if (SUCCEEDED(hr)) {
+        IDXGISwapChain_Present(d->swap_chain, 0, 0);
+        idd_publish_display_runtime(d,
+            d->video_profile == VM_VIDEO_HEVC444
+                ? ASB_DISPLAY_BACKEND_HEVC444_D3D11
+                : ASB_DISPLAY_BACKEND_HEVC420_D3D11,
+            ASB_DISPLAY_PROFILE_STATE_READY, "");
+    }
     if (output_view) ID3D11VideoProcessorOutputView_Release(output_view);
     if (input_view) ID3D11VideoProcessorInputView_Release(input_view);
     if (back_buffer) ID3D11Texture2D_Release(back_buffer);
@@ -1899,6 +2006,7 @@ static BOOL d3d_render_video_frame(VmDisplayIdd *d)
     return SUCCEEDED(hr);
 
 fail:
+    idd_mark_video_path_failed(d, failure_reason, hr);
     if (output_view) ID3D11VideoProcessorOutputView_Release(output_view);
     if (input_view) ID3D11VideoProcessorInputView_Release(input_view);
     if (back_buffer) ID3D11Texture2D_Release(back_buffer);
@@ -1918,7 +2026,12 @@ static void d3d_render_frame(VmDisplayIdd *d)
     if (!d->device || !d->ctx || !d->swap_chain || !d->rtv)
         return;
 
+    if (d->video_active &&
+        InterlockedCompareExchange(&d->video_path_failed, 0, 0))
+        return;
     if (d->video_active && d3d_render_video_frame(d))
+        return;
+    if (InterlockedCompareExchange(&d->video_path_failed, 0, 0))
         return;
 
     /* Upload frame data to GPU texture if dirty */
@@ -2297,6 +2410,10 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         }
 
         idd_log(d, L"Frame channel connected.");
+        /* video_path_failed is scoped to one frame session.  Keep
+           hevc_disabled latched, but let the next session carry raw ASFR. */
+        InterlockedExchange(&d->video_path_failed, 0);
+        InterlockedExchange(&d->video_path_failure_hr, 0);
         {
             AsbDisplayHostHello hello;
             ZeroMemory(&hello, sizeof(hello));
@@ -2324,6 +2441,11 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 (hello.capabilities & ASB_DISPLAY_CAP_HEVC444_D3D11_HW_DECODE) != 0;
             advertised_hevc = requested_hevc444 ? advertised_hevc444 :
                 (hello.capabilities & ASB_DISPLAY_CAP_HEVC420_D3D11_HW_DECODE) != 0;
+            if (requested_hevc444 && !advertised_hevc444 && !d->hevc_disabled &&
+                d->vm && strstr(d->vm->guest_caps, "production-4k60-v1") != NULL)
+                idd_publish_display_runtime(d, ASB_DISPLAY_BACKEND_UNKNOWN,
+                    ASB_DISPLAY_PROFILE_STATE_UNAVAILABLE,
+                    "host-no-hevc444-decoder");
             hello.max_width = 7680;
             hello.max_height = 4320;
             if (!send_exact_socket(s, &hello, sizeof(hello))) {
@@ -2348,14 +2470,14 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             UINT32 magic;
 
             /* Peek at magic to determine message type */
-            if (!recv_exact(s, &magic, sizeof(magic)))
+            if (!recv_exact_display(d, s, &magic, sizeof(magic)))
                 break;
 
             if (magic == CURSOR_MAGIC) {
                 /* Read rest of cursor header (already read magic) */
                 CursorHeader chdr;
                 chdr.magic = magic;
-                if (!recv_exact(s, (BYTE *)&chdr + sizeof(UINT32),
+                if (!recv_exact_display(d, s, (BYTE *)&chdr + sizeof(UINT32),
                                 sizeof(CursorHeader) - sizeof(UINT32)))
                     break;
 
@@ -2373,7 +2495,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                                                     chdr.shape_data_size);
                     if (!cursor_buf) break;
 
-                    if (!recv_exact(s, cursor_buf, (int)chdr.shape_data_size)) {
+                    if (!recv_exact_display(d, s, cursor_buf, (int)chdr.shape_data_size)) {
                         HeapFree(GetProcessHeap(), 0, cursor_buf);
                         break;
                     }
@@ -2404,7 +2526,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 AsbEncodedVideoConfig config;
                 BYTE *extradata = NULL;
                 config.magic = magic;
-                if (!recv_exact(s, (BYTE *)&config + sizeof(UINT32),
+                if (!recv_exact_display(d, s, (BYTE *)&config + sizeof(UINT32),
                                 sizeof(config) - sizeof(UINT32))) break;
                 if (config.version != ASB_DISPLAY_PROTOCOL_VERSION ||
                     config.header_size != sizeof(config) ||
@@ -2413,9 +2535,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     config.width > 7680 || config.height > 4320 ||
                     !config.fps_num || !config.fps_den ||
                     config.extradata_size > ASB_DISPLAY_MAX_EXTRADATA) {
-                    d->fallback_count++;
-                    idd_log(d, L"display_protocol=v2 display_backend=raw-asfr fallback=1 fallback_count=%u fallback_reason=invalid-asvc reconnecting=1",
-                            d->fallback_count);
+                    idd_mark_video_path_failed(d, "invalid-asvc", E_INVALIDARG);
                     break;
                 }
                 {
@@ -2429,10 +2549,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                         (!config_444 && !config_420) ||
                         (config_444 && (config.width != 3840 || config.height != 2160 ||
                                         config.fps_num != 60 || config.fps_den != 1))) {
-                        d->fallback_count++;
-                        idd_log(d, L"display_protocol=v2 display_backend=raw-asfr fallback=1 "
-                                L"fallback_count=%u fallback_reason=profile-mismatch reconnecting=1",
-                                d->fallback_count);
+                        idd_mark_video_path_failed(d, "profile-mismatch", E_INVALIDARG);
                         break;
                     }
                     d->video_profile = config_444 ? VM_VIDEO_HEVC444 : VM_VIDEO_HEVC420;
@@ -2440,7 +2557,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 if (config.extradata_size) {
                     extradata = (BYTE *)HeapAlloc(GetProcessHeap(), 0,
                                                   config.extradata_size);
-                    if (!extradata || !recv_exact(s, extradata,
+                    if (!extradata || !recv_exact_display(d, s, extradata,
                                                   (int)config.extradata_size)) {
                         if (extradata) HeapFree(GetProcessHeap(), 0, extradata);
                         break;
@@ -2463,14 +2580,16 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 LeaveCriticalSection(&d->frame_cs);
                 if (extradata) HeapFree(GetProcessHeap(), 0, extradata);
                 if (!d->video_decoder) {
-                    d->hevc_disabled = TRUE;
-                    d->fallback_count++;
-                    idd_log(d, L"display_protocol=v2 display_backend=raw-asfr fallback=1 fallback_count=%u fallback_reason=hevc-decoder-create-failed reconnecting=1",
-                            d->fallback_count);
+                    idd_mark_video_path_failed(d, "hevc-decoder-create-failed", E_FAIL);
                     break;
                 }
+                idd_publish_display_runtime(d, ASB_DISPLAY_BACKEND_UNKNOWN,
+                    ASB_DISPLAY_PROFILE_STATE_PENDING,
+                    requested_hevc444 ? "hevc444-awaiting-frame" :
+                                        "hevc420-awaiting-frame");
                 session_saw_hevc = TRUE;
-                idd_log(d, L"display_protocol=v2 display_backend=hevc-d3d11 fallback=0 generation=%llu mode=%ux%u fps=%u/%u",
+                idd_log(d, L"display_protocol=v2 display_backend=%s fallback=0 generation=%llu mode=%ux%u fps=%u/%u",
+                        d->video_profile == VM_VIDEO_HEVC444 ? L"hevc444-d3d11" : L"hevc420-d3d11",
                         config.generation, config.width, config.height,
                         config.fps_num, config.fps_den);
                 continue;
@@ -2482,7 +2601,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 UINT subresource = 0;
                 HRESULT decode_hr;
                 frame.magic = magic;
-                if (!recv_exact(s, (BYTE *)&frame + sizeof(UINT32),
+                if (!recv_exact_display(d, s, (BYTE *)&frame + sizeof(UINT32),
                                 sizeof(frame) - sizeof(UINT32))) break;
                 if (frame.version != ASB_DISPLAY_PROTOCOL_VERSION ||
                     frame.header_size != sizeof(frame) ||
@@ -2497,7 +2616,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     recv_buf = larger;
                     recv_capacity = frame.payload_size;
                 }
-                if (!recv_exact(s, recv_buf, (int)frame.payload_size)) break;
+                if (!recv_exact_display(d, s, recv_buf, (int)frame.payload_size)) break;
                 if (d->video_wait_idr && !(frame.flags & ASB_DISPLAY_VIDEO_FLAG_IDR))
                     continue;
                 decode_hr = vm_video_decoder_decode(d->video_decoder,
@@ -2505,10 +2624,10 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     (LONGLONG)(frame.capture_time_ns / 100),
                     &texture, &subresource);
                 if (FAILED(decode_hr)) {
-                    d->hevc_disabled = TRUE;
-                    d->fallback_count++;
-                    idd_log(d, L"display_protocol=v2 display_backend=raw-asfr fallback=1 fallback_count=%u fallback_reason=hevc-decode-failed hresult=0x%08X reconnecting=1",
-                            d->fallback_count, decode_hr);
+                    idd_mark_video_path_failed(d,
+                        d->video_profile == VM_VIDEO_HEVC444
+                            ? "hevc444-decode-failed" : "hevc420-decode-failed",
+                        decode_hr);
                     break;
                 }
                 if (decode_hr == S_OK && texture) {
@@ -2537,7 +2656,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
 
             /* Read rest of frame header (already read magic) */
             hdr.magic = magic;
-            if (!recv_exact(s, (BYTE *)&hdr + sizeof(UINT32),
+            if (!recv_exact_display(d, s, (BYTE *)&hdr + sizeof(UINT32),
                             sizeof(FrameHeader) - sizeof(UINT32)))
                 break;
 
@@ -2558,12 +2677,12 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
 
             /* Read dirty rects */
             if (rect_count > 0) {
-                if (!recv_exact(s, dirty_rects, (int)(rect_count * sizeof(RECT))))
+                if (!recv_exact_display(d, s, dirty_rects, (int)(rect_count * sizeof(RECT))))
                     break;
             }
 
             /* Read data_size */
-            if (!recv_exact(s, &data_size, 4))
+            if (!recv_exact_display(d, s, &data_size, 4))
                 break;
 
             if (data_size > MAX_FRAME_DATA_SIZE) {
@@ -2579,6 +2698,14 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                         d->fallback_count,
                         advertised_hevc ? L"guest-selected-raw" :
                                           L"host-hevc-unavailable");
+                if (d->vm && d->vm->display_profile == ASB_DISPLAY_PROFILE_HIGH_PERFORMANCE)
+                    idd_publish_display_runtime(d, ASB_DISPLAY_BACKEND_RAW_ASFR,
+                        ASB_DISPLAY_PROFILE_STATE_DEGRADED,
+                        InterlockedCompareExchange(&d->video_path_failed, 0, 0)
+                            ? NULL : "host-hevc-unavailable");
+                else
+                    idd_publish_display_runtime(d, ASB_DISPLAY_BACKEND_RAW_ASFR,
+                        ASB_DISPLAY_PROFILE_STATE_READY, "");
             }
 
             if (data_size > recv_capacity) {
@@ -2591,7 +2718,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
 
             /* Read pixel data */
             if (data_size > 0) {
-                if (!recv_exact(s, recv_buf, (int)data_size))
+                if (!recv_exact_display(d, s, recv_buf, (int)data_size))
                     break;
             }
 
@@ -2717,6 +2844,8 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         idd_log(d, L"display_protocol=%s display_backend=%s session_ended=1 reconnecting=1",
                 session_saw_hevc ? L"v2" :
                 session_logged_raw ? L"asfr" : L"unknown",
+                InterlockedCompareExchange(&d->video_path_failed, 0, 0)
+                    ? L"raw-asfr" :
                 session_saw_hevc ? L"hevc-d3d11" :
                 session_logged_raw ? L"raw-asfr" : L"unknown");
 

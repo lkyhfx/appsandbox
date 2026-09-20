@@ -308,8 +308,15 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_int(jb, L"cpuCores", (int)v->cpu_cores);
     jb_int(jb, L"gpuMode", v->gpu_mode);
     jb_int(jb, L"displayProfile", v->display_profile);
+    jb_int(jb, L"guestDisplayProfile", v->guest_display_profile);
     jb_int(jb, L"activeDisplayProfile", v->active_display_profile);
     jb_bool(jb, L"displayProfilePending", v->display_profile_pending);
+    jb_int(jb, L"displayBackend", v->display_backend);
+    jb_int(jb, L"displayProfileState", v->display_profile_state);
+    jb_bool(jb, L"rebootRequired",
+            v->display_profile_pending &&
+            (!strcmp(v->display_profile_reason, "guest-restart-required") ||
+             !strcmp(v->display_profile_reason, "guest-restart-issued")));
     jb_ascii(jb, L"displayProfileReason", v->display_profile_reason);
     jb_string(jb, L"gpuId", v->gpu_id);
     jb_string(jb, L"gpuName", v->gpu_name);
@@ -1128,6 +1135,19 @@ static void on_webview2_message(const wchar_t *json)
             safe_destroy_rdp(idx);
             safe_destroy_idd(idx);
             asb_vm_shutdown(asb_vm_get(idx));
+            send_vm_list();
+        }
+    } else if (wcscmp(action, L"restartVm") == 0) {
+        int idx;
+        if (json_get_int(json, L"vmIndex", &idx) && idx >= 0 && idx < asb_vm_count()) {
+            VmInstance *inst = asb_vm_instance(asb_vm_get(idx));
+            if (inst && inst->running && inst->display_profile_pending &&
+                strcmp(inst->display_profile_reason, "guest-restart-required") == 0) {
+                if (!vm_agent_restart(inst))
+                    ui_show_alert(L"The guest restart could not be requested.");
+            } else {
+                ui_show_alert(L"This VM does not have a pending display-mode restart.");
+            }
             send_vm_list();
         }
     } else if (wcscmp(action, L"stopVm") == 0) {

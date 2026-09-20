@@ -67,10 +67,25 @@ static DWORD WINAPI display_profile_reconcile_proc(LPVOID param);
 static void display_profile_mark_offline(VmInstance *vm, const char *reason)
 {
     if (!vm) return;
+    vm->guest_display_profile = ASB_DISPLAY_PROFILE_UNKNOWN;
     vm->active_display_profile = ASB_DISPLAY_PROFILE_UNKNOWN;
+    vm->display_backend = ASB_DISPLAY_BACKEND_UNKNOWN;
+    vm->display_profile_state = ASB_DISPLAY_PROFILE_STATE_PENDING;
     vm->display_profile_pending = TRUE;
     strncpy_s(vm->display_profile_reason, sizeof(vm->display_profile_reason),
               reason ? reason : "guest-offline", _TRUNCATE);
+}
+
+static void display_profile_set_state(VmInstance *vm, int state,
+                                       const char *reason)
+{
+    if (!vm) return;
+    vm->display_profile_state = state;
+    if (reason)
+        strncpy_s(vm->display_profile_reason,
+                  sizeof(vm->display_profile_reason), reason, _TRUNCATE);
+    else
+        vm->display_profile_reason[0] = '\0';
 }
 
 static void schedule_display_profile_reconcile(VmInstance *vm)
@@ -284,21 +299,28 @@ static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
     } else if (strncmp(buf, "display_profile:", 16) == 0) {
         const char *profile = buf + 16;
         if (strcmp(profile, "high_performance") == 0)
-            vm->active_display_profile = ASB_DISPLAY_PROFILE_HIGH_PERFORMANCE;
+            vm->guest_display_profile = ASB_DISPLAY_PROFILE_HIGH_PERFORMANCE;
         else if (strcmp(profile, "standard") == 0)
-            vm->active_display_profile = ASB_DISPLAY_PROFILE_STANDARD;
+            vm->guest_display_profile = ASB_DISPLAY_PROFILE_STANDARD;
         else
-            vm->active_display_profile = ASB_DISPLAY_PROFILE_UNKNOWN;
+            vm->guest_display_profile = ASB_DISPLAY_PROFILE_UNKNOWN;
+        vm->active_display_profile = vm->guest_display_profile;
         vm->display_profile_pending =
             vm->active_display_profile != vm->display_profile;
         if (vm->display_profile_pending) {
             strncpy_s(vm->display_profile_reason,
                       sizeof(vm->display_profile_reason),
                       "guest-profile-mismatch", _TRUNCATE);
+            display_profile_set_state(vm, ASB_DISPLAY_PROFILE_STATE_PENDING,
+                                      "guest-profile-mismatch");
         } else {
-            vm->display_profile_reason[0] = '\0';
+            if (vm->display_backend == ASB_DISPLAY_BACKEND_UNKNOWN)
+                display_profile_set_state(vm,
+                    ASB_DISPLAY_PROFILE_STATE_PENDING,
+                    "display-backend-awaiting-negotiation");
         }
         notify_agent_status(vm);
+        schedule_display_profile_reconcile(vm);
     } else if (strncmp(buf, "update_progress:", 16) == 0) {
         int pct = atoi(buf + 16);
         if (pct >= 0 && pct <= 100) vm->update_progress = pct;
@@ -470,9 +492,11 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
         display_profile_mark_offline(vm, "guest-profile-reconnecting");
         if (_wcsicmp(vm->os_type, L"Linux") != 0 &&
             vm->display_profile == ASB_DISPLAY_PROFILE_STANDARD) {
+            vm->guest_display_profile = ASB_DISPLAY_PROFILE_STANDARD;
             vm->active_display_profile = ASB_DISPLAY_PROFILE_STANDARD;
             vm->display_profile_pending = FALSE;
             vm->display_profile_reason[0] = '\0';
+            vm->display_profile_state = ASB_DISPLAY_PROFILE_STATE_PENDING;
         }
         vm->shutdown_requested = FALSE;
         vm->last_heartbeat = GetTickCount64();
@@ -782,9 +806,36 @@ static const char *display_profile_gate_reason(const VmInstance *instance)
     return NULL;
 }
 
-void vm_agent_reconcile_display_profile(VmInstance *instance)
+static BOOL parse_display_profile_response(const char *response,
+                                           char *configured, size_t configured_cap,
+                                           char *active, size_t active_cap,
+                                           BOOL *reboot_required)
+{
+    int reboot = -1;
+    if (!response || !configured || !active || !reboot_required ||
+        configured_cap < 16 || active_cap < 16)
+        return FALSE;
+    configured[0] = active[0] = '\0';
+    if (sscanf_s(response,
+                 "configured_profile=%15[^;];active_profile=%15[^;];reboot_required=%d",
+                 configured, (unsigned)configured_cap,
+                 active, (unsigned)active_cap, &reboot) != 3)
+        return FALSE;
+    if ((strcmp(configured, "standard") != 0 &&
+         strcmp(configured, "high_performance") != 0) ||
+        (strcmp(active, "standard") != 0 &&
+         strcmp(active, "high_performance") != 0 &&
+         strcmp(active, "unknown") != 0) ||
+        (reboot != 0 && reboot != 1))
+        return FALSE;
+    *reboot_required = reboot != 0;
+    return TRUE;
+}
+
+static void reconcile_display_profile_impl(VmInstance *instance)
 {
     char response[256] = "";
+    char configured[32], active[32];
     const char *reason;
     const char *wanted;
     BOOL reboot_required;
@@ -797,9 +848,11 @@ void vm_agent_reconcile_display_profile(VmInstance *instance)
     if (instance->display_profile == ASB_DISPLAY_PROFILE_STANDARD &&
         (_wcsicmp(instance->os_type, L"Linux") != 0 ||
          !strstr(instance->guest_caps, "display-profile-v1"))) {
+        instance->guest_display_profile = ASB_DISPLAY_PROFILE_STANDARD;
         instance->active_display_profile = ASB_DISPLAY_PROFILE_STANDARD;
         instance->display_profile_pending = FALSE;
-        instance->display_profile_reason[0] = '\0';
+        display_profile_set_state(instance, ASB_DISPLAY_PROFILE_STATE_PENDING,
+                                  "legacy-guest-standard");
         notify_agent_status(instance);
         return;
     }
@@ -808,8 +861,8 @@ void vm_agent_reconcile_display_profile(VmInstance *instance)
     if (reason) {
         instance->active_display_profile = ASB_DISPLAY_PROFILE_UNKNOWN;
         instance->display_profile_pending = TRUE;
-        strncpy_s(instance->display_profile_reason,
-                  sizeof(instance->display_profile_reason), reason, _TRUNCATE);
+        display_profile_set_state(instance, ASB_DISPLAY_PROFILE_STATE_UNAVAILABLE,
+                                  reason);
         notify_agent_status(instance);
         return;
     }
@@ -818,28 +871,50 @@ void vm_agent_reconcile_display_profile(VmInstance *instance)
                           sizeof(response), 5000)) {
         instance->active_display_profile = ASB_DISPLAY_PROFILE_UNKNOWN;
         instance->display_profile_pending = TRUE;
-        strncpy_s(instance->display_profile_reason,
-                  sizeof(instance->display_profile_reason),
-                  "guest-profile-query-failed", _TRUNCATE);
+        display_profile_set_state(instance, ASB_DISPLAY_PROFILE_STATE_UNAVAILABLE,
+                                  "guest-profile-query-failed");
+        notify_agent_status(instance);
+        return;
+    }
+
+    if (!parse_display_profile_response(response, configured, sizeof(configured),
+                                        active, sizeof(active), &reboot_required)) {
+        instance->active_display_profile = ASB_DISPLAY_PROFILE_UNKNOWN;
+        instance->display_profile_pending = TRUE;
+        display_profile_set_state(instance, ASB_DISPLAY_PROFILE_STATE_UNAVAILABLE,
+                                  "guest-profile-protocol-invalid");
         notify_agent_status(instance);
         return;
     }
 
     wanted = instance->display_profile == ASB_DISPLAY_PROFILE_HIGH_PERFORMANCE
         ? "high_performance" : "standard";
-    if (strstr(response, "profile=high_performance") &&
-        instance->display_profile == ASB_DISPLAY_PROFILE_HIGH_PERFORMANCE) {
+    if (!strcmp(configured, wanted) && !strcmp(active, wanted) && !reboot_required) {
+        instance->guest_display_profile = instance->display_profile;
         instance->active_display_profile = ASB_DISPLAY_PROFILE_HIGH_PERFORMANCE;
+        if (instance->display_profile == ASB_DISPLAY_PROFILE_STANDARD)
+            instance->active_display_profile = ASB_DISPLAY_PROFILE_STANDARD;
         instance->display_profile_pending = FALSE;
-        instance->display_profile_reason[0] = '\0';
+        if (instance->display_profile_reboot_issued &&
+            instance->display_profile_reboot_generation == instance->display_profile_generation) {
+            instance->display_profile_reboot_issued = FALSE;
+            instance->display_profile_auto_reboot_allowed = FALSE;
+        }
+        if (instance->display_backend == ASB_DISPLAY_BACKEND_UNKNOWN)
+            display_profile_set_state(instance, ASB_DISPLAY_PROFILE_STATE_PENDING,
+                                      "display-backend-awaiting-negotiation");
         notify_agent_status(instance);
         return;
     }
-    if (strstr(response, "profile=standard") &&
-        instance->display_profile == ASB_DISPLAY_PROFILE_STANDARD) {
-        instance->active_display_profile = ASB_DISPLAY_PROFILE_STANDARD;
-        instance->display_profile_pending = FALSE;
-        instance->display_profile_reason[0] = '\0';
+
+    if (instance->display_profile_reboot_issued &&
+        instance->display_profile_reboot_generation == instance->display_profile_generation &&
+        instance->display_profile_reboot_target == instance->display_profile) {
+        instance->active_display_profile = ASB_DISPLAY_PROFILE_UNKNOWN;
+        instance->display_profile_pending = TRUE;
+        instance->display_profile_auto_reboot_allowed = FALSE;
+        display_profile_set_state(instance, ASB_DISPLAY_PROFILE_STATE_UNAVAILABLE,
+                                  "profile-reconcile-failed-after-reboot");
         notify_agent_status(instance);
         return;
     }
@@ -850,33 +925,62 @@ void vm_agent_reconcile_display_profile(VmInstance *instance)
         if (!vm_agent_request(instance, command, response, sizeof(response), 5000)) {
             instance->active_display_profile = ASB_DISPLAY_PROFILE_UNKNOWN;
             instance->display_profile_pending = TRUE;
-            strncpy_s(instance->display_profile_reason,
-                      sizeof(instance->display_profile_reason),
-                      "guest-profile-set-failed", _TRUNCATE);
+            display_profile_set_state(instance, ASB_DISPLAY_PROFILE_STATE_UNAVAILABLE,
+                                      "guest-profile-set-failed");
             notify_agent_status(instance);
             return;
         }
     }
 
-    reboot_required = strstr(response, "reboot_required=1") != NULL;
+    if (!parse_display_profile_response(response, configured, sizeof(configured),
+                                        active, sizeof(active), &reboot_required) ||
+        strcmp(configured, wanted) != 0) {
+        instance->active_display_profile = ASB_DISPLAY_PROFILE_UNKNOWN;
+        instance->display_profile_pending = TRUE;
+        display_profile_set_state(instance, ASB_DISPLAY_PROFILE_STATE_UNAVAILABLE,
+                                  "guest-profile-protocol-invalid");
+        notify_agent_status(instance);
+        return;
+    }
+
     if (reboot_required) {
         instance->active_display_profile = ASB_DISPLAY_PROFILE_UNKNOWN;
         instance->display_profile_pending = TRUE;
-        strncpy_s(instance->display_profile_reason,
-                  sizeof(instance->display_profile_reason),
-                  "guest-restart-required", _TRUNCATE);
+        if (instance->display_profile_auto_reboot_allowed &&
+            !instance->display_profile_reboot_issued) {
+            instance->display_profile_reboot_issued = TRUE;
+            instance->display_profile_reboot_target = instance->display_profile;
+            instance->display_profile_reboot_generation = instance->display_profile_generation;
+            if (vm_agent_restart(instance)) {
+                display_profile_set_state(instance, ASB_DISPLAY_PROFILE_STATE_PENDING,
+                                          "guest-restart-issued");
+            } else {
+                instance->display_profile_auto_reboot_allowed = FALSE;
+                display_profile_set_state(instance, ASB_DISPLAY_PROFILE_STATE_UNAVAILABLE,
+                                          "guest-restart-failed");
+            }
+        } else {
+            display_profile_set_state(instance, ASB_DISPLAY_PROFILE_STATE_PENDING,
+                                      "guest-restart-required");
+        }
         notify_agent_status(instance);
     } else {
-        /* The guest helper reports the same profile on its next metadata
-           burst. Keep the UI pending until that authoritative reconnect
-           signal arrives rather than claiming the switch completed early. */
         instance->active_display_profile = ASB_DISPLAY_PROFILE_UNKNOWN;
         instance->display_profile_pending = TRUE;
-        strncpy_s(instance->display_profile_reason,
-                  sizeof(instance->display_profile_reason),
-                  "guest-profile-awaiting-report", _TRUNCATE);
+        display_profile_set_state(instance, ASB_DISPLAY_PROFILE_STATE_PENDING,
+                                  "guest-profile-awaiting-report");
         notify_agent_status(instance);
     }
+}
+
+void vm_agent_reconcile_display_profile(VmInstance *instance)
+{
+    if (!instance ||
+        InterlockedCompareExchange(&instance->display_profile_reconcile_inflight,
+                                    1, 0) != 0)
+        return;
+    reconcile_display_profile_impl(instance);
+    InterlockedExchange(&instance->display_profile_reconcile_inflight, 0);
 }
 
 static DWORD WINAPI display_profile_reconcile_proc(LPVOID param)

@@ -191,7 +191,8 @@ methods return `(http_status, body)` so you can branch on the status code.
 
 A **status object** has: `name, osType, state, running, agentOnline,
 installComplete, building, progress, sshState, sshPort, ramMb, hddGb, cpuCores,
-gpuMode, displayProfile, activeDisplayProfile, displayProfilePending,
+gpuMode, displayProfile, guestDisplayProfile, activeDisplayProfile,
+displayProfilePending, displayBackend, displayProfileState, rebootRequired,
 displayProfileReason, networkMode, displayOpen`. `displayProfile` is `0` for
 Standard and `1` for High Performance (Linux + GPU-PV only). High Performance
 stays pending until the guest applies its 4K60 profile; any required reboot is

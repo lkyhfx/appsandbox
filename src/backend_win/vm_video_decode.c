@@ -34,6 +34,288 @@ static const GUID *output_subtype(VmVideoDecodeProfile profile)
     return profile == VM_VIDEO_HEVC444 ? &MFVideoFormat_AYUV : &MFVideoFormat_NV12;
 }
 
+static BOOL probe_ayuv_video_processor(ID3D11Device *device, UINT width,
+                                       UINT height)
+{
+    ID3D11VideoDevice *video_device = NULL;
+    ID3D11VideoContext *video_context = NULL;
+    ID3D11VideoProcessorEnumerator *enumerator = NULL;
+    ID3D11VideoProcessor *processor = NULL;
+    ID3D11Texture2D *input_texture = NULL, *output_texture = NULL;
+    ID3D11VideoProcessorInputView *input_view = NULL;
+    ID3D11VideoProcessorOutputView *output_view = NULL;
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC content;
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC input_desc;
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC output_desc;
+    D3D11_TEXTURE2D_DESC texture_desc;
+    D3D11_VIDEO_PROCESSOR_STREAM stream;
+    HRESULT hr;
+    BOOL ok = FALSE;
+
+    if (!device) return FALSE;
+    hr = ID3D11Device_QueryInterface(device, &IID_ID3D11VideoDevice,
+                                     (void **)&video_device);
+    if (SUCCEEDED(hr))
+        hr = ID3D11Device_QueryInterface(device, &IID_ID3D11VideoContext,
+                                         (void **)&video_context);
+    if (FAILED(hr)) goto done;
+
+    ZeroMemory(&content, sizeof(content));
+    content.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+    content.InputWidth = width;
+    content.InputHeight = height;
+    content.OutputWidth = width;
+    content.OutputHeight = height;
+    content.InputFrameRate.Numerator = content.OutputFrameRate.Numerator = 60;
+    content.InputFrameRate.Denominator = content.OutputFrameRate.Denominator = 1;
+    content.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+    hr = ID3D11VideoDevice_CreateVideoProcessorEnumerator(video_device,
+                                                          &content, &enumerator);
+    if (SUCCEEDED(hr))
+        hr = ID3D11VideoDevice_CreateVideoProcessor(video_device, enumerator, 0,
+                                                    &processor);
+    if (FAILED(hr)) goto done;
+
+    ZeroMemory(&texture_desc, sizeof(texture_desc));
+    texture_desc.Width = width;
+    texture_desc.Height = height;
+    texture_desc.MipLevels = 1;
+    texture_desc.ArraySize = 1;
+    texture_desc.SampleDesc.Count = 1;
+    texture_desc.Usage = D3D11_USAGE_DEFAULT;
+    texture_desc.BindFlags = D3D11_BIND_DECODER;
+    texture_desc.Format = DXGI_FORMAT_AYUV;
+    hr = ID3D11Device_CreateTexture2D(device, &texture_desc, NULL,
+                                      &input_texture);
+    if (FAILED(hr)) goto done;
+    texture_desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+    texture_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    hr = ID3D11Device_CreateTexture2D(device, &texture_desc, NULL,
+                                      &output_texture);
+    if (FAILED(hr)) goto done;
+
+    ZeroMemory(&input_desc, sizeof(input_desc));
+    input_desc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+    hr = ID3D11VideoDevice_CreateVideoProcessorInputView(
+        video_device, (ID3D11Resource *)input_texture, enumerator,
+        &input_desc, &input_view);
+    if (FAILED(hr)) goto done;
+    ZeroMemory(&output_desc, sizeof(output_desc));
+    output_desc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+    hr = ID3D11VideoDevice_CreateVideoProcessorOutputView(
+        video_device, (ID3D11Resource *)output_texture, enumerator,
+        &output_desc, &output_view);
+    if (FAILED(hr)) goto done;
+
+    ZeroMemory(&stream, sizeof(stream));
+    stream.Enable = TRUE;
+    stream.pInputSurface = input_view;
+    hr = ID3D11VideoContext_VideoProcessorBlt(video_context, processor,
+                                              output_view, 0, 1, &stream);
+    ok = SUCCEEDED(hr);
+
+done:
+    if (output_view) ID3D11VideoProcessorOutputView_Release(output_view);
+    if (input_view) ID3D11VideoProcessorInputView_Release(input_view);
+    if (output_texture) ID3D11Texture2D_Release(output_texture);
+    if (input_texture) ID3D11Texture2D_Release(input_texture);
+    if (processor) ID3D11VideoProcessor_Release(processor);
+    if (enumerator) ID3D11VideoProcessorEnumerator_Release(enumerator);
+    if (video_context) ID3D11VideoContext_Release(video_context);
+    if (video_device) ID3D11VideoDevice_Release(video_device);
+    return ok;
+}
+
+static HRESULT make_probe_input_sample(const BYTE *data, UINT size,
+                                       IMFSample **sample)
+{
+    IMFSample *created = NULL;
+    IMFMediaBuffer *buffer = NULL;
+    BYTE *dst = NULL;
+    HRESULT hr;
+    if (!data || !size || !sample) return E_INVALIDARG;
+    *sample = NULL;
+    hr = MFCreateMemoryBuffer(size, &buffer);
+    if (SUCCEEDED(hr)) hr = IMFMediaBuffer_Lock(buffer, &dst, NULL, NULL);
+    if (SUCCEEDED(hr)) {
+        memcpy(dst, data, size);
+        IMFMediaBuffer_Unlock(buffer);
+        hr = IMFMediaBuffer_SetCurrentLength(buffer, size);
+    }
+    if (SUCCEEDED(hr)) hr = MFCreateSample(&created);
+    if (SUCCEEDED(hr)) hr = IMFSample_AddBuffer(created, buffer);
+    if (SUCCEEDED(hr)) hr = IMFSample_SetSampleTime(created, 0);
+    if (SUCCEEDED(hr)) hr = IMFSample_SetSampleDuration(created, 10000000LL / 60);
+    if (buffer) IMFMediaBuffer_Release(buffer);
+    if (FAILED(hr)) {
+        if (created) IMFSample_Release(created);
+        return hr;
+    }
+    *sample = created;
+    return S_OK;
+}
+
+static HRESULT make_probe_output_sample(ID3D11Device *device, UINT width,
+                                        UINT height, IMFSample **sample)
+{
+    D3D11_TEXTURE2D_DESC desc;
+    ID3D11Texture2D *texture = NULL;
+    IMFMediaBuffer *buffer = NULL;
+    IMFSample *created = NULL;
+    HRESULT hr;
+    if (!device || !sample) return E_INVALIDARG;
+    *sample = NULL;
+    ZeroMemory(&desc, sizeof(desc));
+    desc.Width = width; desc.Height = height;
+    desc.MipLevels = 1; desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_AYUV;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_DECODER;
+    hr = ID3D11Device_CreateTexture2D(device, &desc, NULL, &texture);
+    if (SUCCEEDED(hr)) hr = MFCreateDXGISurfaceBuffer(
+        &IID_ID3D11Texture2D, (IUnknown *)texture, 0, FALSE, &buffer);
+    if (SUCCEEDED(hr)) hr = MFCreateSample(&created);
+    if (SUCCEEDED(hr)) hr = IMFSample_AddBuffer(created, buffer);
+    if (buffer) IMFMediaBuffer_Release(buffer);
+    if (texture) ID3D11Texture2D_Release(texture);
+    if (FAILED(hr)) {
+        if (created) IMFSample_Release(created);
+        return hr;
+    }
+    *sample = created;
+    return S_OK;
+}
+
+static BOOL probe_one_decoder(ID3D11Device *device, IMFActivate *activate,
+                              UINT decoder_index, UINT width, UINT height,
+                              UINT fps_num, UINT fps_den,
+                              const BYTE *extradata, UINT extradata_size,
+                              const BYTE *access_unit, UINT access_unit_size,
+                              VmVideoDecodeProfile profile,
+                              VmVideoDecodeCapability *out)
+{
+    IMFTransform *transform = NULL;
+    IMFDXGIDeviceManager *manager = NULL;
+    IMFMediaType *input = NULL, *output_type = NULL, *candidate = NULL;
+    IMFSample *input_sample = NULL, *output_sample = NULL;
+    IMFMediaBuffer *buffer = NULL;
+    IMFDXGIBuffer *dxgi = NULL;
+    ID3D11Texture2D *texture = NULL;
+    MFT_OUTPUT_DATA_BUFFER output;
+    MFT_OUTPUT_STREAM_INFO stream_info;
+    UINT token = 0, subresource = 0, i;
+    DWORD status = 0;
+    GUID subtype;
+    HRESULT hr;
+    BOOL ok = FALSE;
+
+    hr = IMFActivate_ActivateObject(activate, &IID_IMFTransform,
+                                    (void **)&transform);
+    if (FAILED(hr)) goto done;
+    hr = MFCreateDXGIDeviceManager(&token, &manager);
+    if (SUCCEEDED(hr)) hr = IMFDXGIDeviceManager_ResetDevice(
+        manager, (IUnknown *)device, token);
+    if (SUCCEEDED(hr)) hr = IMFTransform_ProcessMessage(
+        transform, MFT_MESSAGE_SET_D3D_MANAGER, (ULONG_PTR)manager);
+    if (SUCCEEDED(hr)) hr = MFCreateMediaType(&input);
+    if (SUCCEEDED(hr)) hr = IMFMediaType_SetGUID(input, &MF_MT_MAJOR_TYPE,
+                                                   &MFMediaType_Video);
+    if (SUCCEEDED(hr)) hr = IMFMediaType_SetGUID(input, &MF_MT_SUBTYPE,
+                                                   &MFVideoFormat_HEVC);
+    if (SUCCEEDED(hr)) hr = IMFMediaType_SetUINT64(input, &MF_MT_FRAME_SIZE,
+                                                   ((UINT64)width << 32) | height);
+    if (SUCCEEDED(hr)) hr = IMFMediaType_SetUINT64(input, &MF_MT_FRAME_RATE,
+                                                   ((UINT64)fps_num << 32) | fps_den);
+    if (SUCCEEDED(hr) && extradata_size) hr = IMFMediaType_SetBlob(
+        input, &MF_MT_MPEG_SEQUENCE_HEADER, extradata, extradata_size);
+    if (SUCCEEDED(hr)) hr = IMFTransform_SetInputType(transform, 0, input, 0);
+    if (FAILED(hr)) goto done;
+
+    for (i = 0;; i++) {
+        hr = IMFTransform_GetOutputAvailableType(transform, 0, i, &candidate);
+        if (hr == MF_E_NO_MORE_TYPES) break;
+        if (FAILED(hr)) goto done;
+        if (SUCCEEDED(IMFMediaType_GetGUID(candidate, &MF_MT_SUBTYPE, &subtype)) &&
+            IsEqualGUID(&subtype, output_subtype(profile))) {
+            output_type = candidate;
+            candidate = NULL;
+            break;
+        }
+        IMFMediaType_Release(candidate);
+        candidate = NULL;
+    }
+    if (!output_type || FAILED(IMFTransform_SetOutputType(transform, 0,
+                                                           output_type, 0)))
+        goto done;
+    if (FAILED(IMFTransform_ProcessMessage(transform,
+                                           MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0)) ||
+        FAILED(IMFTransform_ProcessMessage(transform,
+                                           MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0)) ||
+        FAILED(make_probe_input_sample(access_unit, access_unit_size,
+                                       &input_sample)) ||
+        FAILED(IMFTransform_ProcessInput(transform, 0, input_sample, 0)))
+        goto done;
+    ZeroMemory(&stream_info, sizeof(stream_info));
+    if (FAILED(IMFTransform_GetOutputStreamInfo(transform, 0, &stream_info)))
+        goto done;
+
+    for (i = 0; i < 32; i++) {
+        ZeroMemory(&output, sizeof(output));
+        output.dwStreamID = 0;
+        if (!(stream_info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) &&
+            FAILED(make_probe_output_sample(device, width, height,
+                                             &output.pSample)))
+            goto done;
+        hr = IMFTransform_ProcessOutput(transform, 0, 1, &output, &status);
+        output_sample = output.pSample;
+        if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) {
+            if (output_sample) { IMFSample_Release(output_sample); output_sample = NULL; }
+            if (output.pEvents) { IMFCollection_Release(output.pEvents); output.pEvents = NULL; }
+            IMFTransform_ProcessMessage(transform, MFT_MESSAGE_COMMAND_DRAIN, 0);
+            continue;
+        }
+        if (output.pEvents) { IMFCollection_Release(output.pEvents); output.pEvents = NULL; }
+        if (FAILED(hr) || !output_sample) goto done;
+        hr = IMFSample_GetBufferByIndex(output_sample, 0, &buffer);
+        if (SUCCEEDED(hr)) hr = IMFMediaBuffer_QueryInterface(buffer,
+            &IID_IMFDXGIBuffer, (void **)&dxgi);
+        if (SUCCEEDED(hr)) hr = IMFDXGIBuffer_GetResource(dxgi,
+            &IID_ID3D11Texture2D, (void **)&texture);
+        if (SUCCEEDED(hr)) hr = IMFDXGIBuffer_GetSubresourceIndex(dxgi,
+                                                                    &subresource);
+        if (SUCCEEDED(hr)) {
+            D3D11_TEXTURE2D_DESC desc;
+            ID3D11Texture2D_GetDesc(texture, &desc);
+            out->actual_decode = TRUE;
+            out->gpu_surface = TRUE;
+            out->decoded_format = desc.Format;
+            if (desc.Format == (profile == VM_VIDEO_HEVC444
+                                ? DXGI_FORMAT_AYUV : DXGI_FORMAT_NV12)) {
+                out->ayuv_video_processor = profile == VM_VIDEO_HEVC444
+                    ? probe_ayuv_video_processor(device, width, height) : TRUE;
+                out->available = out->ayuv_video_processor;
+                out->decoder_index = decoder_index;
+                ok = out->available;
+            }
+        }
+        break;
+    }
+
+done:
+    if (texture) ID3D11Texture2D_Release(texture);
+    if (dxgi) IMFDXGIBuffer_Release(dxgi);
+    if (buffer) IMFMediaBuffer_Release(buffer);
+    if (output_sample) IMFSample_Release(output_sample);
+    if (input_sample) IMFSample_Release(input_sample);
+    if (candidate) IMFMediaType_Release(candidate);
+    if (output_type) IMFMediaType_Release(output_type);
+    if (input) IMFMediaType_Release(input);
+    if (transform) IMFTransform_Release(transform);
+    if (manager) IMFDXGIDeviceManager_Release(manager);
+    return ok;
+}
+
 static HRESULT activate_hevc_decoder(VmVideoDecodeProfile profile,
                                      IMFTransform **result)
 {
@@ -68,9 +350,146 @@ static HRESULT activate_hevc_decoder(VmVideoDecodeProfile profile,
     return hr;
 }
 
+/* Configure every candidate far enough to prove that it accepts this stream
+   and exposes the requested output type. The actual ProcessInput/Output gate
+   remains vm_video_decode_probe_profile; this helper prevents production
+   decoder creation from stopping at the first merely activatable MFT. */
+static HRESULT activate_configured_decoder(ID3D11Device *device,
+                                           IMFDXGIDeviceManager *manager,
+                                           UINT width, UINT height,
+                                           UINT fps_num, UINT fps_den,
+                                           const BYTE *extradata,
+                                           UINT extradata_size,
+                                           VmVideoDecodeProfile profile,
+                                           IMFTransform **result)
+{
+    MFT_REGISTER_TYPE_INFO mft_input = { MFMediaType_Video, MFVideoFormat_HEVC };
+    MFT_REGISTER_TYPE_INFO mft_output = { MFMediaType_Video, MFVideoFormat_NV12 };
+    IMFActivate **activates = NULL;
+    UINT32 count = 0, i;
+    HRESULT hr;
+    if (!device || !manager || !result) return E_INVALIDARG;
+    *result = NULL;
+    mft_output.guidSubtype = *output_subtype(profile);
+    hr = MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER,
+                   MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+                   &mft_input, &mft_output, &activates, &count);
+    if (FAILED(hr) || count == 0) {
+        if (activates) CoTaskMemFree(activates);
+        return FAILED(hr) ? hr : MF_E_TOPO_CODEC_NOT_FOUND;
+    }
+    hr = MF_E_TOPO_CODEC_NOT_FOUND;
+    for (i = 0; i < count; i++) {
+        IMFTransform *candidate = NULL;
+        IMFMediaType *input = NULL, *output = NULL, *available = NULL;
+        GUID subtype;
+        UINT type_index;
+        HRESULT candidate_hr = IMFActivate_ActivateObject(
+            activates[i], &IID_IMFTransform, (void **)&candidate);
+        if (FAILED(candidate_hr)) continue;
+        candidate_hr = IMFTransform_ProcessMessage(candidate,
+            MFT_MESSAGE_SET_D3D_MANAGER, (ULONG_PTR)manager);
+        if (SUCCEEDED(candidate_hr)) candidate_hr = MFCreateMediaType(&input);
+        if (SUCCEEDED(candidate_hr)) candidate_hr = IMFMediaType_SetGUID(
+            input, &MF_MT_MAJOR_TYPE, &MFMediaType_Video);
+        if (SUCCEEDED(candidate_hr)) candidate_hr = IMFMediaType_SetGUID(
+            input, &MF_MT_SUBTYPE, &MFVideoFormat_HEVC);
+        if (SUCCEEDED(candidate_hr)) candidate_hr = IMFMediaType_SetUINT64(
+            input, &MF_MT_FRAME_SIZE, ((UINT64)width << 32) | height);
+        if (SUCCEEDED(candidate_hr)) candidate_hr = IMFMediaType_SetUINT64(
+            input, &MF_MT_FRAME_RATE, ((UINT64)fps_num << 32) | fps_den);
+        if (SUCCEEDED(candidate_hr) && extradata_size) candidate_hr =
+            IMFMediaType_SetBlob(input, &MF_MT_MPEG_SEQUENCE_HEADER,
+                                 extradata, extradata_size);
+        if (SUCCEEDED(candidate_hr)) candidate_hr = IMFTransform_SetInputType(
+            candidate, 0, input, 0);
+        for (type_index = 0; SUCCEEDED(candidate_hr); type_index++) {
+            candidate_hr = IMFTransform_GetOutputAvailableType(candidate, 0,
+                                                               type_index,
+                                                               &available);
+            if (candidate_hr == MF_E_NO_MORE_TYPES) {
+                candidate_hr = MF_E_INVALIDMEDIATYPE;
+                break;
+            }
+            if (FAILED(candidate_hr)) break;
+            if (SUCCEEDED(IMFMediaType_GetGUID(available, &MF_MT_SUBTYPE,
+                                               &subtype)) &&
+                IsEqualGUID(&subtype, output_subtype(profile))) {
+                output = available;
+                available = NULL;
+                candidate_hr = IMFTransform_SetOutputType(candidate, 0,
+                                                          output, 0);
+                break;
+            }
+            IMFMediaType_Release(available);
+            available = NULL;
+        }
+        if (available) IMFMediaType_Release(available);
+        if (input) IMFMediaType_Release(input);
+        if (output) IMFMediaType_Release(output);
+        if (SUCCEEDED(candidate_hr)) {
+            *result = candidate;
+            hr = S_OK;
+            break;
+        }
+        IMFTransform_Release(candidate);
+    }
+    for (i = 0; i < count; i++) IMFActivate_Release(activates[i]);
+    CoTaskMemFree(activates);
+    return hr;
+}
+
 BOOL vm_video_decode_supported(ID3D11Device *device)
 {
     return vm_video_decode_supported_profile(device, VM_VIDEO_HEVC420);
+}
+
+BOOL vm_video_decode_probe_profile(ID3D11Device *device,
+                                   UINT width, UINT height,
+                                   UINT fps_num, UINT fps_den,
+                                   const BYTE *extradata, UINT extradata_size,
+                                   const BYTE *access_unit, UINT access_unit_size,
+                                   VmVideoDecodeProfile profile,
+                                   VmVideoDecodeCapability *out)
+{
+    MFT_REGISTER_TYPE_INFO input = { MFMediaType_Video, MFVideoFormat_HEVC };
+    IMFActivate **activates = NULL;
+    UINT count = 0, i;
+    HRESULT hr;
+    BOOL found = FALSE;
+
+    if (!out) return FALSE;
+    ZeroMemory(out, sizeof(*out));
+    out->decoded_format = DXGI_FORMAT_UNKNOWN;
+    if (!device || !width || !height || !fps_num || !fps_den ||
+        !access_unit || !access_unit_size)
+        return FALSE;
+
+    hr = MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET);
+    if (FAILED(hr)) return FALSE;
+    hr = MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER,
+                   MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+                   &input, NULL, &activates, &count);
+    if (SUCCEEDED(hr)) {
+        for (i = 0; i < count; i++) {
+            VmVideoDecodeCapability candidate;
+            ZeroMemory(&candidate, sizeof(candidate));
+            candidate.decoded_format = DXGI_FORMAT_UNKNOWN;
+            if (probe_one_decoder(device, activates[i], i, width, height,
+                                  fps_num, fps_den, extradata, extradata_size,
+                                  access_unit, access_unit_size, profile,
+                                  &candidate) && candidate.available && !found) {
+                *out = candidate;
+                found = TRUE;
+            }
+        }
+    }
+    if (activates) {
+        for (i = 0; i < count; i++) IMFActivate_Release(activates[i]);
+        CoTaskMemFree(activates);
+    }
+    MFShutdown();
+    return found;
 }
 
 BOOL vm_video_decode_supported_profile(ID3D11Device *device,
@@ -81,6 +500,11 @@ BOOL vm_video_decode_supported_profile(ID3D11Device *device,
     UINT token = 0;
     HRESULT hr;
     if (!device) return FALSE;
+    /* HostHello is sent before the guest ASVC supplies a real access unit.
+       Do not turn registration/activation into a false HEVC444 capability. A
+       caller with a real production access unit must use the selector above. */
+    if (profile == VM_VIDEO_HEVC444)
+        return FALSE;
     hr = MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET);
     if (FAILED(hr)) return FALSE;
     hr = MFCreateDXGIDeviceManager(&token, &manager);
@@ -103,9 +527,6 @@ VmVideoDecoder *vm_video_decoder_create(ID3D11Device *device,
                                         VmVideoDecodeProfile profile)
 {
     VmVideoDecoder *d = NULL;
-    IMFMediaType *input = NULL, *output = NULL, *candidate = NULL;
-    DWORD i;
-    GUID subtype;
     HRESULT hr = MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET);
     if (FAILED(hr)) return NULL;
     d = (VmVideoDecoder *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*d));
@@ -118,36 +539,9 @@ VmVideoDecoder *vm_video_decoder_create(ID3D11Device *device,
     hr = MFCreateDXGIDeviceManager(&d->reset_token, &d->manager);
     if (SUCCEEDED(hr))
         hr = IMFDXGIDeviceManager_ResetDevice(d->manager, (IUnknown *)device, d->reset_token);
-    if (SUCCEEDED(hr)) hr = activate_hevc_decoder(profile, &d->transform);
-    if (SUCCEEDED(hr))
-        hr = IMFTransform_ProcessMessage(d->transform, MFT_MESSAGE_SET_D3D_MANAGER,
-                                         (ULONG_PTR)d->manager);
-    if (SUCCEEDED(hr)) hr = MFCreateMediaType(&input);
-    if (SUCCEEDED(hr)) hr = IMFMediaType_SetGUID(input, &MF_MT_MAJOR_TYPE, &MFMediaType_Video);
-    if (SUCCEEDED(hr)) hr = IMFMediaType_SetGUID(input, &MF_MT_SUBTYPE, &MFVideoFormat_HEVC);
-    if (SUCCEEDED(hr)) hr = IMFMediaType_SetUINT64(input, &MF_MT_FRAME_SIZE,
-                                                   ((UINT64)width << 32) | height);
-    if (SUCCEEDED(hr)) hr = IMFMediaType_SetUINT64(input, &MF_MT_FRAME_RATE,
-                                                   ((UINT64)fps_num << 32) | fps_den);
-    if (SUCCEEDED(hr) && extradata_size)
-        hr = IMFMediaType_SetBlob(input, &MF_MT_MPEG_SEQUENCE_HEADER,
-                                  extradata, extradata_size);
-    if (SUCCEEDED(hr)) hr = IMFTransform_SetInputType(d->transform, 0, input, 0);
-
-    for (i = 0; SUCCEEDED(hr); i++) {
-        hr = IMFTransform_GetOutputAvailableType(d->transform, 0, i, &candidate);
-        if (FAILED(hr)) break;
-        if (SUCCEEDED(IMFMediaType_GetGUID(candidate, &MF_MT_SUBTYPE, &subtype)) &&
-            IsEqualGUID(&subtype, output_subtype(profile))) {
-            output = candidate; candidate = NULL;
-            hr = S_OK;
-            break;
-        }
-        IMFMediaType_Release(candidate); candidate = NULL;
-    }
-    if (SUCCEEDED(hr) && output)
-        hr = IMFTransform_SetOutputType(d->transform, 0, output, 0);
-    else if (SUCCEEDED(hr)) hr = MF_E_INVALIDMEDIATYPE;
+    if (SUCCEEDED(hr)) hr = activate_configured_decoder(
+        device, d->manager, width, height, fps_num, fps_den,
+        extradata, extradata_size, profile, &d->transform);
     if (SUCCEEDED(hr)) hr = IMFTransform_ProcessMessage(d->transform,
                                       MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
     if (SUCCEEDED(hr)) hr = IMFTransform_ProcessMessage(d->transform,
@@ -162,9 +556,6 @@ VmVideoDecoder *vm_video_decoder_create(ID3D11Device *device,
                                  MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES)) != 0;
     }
 
-    if (candidate) IMFMediaType_Release(candidate);
-    if (output) IMFMediaType_Release(output);
-    if (input) IMFMediaType_Release(input);
     if (FAILED(hr)) { vm_video_decoder_destroy(d); return NULL; }
     return d;
 }
@@ -242,6 +633,16 @@ HRESULT vm_video_decoder_decode(VmVideoDecoder *d,
                                       &IID_IMFDXGIBuffer, (void **)&dxgi_buffer);
     if (SUCCEEDED(hr)) hr = IMFDXGIBuffer_GetResource(dxgi_buffer,
                                       &IID_ID3D11Texture2D, (void **)texture);
+    if (SUCCEEDED(hr) && *texture) {
+        D3D11_TEXTURE2D_DESC decoded_desc;
+        ID3D11Texture2D_GetDesc(*texture, &decoded_desc);
+        if (decoded_desc.Format != (d->profile == VM_VIDEO_HEVC444
+                                    ? DXGI_FORMAT_AYUV : DXGI_FORMAT_NV12)) {
+            ID3D11Texture2D_Release(*texture);
+            *texture = NULL;
+            hr = MF_E_INVALIDMEDIATYPE;
+        }
+    }
     if (SUCCEEDED(hr)) hr = IMFDXGIBuffer_GetSubresourceIndex(dxgi_buffer, subresource);
     if (dxgi_buffer) IMFDXGIBuffer_Release(dxgi_buffer);
     if (buffer) IMFMediaBuffer_Release(buffer);

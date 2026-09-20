@@ -11,6 +11,7 @@
 #define ASB_CORE_H
 
 #include <windows.h>
+#include "../core/asb_types.h"
 
 #ifdef ASB_BUILDING_DLL
 #define ASB_API __declspec(dllexport)
@@ -42,10 +43,6 @@ typedef struct AsbDisplay AsbDisplay;
 #define ASB_NET_NAT      1
 #define ASB_NET_EXTERNAL 2
 #define ASB_NET_INTERNAL 3
-
-#define ASB_DISPLAY_PROFILE_STANDARD         0
-#define ASB_DISPLAY_PROFILE_HIGH_PERFORMANCE 1
-#define ASB_DISPLAY_PROFILE_UNKNOWN         (-1)
 
 /* ---- VM configuration (for creating a new VM) ---- */
 
@@ -194,8 +191,12 @@ ASB_API DWORD   asb_vm_cpu_cores(AsbVm vm);
 ASB_API int     asb_vm_gpu_mode(AsbVm vm);
 ASB_API int     asb_vm_network_mode(AsbVm vm);
 ASB_API int     asb_vm_display_profile(AsbVm vm);
+ASB_API int     asb_vm_guest_display_profile(AsbVm vm);
 ASB_API int     asb_vm_active_display_profile(AsbVm vm);
 ASB_API BOOL    asb_vm_display_profile_pending(AsbVm vm);
+ASB_API int     asb_vm_display_backend(AsbVm vm);
+ASB_API int     asb_vm_display_profile_state(AsbVm vm);
+ASB_API const char *asb_vm_display_profile_reason(AsbVm vm);
 ASB_API BOOL    asb_vm_ssh_enabled(AsbVm vm);
 ASB_API DWORD   asb_vm_ssh_port(AsbVm vm);
 

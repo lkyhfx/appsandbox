@@ -11,6 +11,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
+#include <limits.h>
+#include <errno.h>
 
 #pragma comment(lib, "shlwapi.lib")
 
@@ -627,11 +630,32 @@ BOOL json_get_string(const wchar_t *json, const wchar_t *key,
 BOOL json_get_int(const wchar_t *json, const wchar_t *key, int *out)
 {
     const wchar_t *p = json_find_value(json, key);
+    wchar_t *end;
+    long value;
+    BOOL quoted = FALSE;
     if (!p || !out) return FALSE;
 
-    /* Handle quoted numbers from JS */
-    if (*p == L'"') p++;
-    *out = _wtoi(p);
+    /* Accept JSON integers and the quoted integer strings emitted by the UI,
+       but do not silently coerce malformed values to zero. */
+    if (*p == L'"') {
+        quoted = TRUE;
+        p++;
+    }
+    if (*p == L'+' || (!quoted && *p == L'0' && p[1] >= L'0' && p[1] <= L'9'))
+        return FALSE;
+    errno = 0;
+    value = wcstol(p, &end, 10);
+    if (end == p || errno == ERANGE || value < INT_MIN || value > INT_MAX)
+        return FALSE;
+    if (quoted) {
+        if (*end != L'"') return FALSE;
+        end++;
+    }
+    while (*end == L' ' || *end == L'\t' || *end == L'\n' || *end == L'\r')
+        end++;
+    if (*end != L'\0' && *end != L',' && *end != L'}' && *end != L']')
+        return FALSE;
+    *out = (int)value;
     return TRUE;
 }
 

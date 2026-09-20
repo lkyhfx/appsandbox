@@ -826,12 +826,15 @@ static int read_display_profile(char *out, size_t cap)
 
 static int read_active_display_profile(char *out, size_t cap)
 {
-    FILE *width_file, *height_file;
-    unsigned width = 0, height = 0;
+    FILE *width_file, *height_file, *refresh_file, *env_file;
+    unsigned width = 0, height = 0, refresh = 0;
+    char codec[32] = "";
+    char env_name[64], env_value[32];
     if (!out || cap < 32) return -1;
-    snprintf(out, cap, "standard");
+    snprintf(out, cap, "unknown");
     width_file = fopen("/sys/module/asb_drm/parameters/width", "r");
     height_file = fopen("/sys/module/asb_drm/parameters/height", "r");
+    refresh_file = fopen("/sys/module/asb_drm/parameters/refresh", "r");
     if (width_file) {
         (void)fscanf(width_file, "%u", &width);
         fclose(width_file);
@@ -840,8 +843,24 @@ static int read_active_display_profile(char *out, size_t cap)
         (void)fscanf(height_file, "%u", &height);
         fclose(height_file);
     }
-    if (width >= 3840 && height >= 2160)
+    if (refresh_file) {
+        (void)fscanf(refresh_file, "%u", &refresh);
+        fclose(refresh_file);
+    }
+    env_file = fopen(DISPLAY_ENV_PATH, "r");
+    if (env_file) {
+        while (fscanf(env_file, "%63[^=]=%31s", env_name, env_value) == 2) {
+            if (!strcmp(env_name, "APPSANDBOX_DISPLAY_CODEC_MODE"))
+                snprintf(codec, sizeof(codec), "%s", env_value);
+        }
+        fclose(env_file);
+    }
+    if (width == 3840 && height == 2160 && refresh == 60 &&
+        !strcmp(codec, "hevc444"))
         snprintf(out, cap, "high_performance");
+    else if (width == 1920 && height == 1080 && refresh == 60 &&
+             !strcmp(codec, "hevc420"))
+        snprintf(out, cap, "standard");
     return 0;
 }
 
@@ -880,8 +899,9 @@ static void handle_display_profile(int fd, const char *tag, const char *cmd)
         char response[96];
         read_display_profile(current, sizeof(current));
         read_active_display_profile(active, sizeof(active));
-        snprintf(response, sizeof(response), "profile=%s;reboot_required=%d",
-                 active, strcmp(current, active) != 0 ? 1 : 0);
+        snprintf(response, sizeof(response),
+                 "configured_profile=%s;active_profile=%s;reboot_required=%d",
+                 current, active, strcmp(current, active) != 0 ? 1 : 0);
         send_reply(fd, tag, response);
         return;
     }
@@ -899,18 +919,24 @@ static void handle_display_profile(int fd, const char *tag, const char *cmd)
     read_display_profile(current, sizeof(current));
     read_active_display_profile(active, sizeof(active));
     if (!strcmp(current, profile) && !strcmp(active, profile)) {
-        send_reply(fd, tag, !strcmp(profile, "high_performance")
-            ? "profile=high_performance;reboot_required=0"
-            : "profile=standard;reboot_required=0");
+        char response[128];
+        snprintf(response, sizeof(response),
+                 "configured_profile=%s;active_profile=%s;reboot_required=0",
+                 current, active);
+        send_reply(fd, tag, response);
         return;
     }
     if (write_display_profile(profile) < 0) {
         send_reply(fd, tag, "error:display_profile_write_failed");
         return;
     }
-    send_reply(fd, tag, !strcmp(profile, "high_performance")
-        ? "profile=high_performance;reboot_required=1"
-        : "profile=standard;reboot_required=1");
+    {
+        char response[128];
+        snprintf(response, sizeof(response),
+                 "configured_profile=%s;active_profile=%s;reboot_required=1",
+                 profile, active);
+        send_reply(fd, tag, response);
+    }
 }
 
 static void handle_guest_update(int fd, const char *tag, const char *cmd)
