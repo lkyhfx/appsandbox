@@ -18,6 +18,7 @@
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/platform_device.h>
+#include <linux/string.h>
 #include <linux/version.h>
 
 #include <drm/drm_atomic_helper.h>
@@ -40,6 +41,7 @@
 static unsigned int width_param   = ASB_DEFAULT_WIDTH;
 static unsigned int height_param  = ASB_DEFAULT_HEIGHT;
 static unsigned int refresh_param = ASB_DEFAULT_REFRESH;
+static char profile_param[8]      = "1080p";
 
 module_param_named(width,   width_param,   uint, 0444);
 MODULE_PARM_DESC(width,   "Initial display width  (default 1920)");
@@ -47,6 +49,8 @@ module_param_named(height,  height_param,  uint, 0444);
 MODULE_PARM_DESC(height,  "Initial display height (default 1080)");
 module_param_named(refresh, refresh_param, uint, 0444);
 MODULE_PARM_DESC(refresh, "Refresh rate in Hz     (default 60)");
+module_param_string(profile, profile_param, sizeof(profile_param), 0444);
+MODULE_PARM_DESC(profile, "Display profile: 1080p (default) or 4k (3840x2160@60)");
 
 /* --------------------------------------------------------------------------
  * drm_driver
@@ -147,10 +151,18 @@ static int asb_probe(struct platform_device *pdev)
 	drm = &asb->drm;
 	platform_set_drvdata(pdev, drm);
 
-	/* Clamp module params into the supported range. */
-	asb->width   = clamp(width_param,   64u, (unsigned)ASB_MAX_WIDTH);
-	asb->height  = clamp(height_param,  64u, (unsigned)ASB_MAX_HEIGHT);
-	asb->refresh = clamp(refresh_param, 24u, 240u);
+	/* Clamp module params into the supported range. The named profile is the
+	 * explicit per-VM switch for 4K; the existing width/height/refresh params
+	 * remain available for custom modes and retain the 1080p default. */
+	if (!strcmp(profile_param, "4k")) {
+		asb->width = ASB_4K_WIDTH;
+		asb->height = ASB_4K_HEIGHT;
+		asb->refresh = ASB_4K_REFRESH;
+	} else {
+		asb->width   = clamp(width_param,   64u, (unsigned)ASB_MAX_WIDTH);
+		asb->height  = clamp(height_param,  64u, (unsigned)ASB_MAX_HEIGHT);
+		asb->refresh = clamp(refresh_param, 24u, 240u);
+	}
 
 	ret = asb_mode_config_setup(asb);
 	if (ret) {

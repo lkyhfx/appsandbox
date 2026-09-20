@@ -33,6 +33,14 @@
 #define ASB_DEFAULT_WIDTH     1920
 #define ASB_DEFAULT_HEIGHT    1080
 #define ASB_DEFAULT_REFRESH   60
+#define ASB_4K_WIDTH          3840
+#define ASB_4K_HEIGHT         2160
+#define ASB_4K_REFRESH        60
+
+/* Damage clips are intentionally not advertised yet. The driver has no
+ * user-visible damage sequence and the current Mutter path does not give the
+ * capture daemon a reliable FB_DAMAGE_CLIPS snapshot to consume. */
+#define ASB_DRM_DAMAGE_AVAILABLE 0
 
 #define ASB_MAX_WIDTH         7680
 #define ASB_MAX_HEIGHT        4320

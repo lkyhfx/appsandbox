@@ -229,6 +229,9 @@ struct VmDisplayIdd {
     ULONGLONG      host_gpu_upload_bytes;
     ULONGLONG      host_stats_start_ms;
     ULONGLONG      host_stats_last_log_ms;
+    ULONGLONG      lost_dirty_updates;
+    ULONGLONG      last_frame_seq;
+    BOOL           have_frame_seq;
 
     UINT           render_count;     /* number of renders (for one-shot logging) */
     volatile UINT  recv_count;       /* number of frames received over HvSocket */
@@ -1583,6 +1586,9 @@ static BOOL checked_raw_frame_layout(UINT width, UINT height, UINT stride,
 
 static void pending_mark_full_locked(VmDisplayIdd *d)
 {
+    /* Full upload dominates every queued partial. Clearing the accumulator is
+     * intentional: the CPU backing buffer already contains all prior dirty
+     * regions, so replaying them after the full upload cannot add coverage. */
     d->pending_full_upload = TRUE;
     d->pending_dirty_count = 0;
     d->frame_dirty = TRUE;
@@ -1660,12 +1666,13 @@ static void maybe_log_host_stats(VmDisplayIdd *d)
     idd_log(d, L"display_stats scope=host resolution=%ux%u logical_refresh_hz=60 "
             L"host_full_uploads=%llu host_partial_uploads=%llu "
             L"host_gpu_upload_bytes=%llu host_gpu_upload_mib_per_sec=%.3f "
-            L"recv_fps=%.2f present_fps=%.2f lost_dirty_updates=0",
+            L"recv_fps=%.2f present_fps=%.2f lost_dirty_updates=%llu",
             d->frame_width, d->frame_height,
             d->host_full_uploads, d->host_partial_uploads,
             d->host_gpu_upload_bytes, mib_per_sec,
             elapsed ? (double)d->recv_count * 1000.0 / elapsed : 0.0,
-            elapsed ? (double)d->render_count * 1000.0 / elapsed : 0.0);
+            elapsed ? (double)d->render_count * 1000.0 / elapsed : 0.0,
+            d->lost_dirty_updates);
 }
 
 static BOOL d3d_init(VmDisplayIdd *d)
@@ -2273,6 +2280,11 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
 
         idd_log(d, L"Frame channel connected.");
         d->cursor_visible = TRUE;
+        /* frame_seq is scoped to one Guest connection. A real sequence gap
+         * is the only host-side evidence we can provide for a dropped dirty
+         * update; never report a hard-coded zero. */
+        d->have_frame_seq = FALSE;
+        d->last_frame_seq = 0;
         PostMessageW(d->hwnd, WM_IDD_CURSOR_CHANGED, 0, 0);
 
         /* Receive loop — reads magic first to dispatch frame vs cursor */
@@ -2356,6 +2368,21 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                        hdr.width, hdr.height, hdr.stride);
                 break;
             }
+
+            if (!d->have_frame_seq) {
+                d->have_frame_seq = TRUE;
+            } else {
+                ULONGLONG expected = d->last_frame_seq + 1;
+                if (hdr.frame_seq != expected) {
+                    ULONGLONG missing = (hdr.frame_seq > expected)
+                        ? hdr.frame_seq - expected : 1;
+                    d->lost_dirty_updates += missing;
+                    idd_log(d, L"Frame sequence gap: expected=%llu got=%llu "
+                            L"(lost_dirty_updates=%llu)",
+                            expected, hdr.frame_seq, d->lost_dirty_updates);
+                }
+            }
+            d->last_frame_seq = hdr.frame_seq;
 
             rect_count = hdr.dirty_rect_count;
             if (rect_count > MAX_DIRTY_RECTS) {

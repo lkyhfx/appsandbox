@@ -38,6 +38,7 @@
 #include <drm_fourcc.h>
 
 #include "../../../src/core/display_protocol.h"
+#include "../../../src/core/display_snapshot.h"
 
 #define VSOCK_PORT      2
 #define FRAME_MAGIC     ASB_DISPLAY_RAW_MAGIC
@@ -49,6 +50,7 @@
 
 #define CURSOR_TYPE_MASKED_COLOR  1
 #define CURSOR_TYPE_ALPHA         2
+#define STATS_US_BUCKETS          5001u /* last bucket means >= 5000 us */
 
 #pragma pack(push, 1)
 typedef AsbDisplayFrameHeader frame_header;
@@ -131,9 +133,9 @@ struct capture_ctx {
     size_t   mem_size;
     int      dma_fd;
 
-    /* The current DRM userspace interface exposes the active framebuffer but
-     * not reliable compositor damage clips. Keep a compact shadow and use a
-     * 64x64 tile fallback until a trustworthy damage source is available. */
+    /* DRM_DAMAGE_AVAILABLE=0: asb_drm does not expose FB_DAMAGE_CLIPS or
+     * atomic damage metadata to this daemon. Keep a compact shadow and use
+     * the explicit 64x64 tile-compare fallback. */
     uint8_t  *shadow;
     size_t    shadow_size;
     uint32_t  shadow_stride;
@@ -143,6 +145,9 @@ struct capture_ctx {
     size_t    dirty_tiles_cap;
     AsbDisplayRect *work_rects;
     size_t    work_rects_cap;
+    uint8_t  *snapshot;
+    size_t    snapshot_size;
+    size_t    snapshot_cap;
     int       force_full;
 
     struct {
@@ -155,6 +160,11 @@ struct capture_ctx {
         uint64_t dirty_area_sum;
         uint64_t wire_bytes_total;
         uint64_t ratio_buckets[101];
+        uint64_t dirty_scan_us_total;
+        uint64_t snapshot_pack_us_total;
+        uint64_t dirty_scan_us_buckets[STATS_US_BUCKETS];
+        uint64_t snapshot_pack_us_buckets[STATS_US_BUCKETS];
+        uint64_t snapshot_pack_samples;
         uint64_t start_ns;
         uint64_t last_log_ns;
     } stats;
@@ -165,6 +175,29 @@ static uint64_t monotonic_ns(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static void stats_record_us(uint64_t *total, uint64_t *buckets,
+                            uint64_t elapsed_ns)
+{
+    uint64_t us = (elapsed_ns + 999) / 1000;
+    uint64_t bucket = us < STATS_US_BUCKETS ? us : STATS_US_BUCKETS - 1;
+    *total += us;
+    buckets[bucket]++;
+}
+
+static uint64_t stats_p95_us(const uint64_t *buckets, uint64_t samples)
+{
+    uint64_t target = (samples * 95 + 99) / 100;
+    uint64_t seen = 0;
+    uint64_t i;
+
+    if (!samples) return 0;
+    for (i = 0; i < STATS_US_BUCKETS; i++) {
+        seen += buckets[i];
+        if (seen >= target) return i;
+    }
+    return STATS_US_BUCKETS - 1;
 }
 
 static int checked_frame_size(uint32_t stride, uint32_t height, size_t *out)
@@ -212,10 +245,35 @@ static void free_capture_buffers(struct capture_ctx *c)
     free(c->shadow);
     free(c->dirty_tiles);
     free(c->work_rects);
+    free(c->snapshot);
     c->shadow = NULL;
     c->dirty_tiles = NULL;
     c->work_rects = NULL;
+    c->snapshot = NULL;
     c->shadow_size = c->dirty_tiles_cap = c->work_rects_cap = 0;
+    c->snapshot_size = c->snapshot_cap = 0;
+}
+
+static int ensure_snapshot_buffer(struct capture_ctx *c, size_t size)
+{
+    uint8_t *larger;
+    size_t cap;
+
+    if (size > ASB_DISPLAY_MAX_FRAME_DATA_SIZE) return -1;
+    if (size <= c->snapshot_cap) return 0;
+    cap = c->snapshot_cap ? c->snapshot_cap : 64 * 1024;
+    while (cap < size) {
+        if (cap > ASB_DISPLAY_MAX_FRAME_DATA_SIZE / 2) {
+            cap = ASB_DISPLAY_MAX_FRAME_DATA_SIZE;
+            break;
+        }
+        cap *= 2;
+    }
+    larger = (uint8_t *)realloc(c->snapshot, cap);
+    if (!larger) return -1;
+    c->snapshot = larger;
+    c->snapshot_cap = cap;
+    return 0;
 }
 
 static int prepare_shadow(struct capture_ctx *c, size_t size)
@@ -249,6 +307,9 @@ static void drm_release_fb(struct capture_ctx *c)
     if (c->dma_fd >= 0) { close(c->dma_fd); c->dma_fd = -1; }
     c->fb_id_last = 0;
     c->width = c->height = c->stride = 0;
+    /* A new GEM buffer has no relationship to the old shadow, even when its
+     * dimensions happen to match. The next successful send must be full. */
+    c->force_full = 1;
 }
 
 /* Find the active primary-plane framebuffer and map it for read.
@@ -705,53 +766,68 @@ static int scan_dirty_tiles(struct capture_ctx *c, AsbDisplayRect *rects,
     return 0;
 }
 
-static void shadow_apply(struct capture_ctx *c, const AsbDisplayRect *rects,
-                         uint32_t rect_count, int full)
+/* Build one immutable frame payload. The dirty detector may inspect the live
+ * framebuffer first, but the host and shadow both consume this copy. */
+static int build_frame_snapshot(struct capture_ctx *c,
+                                const AsbDisplayRect *rects,
+                                uint32_t rect_count, int full)
 {
-    uint32_t i;
-    if (!c->shadow) return;
+    size_t expected = 0;
+
     if (full) {
-        uint32_t y;
-        size_t row_bytes = (size_t)c->width * 4;
-        for (y = 0; y < c->height; y++)
-            memcpy(c->shadow + (size_t)y * c->shadow_stride,
-                   c->mem + (size_t)y * c->stride, row_bytes);
+        if (c->mem_size > ASB_DISPLAY_MAX_FRAME_DATA_SIZE)
+            return -1;
+        if (ensure_snapshot_buffer(c, c->mem_size) < 0) return -1;
     } else {
+        uint32_t i;
+        uint64_t bytes = 0;
         for (i = 0; i < rect_count; i++) {
-            uint32_t y;
-            uint32_t width = (uint32_t)(rects[i].right - rects[i].left);
-            uint32_t height = (uint32_t)(rects[i].bottom - rects[i].top);
-            size_t row_bytes = (size_t)width * 4;
-            for (y = 0; y < height; y++)
-                memcpy(c->shadow + (size_t)(rects[i].top + y) * c->shadow_stride
-                                      + (size_t)rects[i].left * 4,
-                       c->mem + (size_t)(rects[i].top + y) * c->stride
-                                + (size_t)rects[i].left * 4,
-                       row_bytes);
+            uint64_t width = (uint32_t)(rects[i].right - rects[i].left);
+            uint64_t height = (uint32_t)(rects[i].bottom - rects[i].top);
+            if (width == 0 || height == 0 || bytes > UINT64_MAX - width * height * 4)
+                return -1;
+            bytes += width * height * 4;
         }
+        if (bytes > SIZE_MAX || ensure_snapshot_buffer(c, (size_t)bytes) < 0)
+            return -1;
     }
-    c->force_full = 0;
+
+    if (asb_display_pack_snapshot(c->snapshot, c->snapshot_cap,
+                                  c->mem, c->mem_size,
+                                  c->width, c->height, c->stride,
+                                  rects, rect_count, full, &expected) < 0)
+        return -1;
+    c->snapshot_size = expected;
+    return 0;
 }
 
-static int send_frame(int client_fd, struct capture_ctx *c, uint64_t seq,
-                      const AsbDisplayRect *rects, uint32_t rect_count,
-                      int full, uint64_t *wire_bytes)
+static int commit_shadow_from_snapshot(struct capture_ctx *c,
+                                       const AsbDisplayRect *rects,
+                                       uint32_t rect_count, int full)
+{
+    if (!c->shadow ||
+        asb_display_commit_snapshot(c->shadow, c->shadow_size,
+                                    c->snapshot, c->snapshot_size,
+                                    c->width, c->height, c->stride,
+                                    rects, rect_count, full) < 0)
+        return -1;
+    c->force_full = 0;
+    return 0;
+}
+
+static int send_frame_snapshot(int client_fd, struct capture_ctx *c,
+                               uint64_t seq,
+                               const AsbDisplayRect *rects,
+                               uint32_t rect_count, int full,
+                               uint64_t *wire_bytes)
 {
     frame_header h;
-    uint64_t data_size64 = full ? c->mem_size : 0;
-    uint32_t i;
     uint32_t data_size;
     uint64_t sent = sizeof(h) + sizeof(data_size) +
                     (uint64_t)rect_count * sizeof(*rects);
 
-    if (!full) {
-        for (i = 0; i < rect_count; i++) {
-            uint64_t width = (uint64_t)(rects[i].right - rects[i].left);
-            uint64_t height = (uint64_t)(rects[i].bottom - rects[i].top);
-            data_size64 += width * height * 4;
-        }
-    }
-    if (data_size64 > UINT32_MAX || data_size64 > ASB_DISPLAY_MAX_FRAME_DATA_SIZE)
+    if (c->snapshot_size > UINT32_MAX ||
+        c->snapshot_size > ASB_DISPLAY_MAX_FRAME_DATA_SIZE)
         return -1;
 
     h.magic = FRAME_MAGIC;
@@ -760,7 +836,7 @@ static int send_frame(int client_fd, struct capture_ctx *c, uint64_t seq,
     h.stride = c->stride;
     h.frame_seq = seq;
     h.dirty_rect_count = full ? 0 : rect_count;
-    data_size = (uint32_t)data_size64;
+    data_size = (uint32_t)c->snapshot_size;
 
     if (send_all(client_fd, &h, sizeof(h)) < 0 ||
         (rect_count && send_all(client_fd, rects,
@@ -768,23 +844,8 @@ static int send_frame(int client_fd, struct capture_ctx *c, uint64_t seq,
         send_all(client_fd, &data_size, sizeof(data_size)) < 0)
         return -1;
 
-    if (full) {
-        if (send_all(client_fd, c->mem, c->mem_size) < 0) return -1;
-    } else {
-        for (i = 0; i < rect_count; i++) {
-            uint32_t y;
-            uint32_t width = (uint32_t)(rects[i].right - rects[i].left);
-            uint32_t height = (uint32_t)(rects[i].bottom - rects[i].top);
-            size_t row_bytes = (size_t)width * 4;
-            for (y = 0; y < height; y++) {
-                const uint8_t *row = c->mem +
-                    (size_t)(rects[i].top + y) * c->stride +
-                    (size_t)rects[i].left * 4;
-                if (send_all(client_fd, row, row_bytes) < 0) return -1;
-            }
-        }
-    }
-    *wire_bytes = sent + data_size64;
+    if (send_all(client_fd, c->snapshot, c->snapshot_size) < 0) return -1;
+    *wire_bytes = sent + c->snapshot_size;
     return 0;
 }
 
@@ -794,6 +855,7 @@ static void maybe_log_stats(struct capture_ctx *c)
     uint64_t total = c->stats.frames_scanned;
     uint64_t target, seen = 0, p95_bucket = 100;
     double seconds, avg, mib_per_sec;
+    uint64_t dirty_scan_p95, snapshot_pack_p95;
     int i;
 
     if (!c->stats.start_ns) c->stats.start_ns = now;
@@ -812,11 +874,17 @@ static void maybe_log_stats(struct capture_ctx *c)
     mib_per_sec = seconds > 0.0
         ? (double)c->stats.wire_bytes_total / seconds / (1024.0 * 1024.0)
         : 0.0;
+    dirty_scan_p95 = stats_p95_us(c->stats.dirty_scan_us_buckets, total);
+    snapshot_pack_p95 = stats_p95_us(c->stats.snapshot_pack_us_buckets,
+                                     c->stats.snapshot_pack_samples);
     agent_log("display_stats scope=guest resolution=%ux%u logical_refresh_hz=%u "
               "frames_scanned=%llu frames_sent=%llu full_frames_sent=%llu "
               "dirty_frames_sent=%llu unchanged_frames_skipped=%llu "
               "dirty_rects_total=%llu dirty_area_ratio_avg=%.5f "
-              "dirty_area_ratio_p95=%.2f wire_bytes_total=%llu wire_mib_per_sec=%.3f",
+              "dirty_area_ratio_p95=%.2f wire_bytes_total=%llu wire_mib_per_sec=%.3f "
+              "dirty_scan_us_avg=%.2f dirty_scan_us_p95=%llu "
+              "snapshot_pack_us_avg=%.2f snapshot_pack_us_p95=%llu "
+              "DRM_DAMAGE_AVAILABLE=%u fallback=tile64",
               c->width, c->height, TARGET_FPS,
               (unsigned long long)c->stats.frames_scanned,
               (unsigned long long)c->stats.frames_sent,
@@ -825,7 +893,14 @@ static void maybe_log_stats(struct capture_ctx *c)
               (unsigned long long)c->stats.unchanged_frames_skipped,
               (unsigned long long)c->stats.dirty_rects_total, avg,
               (double)p95_bucket / 100.0,
-              (unsigned long long)c->stats.wire_bytes_total, mib_per_sec);
+              (unsigned long long)c->stats.wire_bytes_total, mib_per_sec,
+              total ? (double)c->stats.dirty_scan_us_total / total : 0.0,
+              (unsigned long long)dirty_scan_p95,
+              c->stats.snapshot_pack_samples
+                  ? (double)c->stats.snapshot_pack_us_total /
+                    c->stats.snapshot_pack_samples : 0.0,
+              (unsigned long long)snapshot_pack_p95,
+              ASB_DISPLAY_DRM_DAMAGE_AVAILABLE);
 }
 
 static void capture_loop(int client_fd)
@@ -948,6 +1023,10 @@ have_card:
      * open the device — Mutter needs to become master to render. */
     drmDropMaster(ctx.fd);
 
+    agent_log("DRM_DAMAGE_AVAILABLE=%u reason=asb_drm exposes no FB_DAMAGE_CLIPS "
+              "or atomic damage sequence; fallback=tile64",
+              ASB_DISPLAY_DRM_DAMAGE_AVAILABLE);
+
     /* Universal planes lets us enumerate the primary; atomic exposes the
      * standard property set (CRTC_X / CRTC_Y / FB_ID / type / ...) so we
      * can read cursor position via drmModeObjectGetProperties. Without
@@ -996,21 +1075,43 @@ have_card:
                 last_status = 1;
             }
             ctx.stats.frames_scanned++;
-            (void)scan_dirty_tiles(&ctx, rects, &rect_count, &full, &dirty_area);
+            {
+                uint64_t scan_start = monotonic_ns();
+                (void)scan_dirty_tiles(&ctx, rects, &rect_count, &full, &dirty_area);
+                stats_record_us(&ctx.stats.dirty_scan_us_total,
+                                ctx.stats.dirty_scan_us_buckets,
+                                monotonic_ns() - scan_start);
+            }
             if (!full && rect_count == 0) {
                 ctx.stats.unchanged_frames_skipped++;
             } else {
-                if (send_frame(client_fd, &ctx, ++seq, rects, rect_count,
-                               full, &wire_bytes) < 0) {
+                uint64_t pack_start = monotonic_ns();
+                int pack_rc = build_frame_snapshot(&ctx, rects, rect_count, full);
+                stats_record_us(&ctx.stats.snapshot_pack_us_total,
+                                ctx.stats.snapshot_pack_us_buckets,
+                                monotonic_ns() - pack_start);
+                ctx.stats.snapshot_pack_samples++;
+                if (pack_rc < 0) {
+                    /* Keep the shadow untouched. Retry as a full snapshot on
+                     * the next tick if staging allocation/layout failed. */
+                    ctx.force_full = 1;
+                    agent_log("snapshot staging failed; retrying full frame");
+                } else if (send_frame_snapshot(client_fd, &ctx, ++seq,
+                                               rects, rect_count, full,
+                                               &wire_bytes) < 0) {
                     agent_log("client disconnected");
                     break;
+                } else if (commit_shadow_from_snapshot(&ctx, rects,
+                                                       rect_count, full) < 0) {
+                    agent_log("snapshot shadow commit failed; forcing full frame");
+                    ctx.force_full = 1;
+                } else {
+                    ctx.stats.frames_sent++;
+                    ctx.stats.wire_bytes_total += wire_bytes;
+                    ctx.stats.dirty_rects_total += rect_count;
+                    if (full) ctx.stats.full_frames_sent++;
+                    else      ctx.stats.dirty_frames_sent++;
                 }
-                shadow_apply(&ctx, rects, rect_count, full);
-                ctx.stats.frames_sent++;
-                ctx.stats.wire_bytes_total += wire_bytes;
-                ctx.stats.dirty_rects_total += rect_count;
-                if (full) ctx.stats.full_frames_sent++;
-                else      ctx.stats.dirty_frames_sent++;
             }
             if (dirty_area > total_area) dirty_area = total_area;
             ctx.stats.dirty_area_sum += dirty_area;

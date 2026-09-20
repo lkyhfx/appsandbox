@@ -16,6 +16,7 @@ EXTENSIONDIR  := /usr/share/gnome-shell/extensions/$(POINTER_EXT)
 
 # Daemons get added here as each phase lands.
 BINS := appsandbox-agent appsandbox-display appsandbox-input appsandbox-audio appsandbox-clipboard
+TEST_BINS := tests/test_display_snapshot
 
 SYSTEM_UNITS := systemd/appsandbox-agent.service \
                 systemd/appsandbox-display.service \
@@ -28,6 +29,13 @@ SYSTEM_UNITS := systemd/appsandbox-agent.service \
 USER_UNITS   :=
 
 all: $(BINS)
+
+test: $(TEST_BINS)
+	./tests/test_display_snapshot
+
+tests/test_display_snapshot: tests/test_display_snapshot.c \
+		../../../src/core/display_snapshot.h ../../../src/core/display_protocol.h
+	$(CC) $(CFLAGS) -I../../../src/core -o $@ $<
 
 appsandbox-agent: appsandbox-agent.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
@@ -81,6 +89,6 @@ disable:
 	-systemctl disable --now appsandbox-agent.service
 
 clean:
-	rm -f $(BINS)
+	rm -f $(BINS) $(TEST_BINS)
 
-.PHONY: all install install-pointer enable disable clean
+.PHONY: all test install install-pointer enable disable clean

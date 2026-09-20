@@ -14,6 +14,12 @@
 #define ASB_DISPLAY_MAX_DIRTY_RECTS 64u
 #define ASB_DISPLAY_TILE_SIZE       64u
 
+/* The virtual DRM driver currently exposes only the active primary FB. It
+ * does not publish FB_DAMAGE_CLIPS or a trustworthy atomic damage sequence,
+ * so the guest daemon must use its explicit tile-compare fallback. Keep this
+ * flag visible in logs/tests rather than implying that damage metadata exists. */
+#define ASB_DISPLAY_DRM_DAMAGE_AVAILABLE 0u
+
 /* The DRM driver supports 7680x4320. This is deliberately separate from
  * negotiation limits used by other display protocols. */
 #define ASB_DISPLAY_RAW_MAX_WIDTH   7680u
