@@ -195,39 +195,109 @@ typedef struct SyntheticPageFlipState {
     uint32_t layout_changes;
     uint32_t full_frames;
     uint32_t dirty_frames;
+    uint32_t full_due_to_initial;
+    uint32_t full_due_to_layout_change;
+    uint32_t full_due_to_recovery;
+    AsbDisplayFbTransition pending_transition;
 } SyntheticPageFlipState;
 
 static int synthetic_acquire_fb(SyntheticPageFlipState *state,
                                 uint32_t fb_id,
                                 const AsbDisplayFbLayout *layout)
 {
-    int same_layout = state->have_layout &&
-                      asb_display_fb_layout_equal(&state->layout, layout);
-    int full = state->force_full;
+    int shadow_valid = state->shadow_valid && state->have_layout;
+    AsbDisplayFbTransition transition = asb_display_fb_transition(
+        &state->layout, state->have_layout, layout, shadow_valid);
+    int full = state->force_full || transition != ASB_FB_TRANSITION_SAME_LAYOUT;
 
     if (state->have_layout && state->fb_id != fb_id)
         state->fb_id_changes++;
-    if (!state->have_layout || !same_layout) {
-        if (state->have_layout) state->layout_changes++;
+    if (transition == ASB_FB_TRANSITION_LAYOUT_CHANGE) {
+        state->layout_changes++;
         state->shadow_valid = 0;
-        full = 1;
-    } else if (!state->shadow_valid) {
-        full = 1;
+    } else if (transition != ASB_FB_TRANSITION_SAME_LAYOUT) {
+        state->shadow_valid = 0;
     }
 
     state->fb_id = fb_id;
     state->layout = *layout;
     state->have_layout = 1;
     state->force_full = full;
+    state->pending_transition = transition;
     return full;
 }
 
 static void synthetic_commit(SyntheticPageFlipState *state, int full)
 {
-    if (full) state->full_frames++;
-    else      state->dirty_frames++;
+    if (full) {
+        state->full_frames++;
+        switch (state->pending_transition) {
+        case ASB_FB_TRANSITION_INITIAL:
+            state->full_due_to_initial++;
+            break;
+        case ASB_FB_TRANSITION_LAYOUT_CHANGE:
+            state->full_due_to_layout_change++;
+            break;
+        case ASB_FB_TRANSITION_RECOVERY:
+            state->full_due_to_recovery++;
+            break;
+        case ASB_FB_TRANSITION_SAME_LAYOUT:
+        default:
+            break;
+        }
+    } else {
+        state->dirty_frames++;
+    }
     state->shadow_valid = 1;
     state->force_full = 0;
+}
+
+static void test_transition_gate(void)
+{
+    const AsbDisplayFbLayout base = { 8, 8, 32, 1 };
+    const AsbDisplayFbLayout geometry = { 10, 8, 40, 1 };
+    const AsbDisplayFbLayout stride = { 8, 8, 40, 1 };
+    const AsbDisplayFbLayout pixel_format = { 8, 8, 40, 2 };
+    SyntheticPageFlipState state = { 0 };
+
+    assert(synthetic_acquire_fb(&state, 1, &base) == 1);
+    assert(state.pending_transition == ASB_FB_TRANSITION_INITIAL);
+    synthetic_commit(&state, 1);
+    assert(state.full_due_to_initial == 1);
+    assert(state.full_due_to_layout_change == 0);
+    assert(state.layout_changes == 0);
+
+    assert(synthetic_acquire_fb(&state, 2, &base) == 0);
+    assert(state.pending_transition == ASB_FB_TRANSITION_SAME_LAYOUT);
+    synthetic_commit(&state, 0);
+
+    assert(synthetic_acquire_fb(&state, 3, &geometry) == 1);
+    assert(state.pending_transition == ASB_FB_TRANSITION_LAYOUT_CHANGE);
+    assert(state.shadow_valid == 0);
+    synthetic_commit(&state, 1);
+
+    assert(synthetic_acquire_fb(&state, 4, &stride) == 1);
+    assert(state.pending_transition == ASB_FB_TRANSITION_LAYOUT_CHANGE);
+    assert(state.shadow_valid == 0);
+    synthetic_commit(&state, 1);
+
+    /* Same dimensions/stride/size, but a different pixel format must still
+     * be a layout transition and invalidate the shadow. */
+    assert(synthetic_acquire_fb(&state, 5, &pixel_format) == 1);
+    assert(state.pending_transition == ASB_FB_TRANSITION_LAYOUT_CHANGE);
+    assert(state.shadow_valid == 0);
+    synthetic_commit(&state, 1);
+
+    state.shadow_valid = 0;
+    assert(synthetic_acquire_fb(&state, 6, &pixel_format) == 1);
+    assert(state.pending_transition == ASB_FB_TRANSITION_RECOVERY);
+    assert(state.shadow_valid == 0);
+    synthetic_commit(&state, 1);
+
+    assert(state.full_due_to_initial == 1);
+    assert(state.full_due_to_layout_change == 3);
+    assert(state.full_due_to_recovery == 1);
+    assert(state.layout_changes == 3);
 }
 
 static void test_page_flip_semantics(void)
@@ -341,6 +411,7 @@ int main(void)
     test_rect_packing();
     test_rect_shapes_and_full_frames();
     test_resolution_change();
+    test_transition_gate();
     test_page_flip_semantics();
     puts("display_snapshot: PASS (race, packing, page-flip, layout, churn)");
     return 0;

@@ -55,6 +55,7 @@
 
 enum full_frame_reason {
     FULL_REASON_NONE = 0,
+    FULL_REASON_INITIAL,
     FULL_REASON_LAYOUT_CHANGE,
     FULL_REASON_DIRTY_THRESHOLD,
     FULL_REASON_RECT_OVERFLOW,
@@ -153,6 +154,7 @@ struct capture_ctx {
     uint32_t  shadow_stride;
     uint32_t  shadow_width;
     uint32_t  shadow_height;
+    uint32_t  shadow_pixel_format;
     uint8_t  *dirty_tiles;
     size_t    dirty_tiles_cap;
     AsbDisplayRect *work_rects;
@@ -180,6 +182,7 @@ struct capture_ctx {
         uint64_t snapshot_pack_samples;
         uint64_t fb_id_changes;
         uint64_t layout_changes;
+        uint64_t full_due_to_initial;
         uint64_t full_due_to_layout_change;
         uint64_t full_due_to_dirty_threshold;
         uint64_t full_due_to_rect_overflow;
@@ -227,6 +230,8 @@ static void request_full(struct capture_ctx *c, enum full_frame_reason reason)
     c->force_full = 1;
     if (reason != FULL_REASON_NONE &&
         (!was_full || c->full_reason == FULL_REASON_NONE ||
+         reason == FULL_REASON_INITIAL ||
+         reason == FULL_REASON_LAYOUT_CHANGE ||
          reason == FULL_REASON_RECOVERY))
         c->full_reason = reason;
 }
@@ -235,6 +240,9 @@ static void record_full_reason(struct capture_ctx *c,
                                enum full_frame_reason reason)
 {
     switch (reason) {
+    case FULL_REASON_INITIAL:
+        c->stats.full_due_to_initial++;
+        break;
     case FULL_REASON_LAYOUT_CHANGE:
         c->stats.full_due_to_layout_change++;
         break;
@@ -245,9 +253,10 @@ static void record_full_reason(struct capture_ctx *c,
         c->stats.full_due_to_rect_overflow++;
         break;
     case FULL_REASON_RECOVERY:
+        c->stats.full_due_to_recovery++;
+        break;
     case FULL_REASON_NONE:
     default:
-        c->stats.full_due_to_recovery++;
         break;
     }
 }
@@ -305,6 +314,7 @@ static void free_capture_buffers(struct capture_ctx *c)
     c->shadow_size = c->dirty_tiles_cap = c->work_rects_cap = 0;
     c->snapshot_size = c->snapshot_cap = 0;
     c->shadow_stride = c->shadow_width = c->shadow_height = 0;
+    c->shadow_pixel_format = 0;
 }
 
 static int ensure_snapshot_buffer(struct capture_ctx *c, size_t size)
@@ -336,16 +346,21 @@ static void invalidate_shadow(struct capture_ctx *c,
     c->shadow = NULL;
     c->shadow_size = 0;
     c->shadow_stride = c->shadow_width = c->shadow_height = 0;
+    c->shadow_pixel_format = 0;
     request_full(c, reason);
 }
 
 static int prepare_shadow(struct capture_ctx *c, size_t size,
                            enum full_frame_reason reason)
 {
-    if (c->shadow_width == c->width && c->shadow_height == c->height &&
-        c->shadow_stride == c->stride && c->shadow_size == size && c->shadow)
+    if (reason == FULL_REASON_NONE && c->shadow_width == c->width &&
+        c->shadow_height == c->height && c->shadow_stride == c->stride &&
+        c->shadow_pixel_format == c->pixel_format &&
+        c->shadow_size == size && c->shadow)
         return 0;
 
+    if (reason == FULL_REASON_NONE)
+        reason = FULL_REASON_RECOVERY;
     invalidate_shadow(c, reason);
     c->shadow = (uint8_t *)malloc(size);
     if (!c->shadow) {
@@ -357,6 +372,7 @@ static int prepare_shadow(struct capture_ctx *c, size_t size,
     c->shadow_stride = c->stride;
     c->shadow_width = c->width;
     c->shadow_height = c->height;
+    c->shadow_pixel_format = c->pixel_format;
     memset(c->shadow, 0, size);
     request_full(c, reason);
     return 0;
@@ -467,20 +483,35 @@ static int drm_acquire_fb(struct capture_ctx *c)
             width, height, pitch, pixel_format
         };
         int have_old_layout = c->last_layout_valid;
-        int same_layout = have_old_layout &&
-                          asb_display_fb_layout_equal(&old_layout, &new_layout);
         int shadow_usable = c->shadow &&
                             c->shadow_size == size &&
                             c->shadow_width == width &&
                             c->shadow_height == height &&
-                            c->shadow_stride == pitch;
-        enum full_frame_reason shadow_reason =
-            !same_layout ? FULL_REASON_LAYOUT_CHANGE :
-            (shadow_usable ? FULL_REASON_NONE : FULL_REASON_RECOVERY);
+                            c->shadow_stride == pitch &&
+                            c->shadow_pixel_format == pixel_format;
+        AsbDisplayFbTransition transition = asb_display_fb_transition(
+            &old_layout, have_old_layout, &new_layout, shadow_usable);
+        enum full_frame_reason shadow_reason;
+
+        switch (transition) {
+        case ASB_FB_TRANSITION_INITIAL:
+            shadow_reason = FULL_REASON_INITIAL;
+            break;
+        case ASB_FB_TRANSITION_LAYOUT_CHANGE:
+            shadow_reason = FULL_REASON_LAYOUT_CHANGE;
+            break;
+        case ASB_FB_TRANSITION_RECOVERY:
+            shadow_reason = FULL_REASON_RECOVERY;
+            break;
+        case ASB_FB_TRANSITION_SAME_LAYOUT:
+        default:
+            shadow_reason = FULL_REASON_NONE;
+            break;
+        }
 
         if (old_fb_id && old_fb_id != fb_id)
             c->stats.fb_id_changes++;
-        if (have_old_layout && !same_layout)
+        if (transition == ASB_FB_TRANSITION_LAYOUT_CHANGE)
             c->stats.layout_changes++;
 
         drm_release_fb(c);
@@ -986,6 +1017,7 @@ static void maybe_log_stats(struct capture_ctx *c)
               "frames_scanned=%llu frames_sent=%llu full_frames_sent=%llu "
               "dirty_frames_sent=%llu unchanged_frames_skipped=%llu "
               "fb_id_changes=%llu fb_id_changes_per_sec=%.3f layout_changes=%llu "
+              "full_due_to_initial=%llu "
               "full_due_to_layout_change=%llu "
               "full_due_to_dirty_threshold=%llu "
               "full_due_to_rect_overflow=%llu full_due_to_recovery=%llu "
@@ -1004,6 +1036,7 @@ static void maybe_log_stats(struct capture_ctx *c)
                (unsigned long long)c->stats.fb_id_changes,
                fb_id_changes_per_sec,
                (unsigned long long)c->stats.layout_changes,
+               (unsigned long long)c->stats.full_due_to_initial,
                (unsigned long long)c->stats.full_due_to_layout_change,
                (unsigned long long)c->stats.full_due_to_dirty_threshold,
                (unsigned long long)c->stats.full_due_to_rect_overflow,
