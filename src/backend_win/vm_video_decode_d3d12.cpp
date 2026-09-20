@@ -7,6 +7,8 @@
 #include <dxgi1_2.h>
 #include <dxva.h>
 #include <wrl/client.h>
+#include <array>
+#include <cstring>
 #include <memory>
 #include <cstdio>
 #include "vm_video_decode_d3d12.h"
@@ -20,20 +22,36 @@ static void print_hr(const char *stage, HRESULT hr)
 #include "vm_video_decode_d3d12_process.inl"
 
 struct VmD3D12Decoder {
+    static constexpr UINT kSlotCount = 3;
+    static constexpr UINT kBitstreamCapacity = 8u * 1024u * 1024u;
+    struct Slot {
+        ComPtr<ID3D12Resource> bitstream;
+        ComPtr<ID3D12Resource> output;
+        ComPtr<ID3D12Resource> reference;
+        ComPtr<ID3D12Resource> rgb;
+        ComPtr<ID3D12CommandAllocator> allocator;
+        ComPtr<ID3D12VideoDecodeCommandList> list;
+        ComPtr<ID3D12Fence> decode_fence;
+        ComPtr<ID3D12Fence> process_fence;
+        ComPtr<ID3D11Texture2D> host_texture;
+        UINT64 decode_value = 0;
+        UINT64 process_value = 0;
+    };
     ComPtr<ID3D11Device1> host;
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12VideoDevice> video;
     ComPtr<ID3D12VideoDecoder> decoder;
     ComPtr<ID3D12VideoDecoderHeap> heap;
     ComPtr<ID3D12CommandQueue> queue;
-    ComPtr<ID3D12CommandAllocator> allocator;
-    ComPtr<ID3D12VideoDecodeCommandList> list;
-    ComPtr<ID3D12Fence> fence;
     ComPtr<ID3D12QueryHeap> query;
     ComPtr<ID3D12Resource> statistics;
+    VmD3D12ProcessPipeline process;
+    std::array<Slot, kSlotCount> slots;
     DXVA_PicParams_HEVC_RangeExt picture = {};
     bool reference_only = false;
+    UINT next_slot = 0;
     UINT64 serial = 0;
+    ~VmD3D12Decoder() { destroy_process_pipeline(&process); }
 };
 
 static D3D12_RESOURCE_DESC buffer_desc(UINT64 size)
@@ -190,18 +208,82 @@ extern "C" VmD3D12Decoder *vm_d3d12_create(ID3D11Device *host, UINT width,
         heap_desc.MaxDecodePictureBufferCount = 8;
         D3D12_COMMAND_QUEUE_DESC queue_desc = {};
         queue_desc.Type = D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE;
-        D3D12_QUERY_HEAP_DESC query_desc = {D3D12_QUERY_HEAP_TYPE_VIDEO_DECODE_STATISTICS, 1, 1};
+        D3D12_QUERY_HEAP_DESC query_desc = {};
+        query_desc.Type = D3D12_QUERY_HEAP_TYPE_VIDEO_DECODE_STATISTICS;
+        query_desc.Count = VmD3D12Decoder::kSlotCount;
+        query_desc.NodeMask = 1;
         if (FAILED(d->video->CreateVideoDecoder(&decoder_desc, IID_PPV_ARGS(&d->decoder))) ||
             FAILED(d->video->CreateVideoDecoderHeap(&heap_desc, IID_PPV_ARGS(&d->heap))) ||
             FAILED(d->device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&d->queue))) ||
-            FAILED(d->device->CreateCommandAllocator(queue_desc.Type, IID_PPV_ARGS(&d->allocator))) ||
-            FAILED(d->device->CreateCommandList(0, queue_desc.Type, d->allocator.Get(), nullptr, IID_PPV_ARGS(&d->list))) ||
-            FAILED(d->list->Close()) ||
-            FAILED(d->device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&d->fence))) ||
             FAILED(d->device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&d->query))) ||
             FAILED(resource(d.get(), D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_FLAG_NONE,
-                buffer_desc(sizeof(D3D12_QUERY_DATA_VIDEO_DECODE_STATISTICS)),
+                buffer_desc(sizeof(D3D12_QUERY_DATA_VIDEO_DECODE_STATISTICS) *
+                            VmD3D12Decoder::kSlotCount),
                 D3D12_RESOURCE_STATE_COPY_DEST, &d->statistics))) return nullptr;
+
+        if (!create_process_pipeline(d->device.Get(), d->video.Get(), &d->process))
+            return nullptr;
+
+        D3D12_RESOURCE_DESC bitstream_desc = buffer_desc(
+            VmD3D12Decoder::kBitstreamCapacity);
+        D3D12_RESOURCE_DESC texture_desc = {};
+        texture_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        texture_desc.Width = width;
+        texture_desc.Height = height;
+        texture_desc.DepthOrArraySize = 1;
+        texture_desc.MipLevels = 1;
+        texture_desc.Format = DXGI_FORMAT_AYUV;
+        texture_desc.SampleDesc.Count = 1;
+        texture_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+        D3D12_RESOURCE_DESC rgb_desc = texture_desc;
+        rgb_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        rgb_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        for (UINT slot_index = 0; slot_index < VmD3D12Decoder::kSlotCount;
+             ++slot_index) {
+            auto &slot = d->slots[slot_index];
+            if (FAILED(resource(d.get(), D3D12_HEAP_TYPE_UPLOAD,
+                                D3D12_HEAP_FLAG_NONE, bitstream_desc,
+                                D3D12_RESOURCE_STATE_GENERIC_READ,
+                                &slot.bitstream)) ||
+                FAILED(resource(d.get(), D3D12_HEAP_TYPE_DEFAULT,
+                                D3D12_HEAP_FLAG_SHARED, texture_desc,
+                                D3D12_RESOURCE_STATE_COMMON, &slot.output)) ||
+                FAILED(resource(d.get(), D3D12_HEAP_TYPE_DEFAULT,
+                                D3D12_HEAP_FLAG_SHARED, rgb_desc,
+                                D3D12_RESOURCE_STATE_COMMON, &slot.rgb)) ||
+                FAILED(d->device->CreateCommandAllocator(
+                    queue_desc.Type, IID_PPV_ARGS(&slot.allocator))) ||
+                FAILED(d->device->CreateCommandList(
+                    0, queue_desc.Type, slot.allocator.Get(), nullptr,
+                    IID_PPV_ARGS(&slot.list))) ||
+                FAILED(d->device->CreateFence(
+                    0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&slot.decode_fence))) ||
+                FAILED(d->device->CreateFence(
+                    0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&slot.process_fence))) ||
+                FAILED(slot.list->Close()))
+                return nullptr;
+            if (d->reference_only) {
+                D3D12_RESOURCE_DESC reference_desc = texture_desc;
+                reference_desc.Flags =
+                    D3D12_RESOURCE_FLAG_VIDEO_DECODE_REFERENCE_ONLY |
+                    D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+                if (FAILED(resource(d.get(), D3D12_HEAP_TYPE_DEFAULT,
+                                    D3D12_HEAP_FLAG_NONE, reference_desc,
+                                    D3D12_RESOURCE_STATE_COMMON,
+                                    &slot.reference)))
+                    return nullptr;
+            }
+            HANDLE shared = nullptr;
+            if (FAILED(d->device->CreateSharedHandle(
+                    slot.rgb.Get(), nullptr, GENERIC_ALL, nullptr, &shared)) ||
+                FAILED(d->host->OpenSharedResource1(
+                    shared, IID_PPV_ARGS(&slot.host_texture)))) {
+                if (shared) CloseHandle(shared);
+                return nullptr;
+            }
+            CloseHandle(shared);
+        }
         return d.release();
     } catch (...) { return nullptr; }
 }
@@ -215,29 +297,20 @@ extern "C" HRESULT vm_d3d12_decode(VmD3D12Decoder *d, const BYTE *data,
     try {
         std::vector<std::uint8_t> compressed;
         if (!asb_hevc_decode::idr_slice(data, size, &compressed)) return E_INVALIDARG;
-        ComPtr<ID3D12Resource> upload, output, reference;
-        HRESULT hr = resource(d, D3D12_HEAP_TYPE_UPLOAD, D3D12_HEAP_FLAG_NONE,
-            buffer_desc(compressed.size()), D3D12_RESOURCE_STATE_GENERIC_READ, &upload);
-        if (FAILED(hr)) return hr;
+        if (compressed.empty() || compressed.size() > VmD3D12Decoder::kBitstreamCapacity)
+            return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+
+        const UINT slot_index = d->next_slot++ % VmD3D12Decoder::kSlotCount;
+        auto &slot = d->slots[slot_index];
+        HRESULT hr;
         void *mapped = nullptr;
         D3D12_RANGE no_read = {0, 0};
-        if (FAILED(hr = upload->Map(0, &no_read, &mapped))) return hr;
+        if (FAILED(hr = slot.bitstream->Map(0, &no_read, &mapped))) return hr;
         std::memcpy(mapped, compressed.data(), compressed.size());
-        upload->Unmap(0, nullptr);
-        D3D12_RESOURCE_DESC desc = {};
-        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-        desc.Width = 3840; desc.Height = 2160; desc.DepthOrArraySize = 1;
-        desc.MipLevels = 1; desc.Format = DXGI_FORMAT_AYUV; desc.SampleDesc.Count = 1;
-        // A fresh shared surface owns each presented frame; the render thread
-        // may retain it while the next packet is decoded. Never overwrite it.
-        if (FAILED(hr = resource(d, D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_FLAG_SHARED,
-            desc, D3D12_RESOURCE_STATE_COMMON, &output))) return hr;
-        if (d->reference_only) {
-            desc.Flags = D3D12_RESOURCE_FLAG_VIDEO_DECODE_REFERENCE_ONLY | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
-            if (FAILED(hr = resource(d, D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_FLAG_NONE,
-                desc, D3D12_RESOURCE_STATE_COMMON, &reference))) return hr;
-        }
-        if (FAILED(hr = d->allocator->Reset()) || FAILED(hr = d->list->Reset(d->allocator.Get()))) return hr;
+        slot.bitstream->Unmap(0, nullptr);
+
+        if (FAILED(hr = slot.allocator->Reset()) ||
+            FAILED(hr = slot.list->Reset(slot.allocator.Get()))) return hr;
         DXVA_Slice_HEVC_Short slice = {};
         slice.SliceBytesInBuffer = static_cast<UINT>(compressed.size());
         d->picture.params.StatusReportFeedbackNumber = static_cast<UINT>(d->serial + 1);
@@ -245,52 +318,69 @@ extern "C" HRESULT vm_d3d12_decode(VmD3D12Decoder *d, const BYTE *data,
         in.NumFrameArguments = 2;
         in.FrameArguments[0] = {D3D12_VIDEO_DECODE_ARGUMENT_TYPE_PICTURE_PARAMETERS, sizeof(d->picture), &d->picture};
         in.FrameArguments[1] = {D3D12_VIDEO_DECODE_ARGUMENT_TYPE_SLICE_CONTROL, sizeof(slice), &slice};
-        in.CompressedBitstream = {upload.Get(), 0, compressed.size()};
+        in.CompressedBitstream = {slot.bitstream.Get(), 0, compressed.size()};
         in.pHeap = d->heap.Get();
         D3D12_VIDEO_DECODE_OUTPUT_STREAM_ARGUMENTS out = {};
-        out.pOutputTexture2D = output.Get();
-        ID3D12Resource *refs[] = {reference.Get()};
+        out.pOutputTexture2D = slot.output.Get();
+        ID3D12Resource *refs[] = {slot.reference.Get()};
         UINT subresources[] = {0};
         if (d->reference_only) {
             out.ConversionArguments.Enable = TRUE;
-            out.ConversionArguments.pReferenceTexture2D = reference.Get();
+            out.ConversionArguments.pReferenceTexture2D = slot.reference.Get();
             in.ReferenceFrames.NumTexture2Ds = 1;
             in.ReferenceFrames.ppTexture2Ds = refs;
             in.ReferenceFrames.pSubresources = subresources;
-            transition(d->list.Get(), reference.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE);
+            transition(slot.list.Get(), slot.reference.Get(),
+                       D3D12_RESOURCE_STATE_COMMON,
+                       D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE);
         }
-        transition(d->list.Get(), output.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE);
-        d->list->DecodeFrame(d->decoder.Get(), &out, &in);
-        transition(d->list.Get(), output.Get(), D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE, D3D12_RESOURCE_STATE_COMMON);
-        if (reference) transition(d->list.Get(), reference.Get(), D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE, D3D12_RESOURCE_STATE_COMMON);
-        d->list->EndQuery(d->query.Get(), D3D12_QUERY_TYPE_VIDEO_DECODE_STATISTICS, 0);
-        d->list->ResolveQueryData(d->query.Get(), D3D12_QUERY_TYPE_VIDEO_DECODE_STATISTICS, 0, 1, d->statistics.Get(), 0);
-        if (FAILED(hr = d->list->Close())) return hr;
-        ID3D12CommandList *lists[] = {d->list.Get()};
+        transition(slot.list.Get(), slot.output.Get(), D3D12_RESOURCE_STATE_COMMON,
+                   D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE);
+        slot.list->DecodeFrame(d->decoder.Get(), &out, &in);
+        transition(slot.list.Get(), slot.output.Get(),
+                   D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE,
+                   D3D12_RESOURCE_STATE_COMMON);
+        if (slot.reference)
+            transition(slot.list.Get(), slot.reference.Get(),
+                       D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE,
+                       D3D12_RESOURCE_STATE_COMMON);
+        slot.list->EndQuery(d->query.Get(),
+                            D3D12_QUERY_TYPE_VIDEO_DECODE_STATISTICS,
+                            slot_index);
+        slot.list->ResolveQueryData(
+            d->query.Get(), D3D12_QUERY_TYPE_VIDEO_DECODE_STATISTICS,
+            slot_index, 1, d->statistics.Get(),
+            sizeof(D3D12_QUERY_DATA_VIDEO_DECODE_STATISTICS) * slot_index);
+        if (FAILED(hr = slot.list->Close())) return hr;
+        ID3D12CommandList *lists[] = {slot.list.Get()};
         d->queue->ExecuteCommandLists(1, lists);
-        if (FAILED(hr = d->queue->Signal(d->fence.Get(), ++d->serial))) return hr;
-        // Keep all submitted resources alive until the queue completes (or
-        // the device reports removal). Polling avoids closing a live event.
-        while (d->fence->GetCompletedValue() < d->serial) {
-            if (FAILED(hr = d->device->GetDeviceRemovedReason())) return hr;
-            Sleep(1);
-        }
-        if (FAILED(hr = d->device->GetDeviceRemovedReason())) return hr;
-        D3D12_RANGE range = {0, sizeof(D3D12_QUERY_DATA_VIDEO_DECODE_STATISTICS)};
+        slot.decode_value = ++d->serial;
+        if (FAILED(hr = d->queue->Signal(slot.decode_fence.Get(),
+                                         slot.decode_value))) return hr;
+
+        /* The process queue waits on the decode fence on the GPU. The CPU only
+         * waits for the completed presentation slot, so decode and process
+         * remain separate queues and all heavyweight objects stay persistent. */
+        if (!record_ayuv_to_rgb(&d->process, slot.output.Get(), slot.rgb.Get()))
+            return E_FAIL;
+        const UINT64 process_value = ++slot.process_value;
+        if (!submit_process(&d->process, slot.decode_fence.Get(),
+                            slot.decode_value, slot.process_fence.Get(),
+                            process_value, d->device.Get(),
+                            d->process.list.Get()))
+            return E_FAIL;
+
+        const D3D12_RANGE range = {
+            static_cast<SIZE_T>(sizeof(D3D12_QUERY_DATA_VIDEO_DECODE_STATISTICS) * slot_index),
+            static_cast<SIZE_T>(sizeof(D3D12_QUERY_DATA_VIDEO_DECODE_STATISTICS) * (slot_index + 1))};
         if (FAILED(hr = d->statistics->Map(0, &range, &mapped))) return hr;
-        const auto status = static_cast<D3D12_QUERY_DATA_VIDEO_DECODE_STATISTICS *>(mapped)->Status;
+        const auto status = reinterpret_cast<const D3D12_QUERY_DATA_VIDEO_DECODE_STATISTICS *>(
+            static_cast<const BYTE *>(mapped) + range.Begin)->Status;
         d->statistics->Unmap(0, &no_read);
         if (status != D3D12_VIDEO_DECODE_STATUS_OK) return E_FAIL;
-        // D3D11 cannot open a D3D12 AYUV allocation on all drivers. Convert
-        // on the video-process queue, then share the BGRA target instead.
-        ComPtr<ID3D12Resource> rgb;
-        if (!convert_ayuv_to_rgb(d->device.Get(), d->video.Get(), output.Get(), &rgb)) return E_FAIL;
-        HANDLE shared = nullptr;
-        if (FAILED(hr = d->device->CreateSharedHandle(rgb.Get(), nullptr, GENERIC_ALL, nullptr, &shared))) return hr;
-        hr = d->host->OpenSharedResource1(shared, IID_PPV_ARGS(texture));
-        if (FAILED(hr)) print_hr("d3d12-shared-bgra-open", hr);
-        CloseHandle(shared);
-        return hr;
+        *texture = slot.host_texture.Get();
+        (*texture)->AddRef();
+        return S_OK;
     } catch (...) { return E_OUTOFMEMORY; }
 }
 extern "C" void vm_d3d12_destroy(VmD3D12Decoder *d) { delete d; }

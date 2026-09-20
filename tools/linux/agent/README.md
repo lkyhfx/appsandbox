@@ -179,9 +179,9 @@ external-memory import returned `CUDA_ERROR_NOT_SUPPORTED`.
 
 CUDA -> NVENC itself worked, but the missing GPU-resident bridge from the actual
 D3D12 compositor resource made this route unsuitable as the main architecture.
-
-Do not reintroduce CUDA/NVENC unless a future platform requirement specifically
-demands it.
+Issue #4 therefore keeps CUDA/NVENC as an isolated Gate A/B diagnostic only;
+the probe is not wired into the production daemon and must never add a CPU
+staging fallback.
 
 ### 4. Native D3D12 shared resources are viable
 
@@ -318,11 +318,10 @@ It tests every enumerated hardware HEVC MFT independently. `HEVC444_PATH=MF`
 is allowed only after real hardware decode succeeds, an `IMFDXGIBuffer` yields
 an `ID3D11Texture2D` whose format is `DXGI_FORMAT_AYUV`, and the decoded
 surface passes the actual AYUV -> RGB `VideoProcessorBlt`. D3D12 capability or
-decoder/heap creation alone never produces `HEVC444_PATH=D3D12`; until a
-real D3D12 decode is implemented, that field is `not-tested` and the final
-path is `UNAVAILABLE` when MF does not pass. A `BLOCKED` result is a runtime
-capability fact, not a request to enable a fallback or change the production
-display protocol.
+decoder/heap creation alone never produces `HEVC444_PATH=D3D12`; the D3D12
+backend must complete an actual decode, GPU AYUV -> BGRA process, and shared
+surface open. A `BLOCKED` result is a runtime capability fact, not a request
+to enable a fallback or change the production display protocol.
 
 The Windows probe parses Annex-B NAL units into the first complete IRAP access
 unit (including prefix SEI and all slices up to the next picture). It supplies
@@ -338,6 +337,74 @@ python3 tools/linux/agent/test_hevc_headers.py
 The matching Windows CI job builds only
 `tools/win/hevc444-probe/hevc444-probe.vcxproj` in Release/x64. It does not run
 the hardware probe.
+
+### Issue #4 gates: A/B/C evidence and decision
+
+Issue #4 makes the production decision explicit. A capability query or a
+synthetic workload is not sufficient evidence for `production-4k60`.
+
+Gate A is the independent Guest-native CUDA/NVENC test:
+
+```sh
+make nvenc-hevc444-probe \
+  NV_CODEC_HEADERS=/path/to/nv-codec-headers/include
+bash gpu-nvenc-hevc444-probe.sh 600 gate-a-600
+bash gpu-nvenc-hevc444-probe.sh 3600 gate-a-3600
+```
+
+`nvenc-hevc444-probe` dynamically loads `libcuda.so.1` and
+`libnvidia-encode.so.1`, registers CUDA device memory as
+`NV_ENC_BUFFER_FORMAT_YUV444`, requests `NV_ENC_HEVC_PROFILE_FREXT_GUID`, and
+writes a HEVC elementary stream. The runner uses ffmpeg/ffprobe to require
+3840x2160, 4:4:4 output, zero decode errors, and the requested frame count.
+This gate does not test Mutter or D3D12 interop.
+
+Gate B is deliberately fail-closed:
+
+```sh
+make d3d12-cuda-nvenc-interop-probe \
+  NV_CODEC_HEADERS=/path/to/nv-codec-headers/include
+bash gpu-d3d12-cuda-nvenc-interop-probe.sh gate-b
+```
+
+It reports `d3d12_cuda_import`, `gpu_rgb_to_yuv444`,
+`cuda_nvenc_register`, `cuda_nvenc_map`, `real_mutter`,
+`cpu_framebuffer_copy`, `cpu_conversion`, and `cpu_upload`. The current
+implementation may report `BLOCKED` at CUDA texture import or the CUDA
+RGB-to-YUV444 boundary; that is an honest Gate B failure, not permission to
+add CPU readback or upload.
+The real Mutter B4 workload remains separate and cannot be replaced by the
+synthetic texture in this probe.
+
+Gate C is the Host D3D12 production decoder path. It now owns a fixed three-slot
+ring with persistent decode/process queues, processor, fences, bitstream
+uploads, AYUV outputs, RGB shared surfaces, command allocators/lists, and
+opened D3D11 presentation textures. The production harness prints the required
+throughput and failure fields:
+
+```powershell
+.\tools\win\hevc444-probe\build-production-probe.ps1
+.\build\issue3\production-backend-probe.exe 600
+.\build\issue3\production-backend-probe.exe 3600
+```
+
+The decoder path never creates a queue, video processor, fence, shared handle,
+or opened D3D11 resource per frame. If any Gate A/B/C requirement is missing,
+the decision remains `HIGH_PERFORMANCE_HEVC420` or `NOT_RUN`; this repository
+continues to publish:
+
+```text
+production-4k60: false
+```
+
+Validation snapshot for this implementation: Gate A passed both 600 and 3600
+frame runs, with `3840x2160 yuv444p`, zero encode/decode failures, and full
+frame counts. Gate B is `BLOCKED` at
+`d3d12_cuda_import: opaque-fd-texture-import`; B2/B3/B4 remain blocked and no
+CPU fallback is used. Gate C passed both 600 and 3600 frame runs with zero
+decode/process/present failures, `device_removed=0`, three persistent slots,
+and all per-frame creation/copy metrics at zero. The resulting decision is
+`HIGH_PERFORMANCE_HEVC420`; `production-4k60` remains false.
 
 ### 7. Current real Mutter output gate is blocked
 

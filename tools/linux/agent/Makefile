@@ -11,6 +11,7 @@ DESTDIR       ?=
 BINDIR        := $(PREFIX)/bin
 LIBEXECDIR    := $(PREFIX)/libexec
 D3D12_LIBDIR  ?= /opt/appsandbox/wsl-deps
+NV_CODEC_HEADERS ?= /usr/include/ffnvcodec
 SYSTEMDDIR    := /etc/systemd/system
 USERUNITDIR   := /etc/systemd/user
 POINTER_EXT   := appsandbox-pointer@appsandbox
@@ -104,7 +105,8 @@ disable:
 	-systemctl disable --now appsandbox-agent.service
 
 clean:
-	rm -f $(BINS) appsandbox-display-d3d12 d3d12-native-share-probe d3d12-cross-process-share-probe \
+	rm -f $(BINS) appsandbox-display-d3d12 nvenc-hevc444-probe \
+		d3d12-cuda-nvenc-interop-probe d3d12-native-share-probe d3d12-cross-process-share-probe \
 		d3d12-video-encode-probe d3d12-mutter-consumer \
 		mutter-wayland-pattern-client gbm-egl-d3d12-probe \
 		xdg-shell-client-protocol.h \
@@ -117,6 +119,26 @@ d3d12-native-share-probe: d3d12-native-share-probe.cpp
 	$(CXX) -std=c++17 $(CXXFLAGS) -D_WIN32_WINNT=0x0A00 -O2 -Wall -Wextra \
 	       -Werror -Wno-unknown-pragmas -o $@ $< \
 	       $$(pkg-config --cflags --libs DirectX-Headers) -ld3d12 -ldxcore
+
+# Gate A: keep this opt-in because ordinary guest builds do not require the
+# NVIDIA Video Codec SDK headers or runtime. The executable dynamically loads
+# both libcuda.so.1 and libnvidia-encode.so.1.
+nvenc-hevc444-probe: nvenc-hevc444-probe.c
+	$(CC) $(CFLAGS) -I$(NV_CODEC_HEADERS) -o $@ $< $(LDFLAGS) -ldl
+
+nvenc-hevc444-probe-600: nvenc-hevc444-probe
+	LD_LIBRARY_PATH=/usr/lib/wsl/lib:$(LD_LIBRARY_PATH) ./nvenc-hevc444-probe 600
+
+nvenc-hevc444-probe-3600: nvenc-hevc444-probe
+	LD_LIBRARY_PATH=/usr/lib/wsl/lib:$(LD_LIBRARY_PATH) ./nvenc-hevc444-probe 3600
+
+# Gate B: optional diagnostic. It is deliberately outside `all` and does not
+# turn a CPU staging fallback into a zero-copy result.
+d3d12-cuda-nvenc-interop-probe: d3d12-cuda-nvenc-interop-probe.cpp
+	$(CXX) -std=c++17 $(CXXFLAGS) -D_GNU_SOURCE -D_WIN32_WINNT=0x0A00 -DGUID_DEFINED \
+	       -I$(NV_CODEC_HEADERS) -O2 -Wall -Wextra -Werror \
+	       -Wno-unknown-pragmas -o $@ $< $(LDFLAGS) -L$(D3D12_LIBDIR) \
+	       $$(pkg-config --cflags --libs DirectX-Headers) -ld3d12 -ldxcore -ldl
 
 # Cross-process diagnostic: producer and consumer are fork+exec children and
 # exchange native dxg resource/event descriptors with SCM_RIGHTS.  Keep this
@@ -140,6 +162,7 @@ d3d12-video-encode-probe: d3d12-video-encode-probe.cpp hevc444_probe_codec.h
 
 test:
 	python3 test_hevc_headers.py
+	python3 test_issue4_gates.py
 
 # Socket-facing consumer for the isolated Mutter/Mesa producer.  It includes
 # the validated encode consumer implementation but has no producer or daemon
@@ -173,7 +196,8 @@ xdg-shell-protocol.c: $(WAYLAND_XDG_SHELL_XML)
 
 .PHONY: all install install-pointer enable disable clean \
 	test \
-	d3d12-helper \
+	d3d12-helper nvenc-hevc444-probe-600 nvenc-hevc444-probe-3600 \
 	d3d12-native-share-probe d3d12-cross-process-share-probe \
+	nvenc-hevc444-probe d3d12-cuda-nvenc-interop-probe \
 	d3d12-video-encode-probe d3d12-mutter-consumer \
 	mutter-wayland-pattern-client gbm-egl-d3d12-probe
