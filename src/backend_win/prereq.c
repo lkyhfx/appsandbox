@@ -18,9 +18,10 @@ BOOL prereq_is_feature_enabled(const wchar_t *feature_name)
     char buf[PREREQ_PIPE_BUF];
     DWORD total = 0;
     DWORD bytes_read = 0;
+    DWORD exit_code = 1;
 
     _snwprintf_s(cmd, 512, _TRUNCATE,
-        L"C:\\Windows\\System32\\dism.exe /online /Get-FeatureInfo /FeatureName:%ls",
+        L"C:\\Windows\\System32\\dism.exe /English /online /Get-FeatureInfo /FeatureName:%ls",
         feature_name);
 
     ZeroMemory(&sa, sizeof(sa));
@@ -59,12 +60,16 @@ BOOL prereq_is_feature_enabled(const wchar_t *feature_name)
     buf[total] = '\0';
 
     WaitForSingleObject(pi.hProcess, 10000);
+    GetExitCodeProcess(pi.hProcess, &exit_code);
 
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
     CloseHandle(read_pipe);
 
-    if (strstr(buf, "State : Enabled") || strstr(buf, "State : Enable Pending"))
+    /* /English makes these state tokens stable on non-English Windows hosts.
+       A failed DISM query must never be mistaken for an enabled feature. */
+    if (exit_code == 0 &&
+        (strstr(buf, "State : Enabled") || strstr(buf, "State : Enable Pending")))
         enabled = TRUE;
 
     return enabled;
