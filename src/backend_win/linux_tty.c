@@ -1,8 +1,5 @@
 #include "linux_tty.h"
 
-#include "ui.h"
-
-#include <limits.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -12,7 +9,6 @@
    the server: CreateFileW is retried until the guest/HCS side appears. */
 #define LINUX_TTY_PIPE_PREFIX L"\\\\.\\pipe\\"
 #define LINUX_TTY_RETRY_MS    250
-#define LINUX_TTY_RENDER_LIMIT (1024 * 1024)
 #define LINUX_TTY_STOP_WAIT_MS 5000
 
 typedef struct LinuxTtyCapture {
@@ -27,13 +23,6 @@ typedef struct LinuxTtyCapture {
     wchar_t pipe_name[512];
     wchar_t tty_path[MAX_PATH];
 
-    /* Owned by the reader thread.  It contains bytes for the current logical
-       line, not a UTF-8 string; line boundaries must be found before decoding. */
-    unsigned char *line;
-    size_t line_len;
-    size_t line_cap;
-    BOOL pending_cr;
-    BOOL line_discarded;
     uint64_t raw_offset;
 } LinuxTtyCapture;
 
@@ -56,202 +45,15 @@ static BOOL tty_is_stopping(LinuxTtyCapture *capture)
 static void tty_log_error(LinuxTtyCapture *capture, const wchar_t *what,
                           DWORD error)
 {
-    ui_log(L"[TTY:%s] %s failed (error=%lu). Capture will continue where possible.",
-           capture->vm_name, what, (unsigned long)error);
+    wchar_t message[512];
+    swprintf_s(message, ARRAYSIZE(message),
+               L"[TTY:%s] %s failed (error=%lu).\n",
+               capture->vm_name, what, (unsigned long)error);
+    OutputDebugStringW(message);
 }
 
-/* Return the VM-owned directory from either disk.vhdx or a snapshot/branch
-   VHDX.  This mirrors asb_core.c's get_vm_disk_root without coupling the
-   capture module to its private helper. */
-static BOOL tty_get_vm_disk_root(const wchar_t *disk_path, wchar_t *out)
-{
-    wchar_t *slash;
-    BOOL branch;
-    size_t len;
-
-    if (!disk_path || !disk_path[0] || wcslen(disk_path) >= MAX_PATH)
-        return FALSE;
-
-    wcscpy_s(out, MAX_PATH, disk_path);
-    slash = wcsrchr(out, L'\\');
-    if (!slash) return FALSE;
-
-    branch = (_wcsnicmp(slash + 1, L"branch_", 7) == 0 ||
-              _wcsnicmp(slash + 1, L"snapshot_", 9) == 0);
-    *slash = L'\0';
-    len = wcslen(out);
-    if (branch && len >= 10 && _wcsicmp(out + len - 10, L"\\snapshots") == 0)
-        out[len - 10] = L'\0';
-
-    /* Never write a diagnostic file into a drive root if a malformed path was
-       persisted. */
-    return wcslen(out) > 3;
-}
-
-static BOOL tty_append_byte(LinuxTtyCapture *capture, unsigned char byte)
-{
-    unsigned char *new_line;
-    size_t new_cap;
-
-    if (capture->line_len < capture->line_cap) {
-        capture->line[capture->line_len++] = byte;
-        return TRUE;
-    }
-
-    new_cap = capture->line_cap ? capture->line_cap * 2 : 256;
-    if (new_cap > LINUX_TTY_RENDER_LIMIT) new_cap = LINUX_TTY_RENDER_LIMIT;
-    if (new_cap < capture->line_cap || new_cap > SIZE_MAX / 2)
-        return FALSE;
-    new_line = (unsigned char *)realloc(capture->line, new_cap);
-    if (!new_line) return FALSE;
-
-    capture->line = new_line;
-    capture->line_cap = new_cap;
-    capture->line[capture->line_len++] = byte;
-    return TRUE;
-}
-
-/* Convert one complete raw line for the existing wide host log API.  Valid
-   UTF-8 is rendered normally.  If the line is not valid UTF-8, render every
-   byte as ASCII (printable bytes stay readable and high/control bytes become
-   \xNN), so malformed guest output can never make the reader fail. */
-static wchar_t *tty_line_for_log(const unsigned char *line, size_t line_len)
-{
-    int utf8_len;
-    int wide_len;
-    wchar_t *out;
-    size_t i;
-    size_t out_len = 0;
-
-    if (line_len > INT_MAX) return NULL;
-    utf8_len = (int)line_len;
-    wide_len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
-                                   (LPCCH)line, utf8_len, NULL, 0);
-
-    if (wide_len > 0) {
-        wchar_t *decoded = (wchar_t *)malloc((size_t)wide_len * sizeof(wchar_t));
-        if (!decoded) return NULL;
-        if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
-                                (LPCCH)line, utf8_len,
-                                decoded, wide_len) != wide_len) {
-            free(decoded);
-            decoded = NULL;
-            wide_len = 0;
-        }
-
-        if (decoded) {
-            /* A decoded NUL would truncate ui_log's %s argument.  Reserve
-               four characters for its visible escaped form. */
-            for (i = 0; i < (size_t)wide_len; i++)
-                out_len += decoded[i] == L'\0' ? 4 : 1;
-
-            out = (wchar_t *)malloc((out_len + 1) * sizeof(wchar_t));
-            if (!out) {
-                free(decoded);
-                return NULL;
-            }
-            out_len = 0;
-            for (i = 0; i < (size_t)wide_len; i++) {
-                if (decoded[i] == L'\0') {
-                    out[out_len++] = L'\\';
-                    out[out_len++] = L'x';
-                    out[out_len++] = L'0';
-                    out[out_len++] = L'0';
-                } else {
-                    out[out_len++] = decoded[i];
-                }
-            }
-            out[out_len] = L'\0';
-            free(decoded);
-            return out;
-        }
-    }
-
-    /* Invalid UTF-8: use an ASCII escaped representation.  This also avoids
-       passing embedded NUL bytes to the wide variadic logger. */
-    if (line_len > (SIZE_MAX - 1) / 4) return NULL;
-    out = (wchar_t *)malloc((line_len * 4 + 1) * sizeof(wchar_t));
-    if (!out) return NULL;
-    for (i = 0; i < line_len; i++) {
-        unsigned char byte = line[i];
-        if (byte >= 0x20 && byte <= 0x7e && byte != '\\') {
-            out[out_len++] = (wchar_t)byte;
-        } else {
-            static const wchar_t hex[] = L"0123456789ABCDEF";
-            out[out_len++] = L'\\';
-            out[out_len++] = L'x';
-            out[out_len++] = hex[(byte >> 4) & 0xf];
-            out[out_len++] = hex[byte & 0xf];
-        }
-    }
-    out[out_len] = L'\0';
-    return out;
-}
-
-static void tty_emit_line(LinuxTtyCapture *capture)
-{
-    if (capture->line_discarded) {
-        capture->line_discarded = FALSE;
-        capture->line_len = 0;
-        return;
-    }
-    wchar_t *line = tty_line_for_log(capture->line, capture->line_len);
-    if (line) {
-        ui_log(L"[TTY:%s] %s", capture->vm_name, line);
-        free(line);
-    } else {
-        /* The raw stream remains intact even if diagnostic rendering runs out
-           of memory.  Keep the log event line-oriented and non-fatal. */
-        ui_log(L"[TTY:%s] <line could not be rendered>", capture->vm_name);
-    }
-    capture->line_len = 0;
-}
-
-static void tty_process_bytes(LinuxTtyCapture *capture,
-                              const unsigned char *bytes, DWORD count)
-{
-    DWORD i;
-    for (i = 0; i < count; i++) {
-        unsigned char byte = bytes[i];
-
-        if (capture->pending_cr) {
-            capture->pending_cr = FALSE;
-            if (byte == '\n') {
-                /* CRLF is one line terminator. */
-                tty_emit_line(capture);
-                continue;
-            }
-            /* A bare CR ended the previous line.  Re-process this byte as
-               the first byte of the next line. */
-            tty_emit_line(capture);
-        }
-
-        if (byte == '\r') {
-            capture->pending_cr = TRUE;
-        } else if (byte == '\n') {
-            tty_emit_line(capture);
-        } else if (capture->line_discarded) {
-            continue;
-        } else if (capture->line_len >= LINUX_TTY_RENDER_LIMIT ||
-                   !tty_append_byte(capture, byte)) {
-            BOOL limit = capture->line_len >= LINUX_TTY_RENDER_LIMIT;
-            /* Do not let an unbounded guest line take down the reader.  The
-               raw file is already complete; discard only the host rendering
-               of this line until its next terminator. */
-            capture->line_len = 0;
-            capture->line_cap = 0;
-            free(capture->line);
-            capture->line = NULL;
-            capture->line_discarded = TRUE;
-            if (limit)
-                ui_log(L"[TTY:%s] <line exceeded render limit; raw bytes preserved>",
-                       capture->vm_name);
-            else
-                ui_log(L"[TTY:%s] <line could not be rendered; raw bytes preserved>",
-                       capture->vm_name);
-        }
-    }
-}
+/* The COM1 stream is kept as raw bytes only.  It is never forwarded to the
+   application log callback or decoded for the main window. */
 
 static BOOL tty_write_raw(LinuxTtyCapture *capture,
                           const unsigned char *bytes, DWORD count)
@@ -395,8 +197,7 @@ static DWORD WINAPI tty_thread_proc(LPVOID parameter)
     LinuxTtyCapture *capture = (LinuxTtyCapture *)parameter;
     unsigned char buffer[16 * 1024];
 
-    /* Opening a log on a slow or unavailable VM disk never holds the global
-       capture lock. The stop caller can detach after its bounded wait. */
+    /* Opening the diagnostic log never holds the global capture lock. */
     capture->tty_file = CreateFileW(capture->tty_path, GENERIC_WRITE,
                                     FILE_SHARE_READ | FILE_SHARE_WRITE |
                                     FILE_SHARE_DELETE,
@@ -412,29 +213,19 @@ static DWORD WINAPI tty_thread_proc(LPVOID parameter)
 
         if (pipe == INVALID_HANDLE_VALUE) break;
         InterlockedExchangePointer((PVOID volatile *)&capture->pipe, pipe);
-        ui_log(L"[TTY:%s] COM1 connected", capture->vm_name);
-
         while (!tty_is_stopping(capture)) {
             if (!tty_read_once(capture, pipe, buffer, sizeof(buffer), &count))
                 break;
             if (count == 0) break;
 
-            /* Raw bytes are written exactly as received; host log rendering
-               is a separate best-effort path. */
+            /* Preserve the guest's raw bytes without routing them to ui_log. */
             (void)tty_write_raw(capture, buffer, count);
-            tty_process_bytes(capture, buffer, count);
         }
 
         InterlockedExchangePointer((PVOID volatile *)&capture->pipe, NULL);
         CloseHandle(pipe);
-        if (!tty_is_stopping(capture))
-            ui_log(L"[TTY:%s] COM1 disconnected; reconnecting", capture->vm_name);
     }
 
-    if (capture->pending_cr)
-        tty_emit_line(capture);
-    free(capture->line);
-    capture->line = NULL;
     if (capture->tty_file != INVALID_HANDLE_VALUE) {
         CloseHandle(capture->tty_file);
         capture->tty_file = INVALID_HANDLE_VALUE;
@@ -446,15 +237,43 @@ static DWORD WINAPI tty_thread_proc(LPVOID parameter)
 static BOOL tty_prepare_paths(LinuxTtyCapture *capture,
                               const VmInstance *instance)
 {
-    wchar_t root[MAX_PATH];
+    wchar_t exe_path[MAX_PATH], logs_dir[MAX_PATH], vm_dir[MAX_PATH];
+    DWORD length = GetModuleFileNameW(NULL, exe_path, ARRAYSIZE(exe_path));
+    wchar_t *slash;
+    size_t name_len;
 
-    if (!tty_get_vm_disk_root(instance->vhdx_path, root))
+    if (!length || length >= ARRAYSIZE(exe_path)) return FALSE;
+    name_len = wcslen(instance->name);
+    if (!name_len || wcscmp(instance->name, L".") == 0 ||
+        wcscmp(instance->name, L"..") == 0 ||
+        instance->name[name_len - 1] == L'.' ||
+        instance->name[name_len - 1] == L' ') {
+        SetLastError(ERROR_INVALID_NAME);
         return FALSE;
+    }
+    for (size_t i = 0; i < name_len; i++) {
+        if (instance->name[i] < 32 || wcschr(L"\\/:*?\"<>|", instance->name[i])) {
+            SetLastError(ERROR_INVALID_NAME);
+            return FALSE;
+        }
+    }
+    slash = wcsrchr(exe_path, L'\\');
+    if (!slash) return FALSE;
+    *slash = L'\0';
     if (swprintf_s(capture->pipe_name, ARRAYSIZE(capture->pipe_name),
                    L"%s%s.com1", LINUX_TTY_PIPE_PREFIX, instance->name) < 0)
         return FALSE;
+    if (swprintf_s(logs_dir, ARRAYSIZE(logs_dir),
+                   L"%s\\tty-logs", exe_path) < 0 ||
+        swprintf_s(vm_dir, ARRAYSIZE(vm_dir),
+                   L"%s\\%s", logs_dir, instance->name) < 0)
+        return FALSE;
+    if (!CreateDirectoryW(logs_dir, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
+        return FALSE;
+    if (!CreateDirectoryW(vm_dir, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
+        return FALSE;
     if (swprintf_s(capture->tty_path, ARRAYSIZE(capture->tty_path),
-                   L"%s\\tty.log", root) < 0)
+                   L"%s\\tty.log", vm_dir) < 0)
         return FALSE;
     return TRUE;
 }
@@ -476,8 +295,6 @@ void linux_tty_start(VmInstance *instance)
 
     capture = (LinuxTtyCapture *)calloc(1, sizeof(*capture));
     if (!capture) {
-        ui_log(L"[TTY:%s] capture allocation failed; VM continues without TTY capture.",
-               instance->name);
         ReleaseSRWLockExclusive(&g_linux_tty_lock);
         return;
     }
@@ -490,11 +307,10 @@ void linux_tty_start(VmInstance *instance)
     if (!capture->stop_event || !capture->ready_event ||
         !tty_prepare_paths(capture, instance)) {
         DWORD error = GetLastError();
+        tty_log_error(capture, L"capture setup", error);
         if (capture->stop_event) CloseHandle(capture->stop_event);
         if (capture->ready_event) CloseHandle(capture->ready_event);
         free(capture);
-        ui_log(L"[TTY:%s] capture setup failed (error=%lu); VM continues without TTY capture.",
-               instance->name, (unsigned long)error);
         ReleaseSRWLockExclusive(&g_linux_tty_lock);
         return;
     }
@@ -502,24 +318,21 @@ void linux_tty_start(VmInstance *instance)
     thread = CreateThread(NULL, 0, tty_thread_proc, capture, CREATE_SUSPENDED, NULL);
     if (!thread) {
         DWORD error = GetLastError();
+        tty_log_error(capture, L"reader thread creation", error);
         if (capture->tty_file != INVALID_HANDLE_VALUE)
             CloseHandle(capture->tty_file);
         CloseHandle(capture->ready_event);
         CloseHandle(capture->stop_event);
         free(capture);
-        ui_log(L"[TTY:%s] reader thread creation failed (error=%lu); VM continues without TTY capture.",
-               instance->name, (unsigned long)error);
         ReleaseSRWLockExclusive(&g_linux_tty_lock);
         return;
     }
 
     capture->thread = thread;
     instance->linux_tty_capture = capture;
-    ui_log(L"[TTY:%s] capture starting", capture->vm_name);
-    ui_log(L"[TTY:%s] pipe=%s", capture->vm_name, capture->pipe_name);
-    ui_log(L"[TTY:%s] raw_log=%s", capture->vm_name, capture->tty_path);
     if (ResumeThread(thread) == (DWORD)-1) {
         DWORD error = GetLastError();
+        tty_log_error(capture, L"reader thread start", error);
         instance->linux_tty_capture = NULL;
         TerminateThread(thread, 1); /* suspended thread has not run */
         CloseHandle(thread);
@@ -527,8 +340,6 @@ void linux_tty_start(VmInstance *instance)
         CloseHandle(capture->stop_event);
         free(capture);
         ReleaseSRWLockExclusive(&g_linux_tty_lock);
-        ui_log(L"[TTY:%s] reader thread start failed (error=%lu); VM continues without TTY capture.",
-               instance->name, (unsigned long)error);
         return;
     }
     ReleaseSRWLockExclusive(&g_linux_tty_lock);
@@ -571,10 +382,7 @@ void linux_tty_stop(VmInstance *instance)
        A stalled filesystem cannot hold other VMs or shutdown indefinitely. */
     wait_result = WaitForSingleObject(capture->thread, LINUX_TTY_STOP_WAIT_MS);
     CloseHandle(capture->thread);
-    if (wait_result == WAIT_OBJECT_0)
-        ui_log(L"[TTY:%s] capture stopped", capture->vm_name);
-    else
-        ui_log(L"[TTY:%s] stop timed out; reader will release resources on exit",
-               capture->vm_name);
+    if (wait_result != WAIT_OBJECT_0)
+        tty_log_error(capture, L"reader thread stop", wait_result);
     tty_release(capture);
 }
