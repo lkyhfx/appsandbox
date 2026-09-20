@@ -40,6 +40,9 @@
       <AdditionalDependencies>d3d12.lib;dxgi.lib;dxguid.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
-  <ItemGroup><ClCompile Include="hevc444-encode-probe.cpp" /></ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="hevc444-encode-probe.cpp" />
+    <ClInclude Include="d3d12video_hevc1_compat.h" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

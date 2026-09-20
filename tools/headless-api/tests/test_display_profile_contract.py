@@ -1,5 +1,6 @@
 import unittest
 from pathlib import Path
+import subprocess
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -122,17 +123,59 @@ class DisplayProfileContractTests(unittest.TestCase):
     def test_native_encode_probe_has_real_submission_gate(self):
         source = self.read("tools", "win", "hevc444-encode-probe",
                            "hevc444-encode-probe.cpp")
+        compat = self.read("tools", "win", "hevc444-encode-probe",
+                           "d3d12video_hevc1_compat.h")
         for marker in (
             "CreateVideoEncoder",
             "CreateVideoEncoderHeap",
             "EncodeFrame",
             "ResolveEncoderOutputMetadata",
+            "MinSupportedLevel.pHEVCLevelSetting",
+            "MaxSupportedLevel.pHEVCLevelSetting",
+            "D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC1",
+            "D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC1",
+            "encode_queue->Wait(copy_fence.Get(), 1)",
+            "EncodeErrorFlags",
+            "EncodedBitstreamWrittenBytesCount",
+            "parse_hevc444_sequence_headers",
             "host_d3d12_hevc444_actual_encode",
             "host_d3d12_hevc444_4k60",
         ):
             self.assertIn(marker, source)
+        self.assertIn("install_hevc1_support", compat)
+        self.assertIn("install_hevc1_picture_control", compat)
+        self.assertIn("pHEVCSupport1", compat)
+        self.assertIn("pHEVCPicData1", compat)
+        self.assertRegex(
+            source,
+            r"(?s)D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC1\s+limits"
+            r".*?install_hevc1_support\(&query, &limits\)",
+        )
+        self.assertRegex(
+            source,
+            r"(?s)StateBefore = D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE"
+            r".*?StateAfter = D3D12_RESOURCE_STATE_COMMON",
+        )
         self.assertIn("D3D12_VIDEO_ENCODER_CODEC_HEVC", source)
         self.assertIn("DXGI_FORMAT_AYUV", source)
+
+    def test_native_encode_probe_runtime_is_fail_closed(self):
+        exe = (ROOT / "tools" / "win" / "hevc444-encode-probe" / "bin" /
+               "Release" / "appsandbox-hevc444-encode-probe.exe")
+        if not exe.exists():
+            self.skipTest("Windows hardware probe has not been built")
+        result = subprocess.run([str(exe)], capture_output=True, text=True,
+                                timeout=30, check=False)
+        output = result.stdout + result.stderr
+        self.assertIn("host_d3d12_hevc444_4k60=", output)
+        self.assertIn("host_d3d12_hevc444_actual_encode=", output)
+        if "host_d3d12_hevc444_actual_encode=PASS" in output:
+            self.assertIn("host_d3d12_hevc444_encode_error_flags=0x0", output)
+            self.assertRegex(output, r"host_d3d12_hevc444_encoded_bytes=[1-9][0-9]*")
+            self.assertIn("host_d3d12_hevc444_sequence_header_444=1", output)
+            self.assertIn("host_d3d12_hevc444_irap=1", output)
+        else:
+            self.assertIn("host_d3d12_hevc444_actual_encode=BLOCKED", output)
 
     def test_render_failure_is_cross_thread_fatal_and_reconnectable(self):
         source = self.read("src", "backend_win", "vm_display_idd.c")

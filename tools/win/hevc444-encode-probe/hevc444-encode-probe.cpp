@@ -14,15 +14,23 @@
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
+#include "../hevc444-probe/hevc_access_unit_probe.h"
+#include "../../linux/agent/hevc444_probe_codec.h"
+#include "d3d12video_hevc1_compat.h"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <vector>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "dxguid.lib")
 
 using Microsoft::WRL::ComPtr;
+using appsandbox_d3d12_hevc1::D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC1;
+using appsandbox_d3d12_hevc1::D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC1;
 
 namespace {
 
@@ -138,8 +146,11 @@ static bool create_readback_resource(ID3D12Device *device, UINT64 size,
 static bool find_hevc444_configuration(
     ID3D12VideoDevice3 *video,
     D3D12_VIDEO_ENCODER_PROFILE_DESC profile,
-    D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC *configuration)
+    D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC *configuration,
+    D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC1 *picture_defaults)
 {
+    if (!configuration || !picture_defaults)
+        return false;
     const D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_CUSIZE cu_sizes[] = {
         D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_CUSIZE_8x8,
         D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_CUSIZE_16x16,
@@ -158,7 +169,7 @@ static bool find_hevc444_configuration(
                 for (const auto max_tu : tu_sizes) {
                     if (static_cast<int>(max_tu) < static_cast<int>(min_tu)) continue;
                     for (UINT depth = 0; depth <= 4; ++depth) {
-                        D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC limits = {};
+                        D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC1 limits = {};
                         limits.MinLumaCodingUnitSize = min_cu;
                         limits.MaxLumaCodingUnitSize = max_cu;
                         limits.MinLumaTransformUnitSize = min_tu;
@@ -167,28 +178,94 @@ static bool find_hevc444_configuration(
                             static_cast<UCHAR>(depth);
                         limits.max_transform_hierarchy_depth_intra =
                             static_cast<UCHAR>(depth);
+
                         D3D12_FEATURE_DATA_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT query = {};
                         query.NodeIndex = 0;
                         query.Codec = D3D12_VIDEO_ENCODER_CODEC_HEVC;
                         query.Profile = profile;
-                        query.CodecSupportLimits.DataSize = sizeof(limits);
-                        query.CodecSupportLimits.pHEVCSupport = &limits;
+                        appsandbox_d3d12_hevc1::install_hevc1_support(&query, &limits);
                         const HRESULT hr = video->CheckFeatureSupport(
                             D3D12_FEATURE_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT,
                             &query, sizeof(query));
-                        if (SUCCEEDED(hr) && query.IsSupported) {
-                            configuration->ConfigurationFlags =
-                                D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_FLAG_NONE;
-                            configuration->MinLumaCodingUnitSize = limits.MinLumaCodingUnitSize;
-                            configuration->MaxLumaCodingUnitSize = limits.MaxLumaCodingUnitSize;
-                            configuration->MinLumaTransformUnitSize = limits.MinLumaTransformUnitSize;
-                            configuration->MaxLumaTransformUnitSize = limits.MaxLumaTransformUnitSize;
-                            configuration->max_transform_hierarchy_depth_inter =
-                                limits.max_transform_hierarchy_depth_inter;
-                            configuration->max_transform_hierarchy_depth_intra =
-                                limits.max_transform_hierarchy_depth_intra;
-                            return true;
+                        if (FAILED(hr) || query.IsSupported == FALSE)
+                            continue;
+
+                        /* The HEVC1 contract returns masks for all syntax fields
+                           used by Main444. Select the first legal value rather
+                           than sending zeroes that may be outside the driver
+                           advertised domain. */
+                        std::uint32_t config_flags = 0;
+                        std::uint32_t picture_flags = 0;
+                        if (!appsandbox_hevc444_probe::apply_required_configuration_flags(
+                                static_cast<std::uint32_t>(limits.SupportFlags),
+                                limits.SupportFlags1, &config_flags, &picture_flags))
+                            continue;
+
+                        const auto first_allowed = [](UINT mask, unsigned max,
+                                                      UCHAR *value) {
+                            for (unsigned candidate = 0; candidate <= max; ++candidate) {
+                                if ((mask & (UINT{1} << candidate)) != 0) {
+                                    *value = static_cast<UCHAR>(candidate);
+                                    return true;
+                                }
+                            }
+                            return false;
+                        };
+                        const auto first_qp_offset = [](UINT mask, CHAR *value) {
+                            for (int candidate = -12; candidate <= 12; ++candidate) {
+                                const unsigned bit = static_cast<unsigned>(candidate + 12);
+                                if ((mask & (UINT{1} << bit)) != 0) {
+                                    *value = static_cast<CHAR>(candidate);
+                                    return true;
+                                }
+                            }
+                            return false;
+                        };
+                        D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC1 picture = {};
+                        if (!first_allowed(limits.allowed_diff_cu_chroma_qp_offset_depth_values,
+                                           3, &picture.diff_cu_chroma_qp_offset_depth) ||
+                            !first_allowed(limits.allowed_log2_sao_offset_scale_luma_values,
+                                           6, &picture.log2_sao_offset_scale_luma) ||
+                            !first_allowed(limits.allowed_log2_sao_offset_scale_chroma_values,
+                                           6, &picture.log2_sao_offset_scale_chroma) ||
+                            !first_allowed(limits.allowed_log2_max_transform_skip_block_size_minus2_values,
+                                           3, &picture.log2_max_transform_skip_block_size_minus2) ||
+                            !first_allowed(limits.allowed_chroma_qp_offset_list_len_minus1_values,
+                                           5, &picture.chroma_qp_offset_list_len_minus1))
+                            continue;
+                        const unsigned list_count = picture.chroma_qp_offset_list_len_minus1 + 1;
+                        bool picture_values_valid = true;
+                        for (unsigned i = 0; i < list_count; ++i) {
+                            if (!first_qp_offset(limits.allowed_cb_qp_offset_list_values[i],
+                                                 &picture.cb_qp_offset_list[i]) ||
+                                !first_qp_offset(limits.allowed_cr_qp_offset_list_values[i],
+                                                 &picture.cr_qp_offset_list[i])) {
+                                picture_values_valid = false;
+                                break;
+                            }
                         }
+                        if (!picture_values_valid)
+                            continue;
+
+                        picture.Flags =
+                            static_cast<D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC_FLAGS>(picture_flags);
+                        configuration->ConfigurationFlags =
+                            static_cast<D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC_FLAGS>(config_flags);
+                        configuration->MinLumaCodingUnitSize = limits.MinLumaCodingUnitSize;
+                        configuration->MaxLumaCodingUnitSize = limits.MaxLumaCodingUnitSize;
+                        configuration->MinLumaTransformUnitSize = limits.MinLumaTransformUnitSize;
+                        configuration->MaxLumaTransformUnitSize = limits.MaxLumaTransformUnitSize;
+                        configuration->max_transform_hierarchy_depth_inter =
+                            limits.max_transform_hierarchy_depth_inter;
+                        configuration->max_transform_hierarchy_depth_intra =
+                            limits.max_transform_hierarchy_depth_intra;
+                        *picture_defaults = picture;
+                        std::printf("PASS stage=hevc444-codec-config-support flags=0x%08x "
+                                    "flags1=0x%08x picture_flags=0x%08x\n",
+                                    static_cast<unsigned>(limits.SupportFlags),
+                                    static_cast<unsigned>(limits.SupportFlags1),
+                                    static_cast<unsigned>(picture_flags));
+                        return true;
                     }
                 }
             }
@@ -200,6 +277,7 @@ static bool find_hevc444_configuration(
 static bool run_actual_encode(ID3D12Device *device, ID3D12VideoDevice3 *video,
                               D3D12_VIDEO_ENCODER_PROFILE_DESC profile,
                               D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC config,
+                              D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC1 picture_defaults,
                               UINT64 metadata_bytes, UINT64 bitstream_alignment)
 {
     D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION config_union = {};
@@ -279,6 +357,13 @@ static bool run_actual_encode(ID3D12Device *device, ID3D12VideoDevice3 *video,
         std::fputs("BLOCKED stage=host-d3d12-encode-upload\n", stderr);
         return false;
     }
+    ComPtr<ID3D12Resource> bitstream_readback;
+    ComPtr<ID3D12Resource> metadata_readback;
+    if (!create_readback_resource(device, bitstream_size, &bitstream_readback) ||
+        !create_readback_resource(device, metadata_size, &metadata_readback)) {
+        std::fputs("BLOCKED stage=host-d3d12-encode-readback-resources\n", stderr);
+        return false;
+    }
     void *mapped = nullptr;
     D3D12_RANGE no_read = {0, 0};
     if (FAILED(upload->Map(0, &no_read, &mapped))) return false;
@@ -324,6 +409,11 @@ static bool run_actual_encode(ID3D12Device *device, ID3D12VideoDevice3 *video,
     if (FAILED(copy_list->Close())) return false;
     ID3D12CommandList *copy_lists[] = {copy_list.Get()};
     copy_queue->ExecuteCommandLists(1, copy_lists);
+    ComPtr<ID3D12Fence> copy_fence;
+    if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                   IID_PPV_ARGS(&copy_fence))) ||
+        FAILED(copy_queue->Signal(copy_fence.Get(), 1)))
+        return false;
 
     D3D12_COMMAND_QUEUE_DESC encode_queue_desc = {};
     encode_queue_desc.Type = D3D12_COMMAND_LIST_TYPE_VIDEO_ENCODE;
@@ -359,12 +449,12 @@ static bool run_actual_encode(ID3D12Device *device, ID3D12VideoDevice3 *video,
     sequence.PictureTargetResolution = resolution;
     sequence.SelectedLayoutMode = D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_FULL_FRAME;
     sequence.CodecGopSequence = gop;
-    D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC picture_data = {};
+    D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC1 picture_data =
+        picture_defaults;
     picture_data.FrameType = D3D12_VIDEO_ENCODER_FRAME_TYPE_HEVC_I_FRAME;
     picture_data.PictureOrderCountNumber = 0;
     D3D12_VIDEO_ENCODER_PICTURE_CONTROL_DESC picture = {};
-    picture.PictureControlCodecData.DataSize = sizeof(picture_data);
-    picture.PictureControlCodecData.pHEVCPicData = &picture_data;
+    appsandbox_d3d12_hevc1::install_hevc1_picture_control(&picture, &picture_data);
     D3D12_VIDEO_ENCODER_ENCODEFRAME_INPUT_ARGUMENTS encode_input = {};
     encode_input.SequenceControlDesc = sequence;
     encode_input.PictureControlDesc = picture;
@@ -388,8 +478,20 @@ static bool run_actual_encode(ID3D12Device *device, ID3D12VideoDevice3 *video,
     D3D12_VIDEO_ENCODER_RESOLVE_METADATA_OUTPUT_ARGUMENTS resolve_output = {};
     resolve_output.ResolvedLayoutMetadata.pBuffer = metadata_resolved.Get();
     encode_list->ResolveEncoderOutputMetadata(&resolve_input, &resolve_output);
+    D3D12_RESOURCE_BARRIER output_barrier = {};
+    output_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    output_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    output_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE;
+    output_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    output_barrier.Transition.pResource = bitstream.Get();
+    encode_list->ResourceBarrier(1, &output_barrier);
+    output_barrier.Transition.pResource = metadata_hw.Get();
+    encode_list->ResourceBarrier(1, &output_barrier);
+    output_barrier.Transition.pResource = metadata_resolved.Get();
+    encode_list->ResourceBarrier(1, &output_barrier);
     if (FAILED(encode_list->Close())) return false;
     ID3D12CommandList *encode_lists[] = {encode_list.Get()};
+    encode_queue->Wait(copy_fence.Get(), 1);
     encode_queue->ExecuteCommandLists(1, encode_lists);
     ComPtr<ID3D12Fence> fence;
     if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
@@ -403,8 +505,6 @@ static bool run_actual_encode(ID3D12Device *device, ID3D12VideoDevice3 *video,
     CloseHandle(event_handle);
     if (FAILED(wait_registration)) return false;
 
-    ComPtr<ID3D12Resource> bitstream_readback;
-    if (!create_readback_resource(device, bitstream_size, &bitstream_readback)) return false;
     ComPtr<ID3D12CommandAllocator> readback_allocator;
     ComPtr<ID3D12GraphicsCommandList> readback_list;
     if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -412,8 +512,16 @@ static bool run_actual_encode(ID3D12Device *device, ID3D12VideoDevice3 *video,
         FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
                                           readback_allocator.Get(), nullptr,
                                           IID_PPV_ARGS(&readback_list)))) return false;
-    readback_list->CopyBufferRegion(bitstream_readback.Get(), 0, bitstream.Get(), 0,
-                                    bitstream_size);
+    D3D12_RESOURCE_BARRIER metadata_barrier = {};
+    metadata_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    metadata_barrier.Transition.pResource = metadata_resolved.Get();
+    metadata_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    metadata_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    metadata_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    readback_list->ResourceBarrier(1, &metadata_barrier);
+    readback_list->CopyBufferRegion(metadata_readback.Get(), 0,
+                                    metadata_resolved.Get(), 0,
+                                    sizeof(D3D12_VIDEO_ENCODER_OUTPUT_METADATA));
     if (FAILED(readback_list->Close())) return false;
     ID3D12CommandList *readback_lists[] = {readback_list.Get()};
     copy_queue->Wait(fence.Get(), signal_value);
@@ -428,17 +536,81 @@ static bool run_actual_encode(ID3D12Device *device, ID3D12VideoDevice3 *video,
     if (SUCCEEDED(readback_wait)) WaitForSingleObject(event_handle, INFINITE);
     CloseHandle(event_handle);
     if (FAILED(readback_wait)) return false;
-    void *encoded = nullptr;
-    const D3D12_RANGE encoded_range = {0, bitstream_size};
-    if (FAILED(bitstream_readback->Map(0, &encoded_range, &encoded))) return false;
-    bool has_output = false;
-    const auto *bytes = static_cast<const std::uint8_t *>(encoded);
-    for (UINT64 i = 0; i < bitstream_size; ++i) {
-        if (bytes[i] != 0) { has_output = true; break; }
+    void *metadata_mapped = nullptr;
+    const D3D12_RANGE metadata_range =
+        {0, sizeof(D3D12_VIDEO_ENCODER_OUTPUT_METADATA)};
+    if (FAILED(metadata_readback->Map(0, &metadata_range, &metadata_mapped)))
+        return false;
+    const auto *metadata = static_cast<const D3D12_VIDEO_ENCODER_OUTPUT_METADATA *>(
+        metadata_mapped);
+    const UINT64 written_bytes = metadata->EncodedBitstreamWrittenBytesCount;
+    const bool metadata_ok = metadata->EncodeErrorFlags == 0 &&
+        written_bytes > 0 && written_bytes <= bitstream_size;
+    std::printf("host_d3d12_hevc444_encode_error_flags=0x%llx\n",
+                static_cast<unsigned long long>(metadata->EncodeErrorFlags));
+    std::printf("host_d3d12_hevc444_encoded_bytes=%llu\n",
+                static_cast<unsigned long long>(written_bytes));
+    metadata_readback->Unmap(0, nullptr);
+    if (!metadata_ok) {
+        std::printf("host_d3d12_hevc444_encode_submission=0\n");
+        return false;
     }
+
+    if (FAILED(readback_allocator->Reset()) ||
+        FAILED(readback_list->Reset(readback_allocator.Get(), nullptr)))
+        return false;
+    D3D12_RESOURCE_BARRIER bitstream_barrier = {};
+    bitstream_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    bitstream_barrier.Transition.pResource = bitstream.Get();
+    bitstream_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    bitstream_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    bitstream_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    readback_list->ResourceBarrier(1, &bitstream_barrier);
+    readback_list->CopyBufferRegion(bitstream_readback.Get(), 0, bitstream.Get(), 0,
+                                    written_bytes);
+    if (FAILED(readback_list->Close())) return false;
+    copy_queue->ExecuteCommandLists(1, readback_lists);
+    const UINT64 bitstream_readback_value = signal_value + 1;
+    if (FAILED(copy_queue->Signal(readback_fence.Get(), bitstream_readback_value)))
+        return false;
+    event_handle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!event_handle) return false;
+    const HRESULT bitstream_wait = readback_fence->SetEventOnCompletion(
+        bitstream_readback_value, event_handle);
+    if (SUCCEEDED(bitstream_wait)) WaitForSingleObject(event_handle, INFINITE);
+    CloseHandle(event_handle);
+    if (FAILED(bitstream_wait)) return false;
+
+    void *encoded = nullptr;
+    const D3D12_RANGE encoded_range = {0, written_bytes};
+    if (FAILED(bitstream_readback->Map(0, &encoded_range, &encoded))) return false;
+    const auto *bytes = static_cast<const std::uint8_t *>(encoded);
+    std::vector<std::uint8_t> stream(bytes, bytes + written_bytes);
     bitstream_readback->Unmap(0, nullptr);
-    std::printf("host_d3d12_hevc444_encode_submission=%u\n", has_output ? 1U : 0U);
-    return has_output;
+
+    std::vector<hevc_access_unit_probe::Nal> nals;
+    const bool split_ok = hevc_access_unit_probe::split(stream, &nals);
+    bool have_vps = false, have_sps = false, have_pps = false, have_irap = false;
+    for (const auto &nal : nals) {
+        have_vps |= nal.type == 32;
+        have_sps |= nal.type == 33;
+        have_pps |= nal.type == 34;
+        have_irap |= hevc_access_unit_probe::is_irap(nal.type);
+    }
+    appsandbox_hevc444_probe::ParsedConfig parsed = {};
+    const bool parsed_sequence =
+        appsandbox_hevc444_probe::parse_hevc444_sequence_headers(stream, &parsed);
+    const bool sequence_header_ok = split_ok && parsed_sequence && have_vps &&
+        have_sps && have_pps && parsed.width == kWidth && parsed.height == kHeight &&
+        parsed.configuration_flags ==
+            static_cast<std::uint32_t>(config.ConfigurationFlags) &&
+        parsed.picture_flags == static_cast<std::uint32_t>(picture_defaults.Flags);
+    const bool stream_ok = sequence_header_ok && have_irap;
+    std::printf("host_d3d12_hevc444_sequence_header_444=%u\n",
+                sequence_header_ok ? 1U : 0U);
+    std::printf("host_d3d12_hevc444_irap=%u\n", have_irap ? 1U : 0U);
+    std::printf("host_d3d12_hevc444_encode_submission=%u\n", stream_ok ? 1U : 0U);
+    return stream_ok;
 }
 
 static bool query_capability(ID3D12Device *device, ID3D12VideoDevice3 *video)
@@ -459,6 +631,16 @@ static bool query_capability(ID3D12Device *device, ID3D12VideoDevice3 *video)
     profile_level.NodeIndex = 0;
     profile_level.Codec = D3D12_VIDEO_ENCODER_CODEC_HEVC;
     profile_level.Profile = profile;
+    D3D12_VIDEO_ENCODER_LEVEL_TIER_CONSTRAINTS_HEVC min_level = {};
+    D3D12_VIDEO_ENCODER_LEVEL_TIER_CONSTRAINTS_HEVC max_level = {};
+    min_level.Level = D3D12_VIDEO_ENCODER_LEVELS_HEVC_1;
+    min_level.Tier = D3D12_VIDEO_ENCODER_TIER_HEVC_MAIN;
+    max_level.Level = D3D12_VIDEO_ENCODER_LEVELS_HEVC_51;
+    max_level.Tier = D3D12_VIDEO_ENCODER_TIER_HEVC_MAIN;
+    profile_level.MinSupportedLevel.DataSize = sizeof(min_level);
+    profile_level.MinSupportedLevel.pHEVCLevelSetting = &min_level;
+    profile_level.MaxSupportedLevel.DataSize = sizeof(max_level);
+    profile_level.MaxSupportedLevel.pHEVCLevelSetting = &max_level;
     hr = video->CheckFeatureSupport(
         D3D12_FEATURE_VIDEO_ENCODER_PROFILE_LEVEL, &profile_level,
         sizeof(profile_level));
@@ -477,20 +659,12 @@ static bool query_capability(ID3D12Device *device, ID3D12VideoDevice3 *video)
     std::printf("host_d3d12_hevc444_ayuv=%u\n", ayuv_ok ? 1U : 0U);
     if (FAILED(hr)) print_hr("host-d3d12-hevc444-ayuv", hr);
 
-    D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT_HEVC config_limits = {};
-    D3D12_FEATURE_DATA_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT config = {};
-    config.NodeIndex = 0;
-    config.Codec = D3D12_VIDEO_ENCODER_CODEC_HEVC;
-    config.Profile = profile;
-    config.CodecSupportLimits.DataSize = sizeof(config_limits);
-    config.CodecSupportLimits.pHEVCSupport = &config_limits;
-    hr = video->CheckFeatureSupport(
-        D3D12_FEATURE_VIDEO_ENCODER_CODEC_CONFIGURATION_SUPPORT, &config,
-        sizeof(config));
-    const bool config_ok = SUCCEEDED(hr) && config.IsSupported != FALSE;
+    D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC requested_config = {};
+    D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA_HEVC1 picture_defaults = {};
+    const bool config_ok = profile_ok && find_hevc444_configuration(
+        video, profile, &requested_config, &picture_defaults);
     std::printf("host_d3d12_hevc444_codec_configuration=%u\n",
                 config_ok ? 1U : 0U);
-    if (FAILED(hr)) print_hr("host-d3d12-hevc444-codec-configuration", hr);
 
     D3D12_FEATURE_DATA_VIDEO_ENCODER_RESOURCE_REQUIREMENTS requirements = {};
     requirements.NodeIndex = 0;
@@ -515,8 +689,7 @@ static bool query_capability(ID3D12Device *device, ID3D12VideoDevice3 *video)
         return false;
     }
 
-    D3D12_VIDEO_ENCODER_CODEC_CONFIGURATION_HEVC requested_config = {};
-    if (!find_hevc444_configuration(video, profile, &requested_config)) {
+    if (!config_ok) {
         std::printf("host_d3d12_hevc444_actual_encode=BLOCKED "
                     "reason=no-valid-main444-configuration\n");
         return false;
@@ -525,7 +698,7 @@ static bool query_capability(ID3D12Device *device, ID3D12VideoDevice3 *video)
         requirements.MaxEncoderOutputMetadataBufferSize,
         sizeof(D3D12_VIDEO_ENCODER_OUTPUT_METADATA));
     const bool encoded = run_actual_encode(
-        device, video, profile, requested_config, metadata_bytes,
+        device, video, profile, requested_config, picture_defaults, metadata_bytes,
         requirements.CompressedBitstreamBufferAccessAlignment);
     std::printf("host_d3d12_hevc444_actual_encode=%s\n",
                 encoded ? "PASS" : "BLOCKED");

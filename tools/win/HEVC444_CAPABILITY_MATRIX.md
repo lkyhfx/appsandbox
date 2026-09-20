@@ -4,23 +4,22 @@ The probes keep the three capability layers separate. A `0` in a D3D12
 profile query means that the selected D3D12 path did not expose that profile;
 it does not prove that the physical NVIDIA hardware cannot encode YUV444.
 
-## 2026-09-20 validation snapshot
+## 2026-09-20 validation snapshot (after HEVC1 probe fix)
 
-| Layer | Main444 / YUV444 | 3840x2160@60 | Evidence |
-| --- | ---: | ---: | --- |
-| Windows Host native D3D12 encode | 0 / 0 | 0 | `tools/win/hevc444-encode-probe` feature queries; HEVC codec=1, resource requirements=1, profile/config/AYUV=0 |
-| Windows Host MF decode + D3D11 presentation | BLOCKED | BLOCKED | bundled sample reached real probe; this RTX 4070 reported hardware HEVC MFT count=0 |
-| Windows Host native D3D12 decode | 1 / 1 | capability-only | standalone host probe created the HEVC Main444 decoder/heap and reported AYUV; actual decode not tested |
-| Linux Guest GPU-PV D3D12 encode | 0 | 0 for Main444 | existing Guest validation recorded `supported=0`; standard HEVC Main/NV12 4K60 capability is PASS |
-| Windows native NVENC | BLOCKED | BLOCKED | NVIDIA Video Codec SDK is not installed; the optional probe does not infer support from DLL loading |
+The Host probe now supplies the `PROFILE_LEVEL` min/max backing records,
+queries codec configuration through `HEVC1/pHEVCSupport1`, uses
+`HEVC1/pHEVCPicData1` for the actual frame, and only reports encode success
+after metadata and the generated Annex-B stream pass validation.
 
-The current matrix is therefore:
+| Layer | Profile query | Input format | Codec config | Actual encode/decode | GPU surface | 4K60 | Evidence |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Windows Host native D3D12 encode | 0 | 0 (AYUV) | 0 | BLOCKED (capability gate) | n/a | 0 | RTX 4070 run of `appsandbox-hevc444-encode-probe.exe`; HEVC codec=1, resource requirements=1, profile/config/AYUV=0 |
+| Windows Host MF decode + D3D11 presentation | BLOCKED | BLOCKED | n/a | BLOCKED | BLOCKED | BLOCKED | bundled sample reached real MFT probe; hardware HEVC MFT count=0 |
+| Windows Host native D3D12 decode | 1 | AYUV=1 | n/a | capability-only | AYUV object creation only | not tested | standalone decoder/heap capability probe; actual decode not run |
+| Linux Guest GPU-PV D3D12 encode | 0 (Main444) | 0 (AYUV) | BLOCKED | BLOCKED | n/a | 0 (Main444) | latest re-run unavailable: SSH to `yunsen@192.168.42.2` returned `Permission denied`; prior probe recorded standard Main/NV12 4K60 PASS |
+| Windows native NVENC | BLOCKED | BLOCKED | BLOCKED | BLOCKED | n/a | BLOCKED | NVIDIA Video Codec SDK is not installed; DLL loading is not treated as support |
 
-```text
-Host D3D12 encode = 0
-Guest D3D12 encode = 0
-NVENC = BLOCKED
-```
-
-This is a D3D12/GPU-PV capability gap, not a hardware-level "RTX 4070 does
-not support HEVC444" conclusion. `production-4k60` remains `false`.
+The Host `actual_encode`, sequence-header, and IRAP stages are deliberately
+not run when the capability gate is zero. This is a reliable negative result
+for the exposed D3D12 path, not a hardware-level conclusion that an RTX 4070
+cannot encode HEVC444. `production-4k60` remains `false`.
