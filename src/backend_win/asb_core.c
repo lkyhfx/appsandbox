@@ -2297,6 +2297,8 @@ static int spawn_iso_patch_prefetch(const wchar_t *args)
     GetExitCodeProcess(pi.hProcess, &ec);
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
+    if (ec != 0)
+        asb_log(L"prefetch: iso-patch exited with code %lu for %s", ec, args);
     return ec == 0 ? 0 : -1;
 }
 
@@ -2504,8 +2506,12 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
         swprintf_s(args_buf, 2048,
             L"--prefetch-repo --branch \"main\" --out-dir \"%s\"",
             extras);
-        if (spawn_iso_patch_prefetch(args_buf) != 0)
-            asb_log(L"WARN: prefetch-repo failed (agent + DKMS build will fail)");
+        if (spawn_iso_patch_prefetch(args_buf) != 0) {
+            args->result = E_FAIL;
+            wcscpy_s(args->error_msg, ARRAYSIZE(args->error_msg),
+                      L"Linux source prefetch failed; VM was not built without its guest agent.");
+            goto done;
+        }
 
         /* Prefetch 2: apt build-deps closure from archive.ubuntu.com.
            Needs (codename, kernel) detected from the ISO. */
@@ -2523,12 +2529,21 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
                 L"--prefetch-build-deps --codename \"%s\" --kernel \"%s\" "
                 L"--out-dir \"%s\" --iso-root \"%c:\"",
                 codename, kver, apt_out, iso_drive);
-            if (spawn_iso_patch_prefetch(args_buf) != 0)
-                asb_log(L"WARN: prefetch-build-deps failed");
+            if (spawn_iso_patch_prefetch(args_buf) != 0) {
+                DetachVirtualDisk(iso_handle, DETACH_VIRTUAL_DISK_FLAG_NONE, 0);
+                CloseHandle(iso_handle);
+                args->result = E_FAIL;
+                wcscpy_s(args->error_msg, ARRAYSIZE(args->error_msg),
+                          L"Linux build dependency prefetch failed; VM was not built with missing packages.");
+                goto done;
+            }
             DetachVirtualDisk(iso_handle, DETACH_VIRTUAL_DISK_FLAG_NONE, 0);
             CloseHandle(iso_handle);
         } else {
-            asb_log(L"WARN: could not detect ISO kernel — skipping build-deps");
+            args->result = E_FAIL;
+            wcscpy_s(args->error_msg, ARRAYSIZE(args->error_msg),
+                      L"Could not detect Ubuntu kernel; build dependencies could not be prepared.");
+            goto done;
         }
 
         /* Prefetch 3: wsl-deps proprietary .so libs from Microsoft NuGet. */

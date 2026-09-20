@@ -234,7 +234,7 @@ static int parse_url(const wchar_t *url,
 
 /* HTTP GET <url> -> file. Returns 0 on success. Uses a persistent
  * connection per-call (simple; for one-shot fetches this is fine). */
-static int http_download(const wchar_t *url, const wchar_t *out_path)
+static int http_download_once(const wchar_t *url, const wchar_t *out_path)
 {
     wchar_t host[256], path[2048];
     INTERNET_PORT port = 80;
@@ -248,6 +248,7 @@ static int http_download(const wchar_t *url, const wchar_t *out_path)
                                      WINHTTP_NO_PROXY_NAME,
                                      WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) { log_err(L"prefetch: WinHttpOpen failed: %lu", GetLastError()); return -1; }
+    WinHttpSetTimeouts(hSession, 15000, 15000, 30000, 30000);
 
     int rc = -1;
     HINTERNET hConn = WinHttpConnect(hSession, host, port, 0);
@@ -277,6 +278,7 @@ static int http_download(const wchar_t *url, const wchar_t *out_path)
                         WINHTTP_NO_HEADER_INDEX);
     if (status != 200) {
         log_err(L"prefetch: HTTP %lu for %s", status, url);
+        if (status >= 400 && status < 500) rc = -2;
         goto cleanup_req;
     }
 
@@ -317,6 +319,27 @@ cleanup_req:  WinHttpCloseHandle(hReq);
 cleanup_conn: WinHttpCloseHandle(hConn);
 cleanup_sess: WinHttpCloseHandle(hSession);
     return rc;
+}
+
+/* A failed download may leave a partial file. Retry transient network errors
+ * before constructing the offline apt index. */
+static int http_download(const wchar_t *url, const wchar_t *out_path)
+{
+    for (int attempt = 0; attempt < 4; attempt++) {
+        int rc;
+        DeleteFileW(out_path);
+        rc = http_download_once(url, out_path);
+        if (rc == 0) return 0;
+        DeleteFileW(out_path);
+        if (rc == -2) return -1; /* 4xx: retries cannot help */
+        if (attempt < 3) {
+            DWORD delay_ms = 500u << attempt;
+            log_msg(L"prefetch: retrying %s in %lu ms (attempt %d/4)",
+                    url, delay_ms, attempt + 2);
+            Sleep(delay_ms);
+        }
+    }
+    return -1;
 }
 
 /* ====================================================================
@@ -835,7 +858,7 @@ int do_prefetch_build_deps(const wchar_t *codename,
                            const wchar_t *iso_root)
 {
     const wchar_t *mirror = mirror_arg ? mirror_arg
-                                       : L"http://archive.ubuntu.com/ubuntu";
+                                       : L"https://archive.ubuntu.com/ubuntu";
 
     log_msg(L"prefetch: codename=%s kver=%s mirror=%s out=%s",
             codename, kernel_ver, mirror, out_dir);
