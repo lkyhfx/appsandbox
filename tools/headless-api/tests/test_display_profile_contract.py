@@ -158,6 +158,50 @@ class DisplayProfileContractTests(unittest.TestCase):
         )
         self.assertIn("D3D12_VIDEO_ENCODER_CODEC_HEVC", source)
         self.assertIn("DXGI_FORMAT_AYUV", source)
+        self.assertIn("D3D12_VIDEO_ENCODER_FRAME_TYPE_HEVC_IDR_FRAME", source)
+        self.assertIn("host_d3d12_hevc444_encoder_payload", source)
+        self.assertIn("D3D12_FEATURE_VIDEO_ENCODER_SUPPORT", source)
+        self.assertIn("TargetFrameRate", source)
+        self.assertIn("D3D12_VIDEO_ENCODER_VALIDATION_FLAG_NONE", source)
+
+    def test_native_d3d12_decode_probe_submits_and_verifies_gpu_output(self):
+        source = self.read("tools", "win", "hevc444-probe",
+                           "hevc444-probe.cpp")
+        for marker in (
+            "D3D12_VIDEO_DECODE_ARGUMENT_TYPE_PICTURE_PARAMETERS",
+            "D3D12_VIDEO_DECODE_ARGUMENT_TYPE_SLICE_CONTROL",
+            "DXVA_PicParams_HEVC_RangeExt",
+            "ID3D12VideoDecodeCommandList",
+            "DecodeFrame",
+            "D3D12_QUERY_TYPE_VIDEO_DECODE_STATISTICS",
+            "d3d12_decode_status",
+            "CopyTextureRegion",
+            "d3d12_decoded_ayuv_checksum",
+            "d3d12_decoded_gpu_surface",
+            "d3d12_decode_ayuv_to_rgb",
+            "d3d12_decode_cpu_frame_copy",
+        ):
+            self.assertIn(marker, source)
+        self.assertNotIn("d3d12_actual_decode=not-tested", source)
+
+    def test_native_d3d12_decode_runtime_is_fail_closed(self):
+        exe = (ROOT / "tools" / "win" / "hevc444-probe" / "bin" /
+               "Release" / "appsandbox-hevc444-probe.exe")
+        sample = ROOT / "tools" / "win" / "hevc444-probe" / \
+            "hevc444-host-probe-sample.hevc"
+        if not exe.exists():
+            self.skipTest("Windows D3D12 decode probe has not been built")
+        result = subprocess.run([str(exe), str(sample)], capture_output=True,
+                                text=True, timeout=60, check=False)
+        output = result.stdout + result.stderr
+        self.assertIn("d3d12_actual_decode=", output)
+        self.assertIn("d3d12_decode_cpu_frame_copy=0", output)
+        if "d3d12_actual_decode=PASS" in output:
+            self.assertIn("d3d12_decoded_format=AYUV", output)
+            self.assertIn("d3d12_decoded_gpu_surface=1", output)
+            self.assertIn("d3d12_decode_ayuv_to_rgb=1", output)
+        else:
+            self.assertIn("d3d12_actual_decode=BLOCKED", output)
 
     def test_native_encode_probe_runtime_is_fail_closed(self):
         exe = (ROOT / "tools" / "win" / "hevc444-encode-probe" / "bin" /

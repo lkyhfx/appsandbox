@@ -9,6 +9,7 @@
 #include <d3d11_4.h>
 #include <d3d12.h>
 #include <d3d12video.h>
+#include <dxva.h>
 #include <dxgi1_6.h>
 #include <mfapi.h>
 #include <mferror.h>
@@ -91,6 +92,7 @@ static std::string guid_string(const GUID &guid)
 struct D3D11Context {
     ComPtr<IDXGIAdapter1> adapter;
     ComPtr<ID3D11Device> device;
+    ComPtr<ID3D11Device1> device1;
     ComPtr<ID3D11DeviceContext> context;
     ComPtr<ID3D11VideoDevice> video_device;
     ComPtr<ID3D11VideoContext> video_context;
@@ -159,6 +161,7 @@ static bool create_d3d11_context(UINT requested_adapter, D3D11Context *result)
         return false;
     }
     hr = result->device.As(&result->video_device);
+    if (SUCCEEDED(hr)) hr = result->device.As(&result->device1);
     if (SUCCEEDED(hr)) hr = result->context.As(&result->video_context);
     if (SUCCEEDED(hr)) hr = result->context.As(&result->video_context1);
     if (FAILED(hr)) {
@@ -651,9 +654,23 @@ static bool probe_media_foundation(const D3D11Context &d3d11,
 struct D3D12Result {
     bool main444_capability = false;
     bool ayuv_capability = false;
+    bool decoder_created = false;
+    bool decoder_heap_created = false;
+    bool actual_decode = false;
+    bool decoded_gpu_surface = false;
+    bool decode_ayuv_to_rgb = false;
+    bool decode_cpu_frame_copy = false;
 };
 
+static bool probe_ayuv_to_rgb(const D3D11Context &d3d11,
+                              ID3D11Texture2D *decoded_texture,
+                              UINT decoded_subresource);
+static bool probe_d3d12_ayuv_to_rgb(ID3D12Device *device,
+                                    ID3D12VideoDevice *video,
+                                    ID3D12Resource *decoded_texture);
+
 static bool probe_d3d12_decode(const D3D11Context &d3d11,
+                               const HevcAnnexBStream &stream,
                                D3D12Result *result)
 {
     ComPtr<ID3D12Device> device;
@@ -685,6 +702,9 @@ static bool probe_d3d12_decode(const D3D11Context &d3d11,
                                     &support, sizeof(support));
     const bool supported = SUCCEEDED(hr) &&
         (support.SupportFlags & D3D12_VIDEO_DECODE_SUPPORT_FLAG_SUPPORTED) != 0;
+    const bool reference_only_required =
+        (support.ConfigurationFlags &
+         D3D12_VIDEO_DECODE_CONFIGURATION_FLAG_REFERENCE_ONLY_ALLOCATIONS_REQUIRED) != 0;
     if (FAILED(hr)) print_hr("d3d12-decode-main444", hr);
     std::printf("%s stage=d3d12-decode-main444 resolution=%ux%u fps=60/1 "
                 "supported=%u support_flags=0x%08x configuration_flags=0x%08x\n",
@@ -728,6 +748,7 @@ static bool probe_d3d12_decode(const D3D11Context &d3d11,
         print_hr("d3d12-decode-create-decoder", hr);
         return false;
     }
+    result->decoder_created = true;
     D3D12_VIDEO_DECODER_HEAP_DESC heap_desc = {};
     heap_desc.NodeMask = 1;
     heap_desc.Configuration = configuration;
@@ -742,13 +763,700 @@ static bool probe_d3d12_decode(const D3D11Context &d3d11,
         print_hr("d3d12-decode-create-heap", hr);
         return false;
     }
-    std::puts("PASS stage=d3d12-decode-objects decoder=1 heap=1 output=AYUV "
-              "capability_only=1");
+    result->decoder_heap_created = true;
+    std::puts("PASS stage=d3d12-decode-objects decoder=1 heap=1 output=AYUV");
     std::printf("d3d12_decode_main444_capability=%u\n",
                 result->main444_capability ? 1U : 0U);
     std::printf("d3d12_decode_ayuv_capability=%u\n",
                 result->ayuv_capability ? 1U : 0U);
-    std::puts("d3d12_actual_decode=not-tested");
+    std::printf("d3d12_decode_reference_only_required=%u\n",
+                reference_only_required ? 1U : 0U);
+
+    /* D3D12 video decode consumes DXVA picture/slice arguments rather than an
+       opaque Annex-B file.  Keep this sample deliberately small: one IRAP
+       slice, no references, and the Range Extensions picture structure used
+       by HEVC Main 4:4:4. */
+    std::vector<hevc_access_unit_probe::Nal> irap_nals;
+    if (!hevc_access_unit_probe::split(stream.first_irap.bytes, &irap_nals)) {
+        std::fputs("BLOCKED stage=d3d12-actual-decode reason=irap-parse\n",
+                   stderr);
+        return false;
+    }
+    const hevc_access_unit_probe::Nal *irap = nullptr;
+    for (const auto &nal : irap_nals) {
+        if (hevc_access_unit_probe::is_irap(nal.type)) {
+            irap = &nal;
+            break;
+        }
+    }
+    if (!irap || irap->bytes.size() < 3) {
+        std::fputs("BLOCKED stage=d3d12-actual-decode reason=no-irap-slice\n",
+                   stderr);
+        return false;
+    }
+    /* The DXVA picture parameters carry the parsed SPS/PPS state.  Match the
+       D3D12VA submission contract used by the reference decoder: the
+       compressed resource contains the complete VCL NAL with its Annex-B
+       start code, and the slice control points at that NAL. */
+    const std::size_t nal_prefix =
+        irap->bytes.size() >= 4 && irap->bytes[2] == 1 ? 3 : 4;
+    std::vector<std::uint8_t> compressed = {0, 0, 1};
+    compressed.insert(compressed.end(), irap->bytes.begin() + nal_prefix,
+                      irap->bytes.end());
+    /* D3D12VA decoders consume a 128-byte padded bitstream buffer.  The
+       padding belongs to the final slice-control range, as in the DXVA
+       reference implementation. */
+    const std::size_t padding = 128 - (compressed.size() & 127);
+    compressed.resize(compressed.size() + padding, 0);
+    const UINT slice_offset = 0;
+    DXVA_Slice_HEVC_Short slice = {};
+    slice.BSNALunitDataLocation = slice_offset;
+    slice.SliceBytesInBuffer = static_cast<UINT>(compressed.size());
+
+    DXVA_PicParams_HEVC_RangeExt picture = {};
+    DXVA_PicParams_HEVC &pp = picture.params;
+    pp.PicWidthInMinCbsY = static_cast<USHORT>(kWidth / 8);
+    pp.PicHeightInMinCbsY = static_cast<USHORT>(kHeight / 8);
+    pp.chroma_format_idc = 3;
+    pp.bit_depth_luma_minus8 = 0;
+    pp.bit_depth_chroma_minus8 = 0;
+    pp.log2_max_pic_order_cnt_lsb_minus4 = 4;
+    pp.NoPicReorderingFlag = 1;
+    pp.NoBiPredFlag = 1;
+    pp.CurrPic.bPicEntry = 0;
+    pp.sps_max_dec_pic_buffering_minus1 = 2;
+    pp.log2_min_luma_coding_block_size_minus3 = 0;
+    pp.log2_diff_max_min_luma_coding_block_size = 3;
+    pp.log2_min_transform_block_size_minus2 = 0;
+    pp.log2_diff_max_min_transform_block_size = 3;
+    pp.max_transform_hierarchy_depth_inter = 0;
+    pp.max_transform_hierarchy_depth_intra = 0;
+    pp.sample_adaptive_offset_enabled_flag = 1;
+    pp.num_short_term_ref_pic_sets = 0;
+    pp.num_long_term_ref_pics_sps = 0;
+    pp.num_ref_idx_l0_default_active_minus1 = 0;
+    pp.num_ref_idx_l1_default_active_minus1 = 0;
+    pp.init_qp_minus26 = 0;
+    pp.cu_qp_delta_enabled_flag = 1;
+    pp.diff_cu_qp_delta_depth = 1;
+    pp.pps_cb_qp_offset = 6;
+    pp.pps_cr_qp_offset = 6;
+    pp.entropy_coding_sync_enabled_flag = 1;
+    pp.pps_loop_filter_across_slices_enabled_flag = 1;
+    pp.log2_parallel_merge_level_minus2 = 0;
+    pp.IrapPicFlag = 1;
+    pp.IdrPicFlag = stream.first_irap.idr ? 1 : 0;
+    pp.IntraPicFlag = 1;
+    pp.CurrPicOrderCntVal = 0;
+    pp.sps_temporal_mvp_enabled_flag = 1;
+    pp.strong_intra_smoothing_enabled_flag = 1;
+    for (auto &ref : pp.RefPicList) ref.bPicEntry = 0xff;
+    for (auto &poc : pp.PicOrderCntValList) poc = 0;
+    for (auto &ref : pp.RefPicSetStCurrBefore) ref = 0xff;
+    for (auto &ref : pp.RefPicSetStCurrAfter) ref = 0xff;
+    for (auto &ref : pp.RefPicSetLtCurr) ref = 0xff;
+
+    D3D12_HEAP_PROPERTIES default_heap = {};
+    default_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    default_heap.CreationNodeMask = 1;
+    default_heap.VisibleNodeMask = 1;
+    D3D12_HEAP_PROPERTIES upload_heap = default_heap;
+    upload_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_HEAP_PROPERTIES readback_heap = default_heap;
+    readback_heap.Type = D3D12_HEAP_TYPE_READBACK;
+    auto buffer_desc = [](UINT64 size) {
+        D3D12_RESOURCE_DESC desc = {};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        desc.Width = size;
+        desc.Height = 1;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        return desc;
+    };
+    ComPtr<ID3D12Resource> bitstream_upload;
+    const D3D12_RESOURCE_DESC bitstream_desc =
+        buffer_desc(static_cast<UINT64>(compressed.size()));
+    hr = device->CreateCommittedResource(
+        &upload_heap, D3D12_HEAP_FLAG_NONE, &bitstream_desc,
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+        IID_PPV_ARGS(&bitstream_upload));
+    if (FAILED(hr)) {
+        print_hr("d3d12-actual-decode-bitstream-resource", hr);
+        return false;
+    }
+    void *mapped = nullptr;
+    D3D12_RANGE no_read = {0, 0};
+    hr = bitstream_upload->Map(0, &no_read, &mapped);
+    if (SUCCEEDED(hr)) {
+        std::memcpy(mapped, compressed.data(), compressed.size());
+        bitstream_upload->Unmap(0, nullptr);
+    }
+    if (FAILED(hr)) {
+        print_hr("d3d12-actual-decode-bitstream-map", hr);
+        return false;
+    }
+
+    const UINT array_size = 8;
+    D3D12_RESOURCE_DESC output_desc = {};
+    output_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    output_desc.Width = kWidth;
+    output_desc.Height = kHeight;
+    output_desc.DepthOrArraySize = array_size;
+    output_desc.MipLevels = 1;
+    output_desc.Format = DXGI_FORMAT_AYUV;
+    output_desc.SampleDesc.Count = 1;
+    output_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    ComPtr<ID3D12Resource> output_texture;
+    hr = device->CreateCommittedResource(
+        &default_heap, D3D12_HEAP_FLAG_SHARED, &output_desc,
+        D3D12_RESOURCE_STATE_COMMON, nullptr,
+        IID_PPV_ARGS(&output_texture));
+    if (FAILED(hr)) {
+        print_hr("d3d12-actual-decode-output-texture", hr);
+        return false;
+    }
+    ComPtr<ID3D12Resource> reference_texture;
+    if (reference_only_required) {
+        D3D12_RESOURCE_DESC reference_desc = output_desc;
+        reference_desc.Flags = D3D12_RESOURCE_FLAG_VIDEO_DECODE_REFERENCE_ONLY |
+            D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+        hr = device->CreateCommittedResource(
+            &default_heap, D3D12_HEAP_FLAG_NONE, &reference_desc,
+            D3D12_RESOURCE_STATE_COMMON, nullptr,
+            IID_PPV_ARGS(&reference_texture));
+        if (FAILED(hr)) {
+            print_hr("d3d12-actual-decode-reference-texture", hr);
+            return false;
+        }
+    }
+
+    D3D12_COMMAND_QUEUE_DESC copy_queue_desc = {};
+    copy_queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    ComPtr<ID3D12CommandQueue> copy_queue;
+    if (FAILED(device->CreateCommandQueue(&copy_queue_desc,
+                                          IID_PPV_ARGS(&copy_queue)))) {
+        std::fputs("BLOCKED stage=d3d12-actual-decode reason=copy-queue\n",
+                   stderr);
+        return false;
+    }
+
+    D3D12_COMMAND_QUEUE_DESC decode_queue_desc = {};
+    decode_queue_desc.Type = D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE;
+    ComPtr<ID3D12CommandQueue> decode_queue;
+    ComPtr<ID3D12CommandAllocator> decode_allocator;
+    ComPtr<ID3D12VideoDecodeCommandList> decode_list;
+    if (FAILED(device->CreateCommandQueue(&decode_queue_desc,
+                                          IID_PPV_ARGS(&decode_queue))) ||
+        FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE,
+                                               IID_PPV_ARGS(&decode_allocator))) ||
+        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_VIDEO_DECODE,
+                                          decode_allocator.Get(), nullptr,
+                                          IID_PPV_ARGS(&decode_list)))) {
+        std::fputs("BLOCKED stage=d3d12-actual-decode reason=decode-queue\n",
+                   stderr);
+        return false;
+    }
+    D3D12_QUERY_HEAP_DESC query_desc = {};
+    query_desc.Type = D3D12_QUERY_HEAP_TYPE_VIDEO_DECODE_STATISTICS;
+    query_desc.Count = 1;
+    query_desc.NodeMask = 1;
+    ComPtr<ID3D12QueryHeap> query_heap;
+    ComPtr<ID3D12Resource> query_readback;
+    const D3D12_RESOURCE_DESC query_buffer_desc = buffer_desc(
+        sizeof(D3D12_QUERY_DATA_VIDEO_DECODE_STATISTICS));
+    if (FAILED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&query_heap))) ||
+        FAILED(device->CreateCommittedResource(
+            &readback_heap, D3D12_HEAP_FLAG_NONE, &query_buffer_desc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&query_readback)))) {
+        std::fputs("BLOCKED stage=d3d12-actual-decode reason=query-heap\n",
+                   stderr);
+        return false;
+    }
+
+    D3D12_VIDEO_DECODE_FRAME_ARGUMENT frame_args[2] = {};
+    frame_args[0].Type = D3D12_VIDEO_DECODE_ARGUMENT_TYPE_PICTURE_PARAMETERS;
+    frame_args[0].Size = sizeof(picture);
+    frame_args[0].pData = &picture;
+    frame_args[1].Type = D3D12_VIDEO_DECODE_ARGUMENT_TYPE_SLICE_CONTROL;
+    frame_args[1].Size = sizeof(slice);
+    frame_args[1].pData = &slice;
+    D3D12_VIDEO_DECODE_INPUT_STREAM_ARGUMENTS input_args = {};
+    input_args.NumFrameArguments = ARRAYSIZE(frame_args);
+    input_args.FrameArguments[0] = frame_args[0];
+    input_args.FrameArguments[1] = frame_args[1];
+    input_args.CompressedBitstream.pBuffer = bitstream_upload.Get();
+    input_args.CompressedBitstream.Offset = 0;
+    input_args.CompressedBitstream.Size = compressed.size();
+    input_args.pHeap = heap.Get();
+    D3D12_VIDEO_DECODE_OUTPUT_STREAM_ARGUMENTS output_args = {};
+    output_args.pOutputTexture2D = output_texture.Get();
+    output_args.OutputSubresource = 0;
+    ID3D12Resource *reference_frames[] = {reference_texture.Get()};
+    UINT reference_subresources[] = {0};
+    if (reference_only_required) {
+        output_args.ConversionArguments.Enable = TRUE;
+        output_args.ConversionArguments.pReferenceTexture2D =
+            reference_texture.Get();
+        output_args.ConversionArguments.ReferenceSubresource = 0;
+        input_args.ReferenceFrames.NumTexture2Ds = 1;
+        input_args.ReferenceFrames.ppTexture2Ds = reference_frames;
+        input_args.ReferenceFrames.pSubresources = reference_subresources;
+    }
+    D3D12_RESOURCE_BARRIER decode_output_barrier = {};
+    decode_output_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    decode_output_barrier.Transition.pResource = output_texture.Get();
+    decode_output_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    decode_output_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    decode_output_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE;
+    decode_list->ResourceBarrier(1, &decode_output_barrier);
+    D3D12_RESOURCE_BARRIER reference_barrier = {};
+    if (reference_only_required) {
+        reference_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        reference_barrier.Transition.pResource = reference_texture.Get();
+        reference_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        reference_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+        reference_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE;
+        decode_list->ResourceBarrier(1, &reference_barrier);
+    }
+    decode_list->DecodeFrame(decoder.Get(), &output_args, &input_args);
+    if (reference_only_required) {
+        reference_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE;
+        reference_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+        decode_list->ResourceBarrier(1, &reference_barrier);
+    }
+    decode_output_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE;
+    decode_output_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    decode_list->ResourceBarrier(1, &decode_output_barrier);
+    decode_list->EndQuery(query_heap.Get(), D3D12_QUERY_TYPE_VIDEO_DECODE_STATISTICS, 0);
+    decode_list->ResolveQueryData(query_heap.Get(),
+                                  D3D12_QUERY_TYPE_VIDEO_DECODE_STATISTICS, 0, 1,
+                                  query_readback.Get(), 0);
+    const HRESULT decode_close_hr = decode_list->Close();
+    if (FAILED(decode_close_hr)) {
+        print_hr("d3d12-actual-decode-list", decode_close_hr);
+        std::fputs("BLOCKED stage=d3d12-actual-decode reason=decode-list\n",
+                   stderr);
+        return false;
+    }
+    ID3D12CommandList *decode_lists[] = {decode_list.Get()};
+    decode_queue->ExecuteCommandLists(1, decode_lists);
+    ComPtr<ID3D12Fence> decode_fence;
+    if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                   IID_PPV_ARGS(&decode_fence))) ||
+        FAILED(decode_queue->Signal(decode_fence.Get(), 1))) {
+        std::fputs("BLOCKED stage=d3d12-actual-decode reason=decode-fence\n",
+                   stderr);
+        return false;
+    }
+
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+    UINT rows = 0;
+    UINT64 row_size = 0;
+    UINT64 readback_size = 0;
+    device->GetCopyableFootprints(&output_desc, 0, 1, 0, &footprint, &rows,
+                                  &row_size, &readback_size);
+    (void)rows;
+    (void)row_size;
+    ComPtr<ID3D12Resource> output_readback;
+    const D3D12_RESOURCE_DESC output_readback_desc = buffer_desc(readback_size);
+    if (FAILED(device->CreateCommittedResource(
+            &readback_heap, D3D12_HEAP_FLAG_NONE, &output_readback_desc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&output_readback)))) {
+        std::fputs("BLOCKED stage=d3d12-actual-decode reason=output-readback\n",
+                   stderr);
+        return false;
+    }
+    ComPtr<ID3D12CommandAllocator> output_allocator;
+    ComPtr<ID3D12GraphicsCommandList> output_list;
+    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                               IID_PPV_ARGS(&output_allocator))) ||
+        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                          output_allocator.Get(), nullptr,
+                                          IID_PPV_ARGS(&output_list)))) {
+        std::fputs("BLOCKED stage=d3d12-actual-decode reason=output-copy-list\n",
+                   stderr);
+        return false;
+    }
+    D3D12_RESOURCE_BARRIER output_barrier = {};
+    output_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    output_barrier.Transition.pResource = output_texture.Get();
+    output_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    output_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    output_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    output_list->ResourceBarrier(1, &output_barrier);
+    D3D12_TEXTURE_COPY_LOCATION source = {};
+    source.pResource = output_texture.Get();
+    source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    source.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION destination = {};
+    destination.pResource = output_readback.Get();
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    destination.PlacedFootprint = footprint;
+    output_list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+    output_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    output_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    output_list->ResourceBarrier(1, &output_barrier);
+    const HRESULT output_close_hr = output_list->Close();
+    if (FAILED(output_close_hr)) {
+        print_hr("d3d12-actual-decode-output-copy-list", output_close_hr);
+        std::fputs("BLOCKED stage=d3d12-actual-decode reason=output-copy-list\n",
+                   stderr);
+        return false;
+    }
+    ID3D12CommandList *output_lists[] = {output_list.Get()};
+    copy_queue->Wait(decode_fence.Get(), 1);
+    copy_queue->ExecuteCommandLists(1, output_lists);
+    ComPtr<ID3D12Fence> output_fence;
+    if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                   IID_PPV_ARGS(&output_fence))) ||
+        FAILED(copy_queue->Signal(output_fence.Get(), 1))) {
+        std::fputs("BLOCKED stage=d3d12-actual-decode reason=output-fence\n",
+                   stderr);
+        return false;
+    }
+    HANDLE event_handle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!event_handle || FAILED(output_fence->SetEventOnCompletion(1, event_handle))) {
+        if (event_handle) CloseHandle(event_handle);
+        std::fputs("BLOCKED stage=d3d12-actual-decode reason=fence-wait\n",
+                   stderr);
+        return false;
+    }
+    WaitForSingleObject(event_handle, INFINITE);
+    CloseHandle(event_handle);
+
+    D3D12_QUERY_DATA_VIDEO_DECODE_STATISTICS statistics = {};
+    const D3D12_RANGE query_range = {0, sizeof(statistics)};
+    if (FAILED(query_readback->Map(0, &query_range,
+                                   reinterpret_cast<void **>(&mapped)))) {
+        std::fputs("BLOCKED stage=d3d12-actual-decode reason=query-map\n",
+                   stderr);
+        return false;
+    }
+    std::memcpy(&statistics, mapped, sizeof(statistics));
+    query_readback->Unmap(0, nullptr);
+    const bool decode_status_ok =
+        statistics.Status == D3D12_VIDEO_DECODE_STATUS_OK;
+    std::printf("d3d12_decode_status=%llu\n",
+                static_cast<unsigned long long>(statistics.Status));
+
+    const D3D12_RANGE output_range = {0, readback_size};
+    if (FAILED(output_readback->Map(0, &output_range,
+                                    reinterpret_cast<void **>(&mapped)))) {
+        std::fputs("BLOCKED stage=d3d12-actual-decode reason=output-map\n",
+                   stderr);
+        return false;
+    }
+    const auto *output_bytes = static_cast<const std::uint8_t *>(mapped);
+    std::uint64_t checksum = 1469598103934665603ull;
+    bool nonzero = false;
+    for (UINT y = 0; y < kHeight; ++y) {
+        const auto *row = output_bytes + footprint.Offset +
+            static_cast<UINT64>(y) * footprint.Footprint.RowPitch;
+        for (UINT x = 0; x < kWidth * 4; ++x) {
+            checksum ^= row[x];
+            checksum *= 1099511628211ull;
+            nonzero |= row[x] != 0;
+        }
+    }
+    output_readback->Unmap(0, nullptr);
+    result->decoded_gpu_surface = decode_status_ok && nonzero;
+    result->actual_decode = decode_status_ok && result->decoded_gpu_surface;
+    result->decode_cpu_frame_copy = false;
+    std::printf("d3d12_decoded_ayuv_checksum=0x%016llx\n",
+                static_cast<unsigned long long>(checksum));
+    std::printf("d3d12_decoded_format=AYUV\n");
+    std::printf("d3d12_decoded_gpu_surface=%u\n",
+                result->decoded_gpu_surface ? 1U : 0U);
+    std::printf("d3d12_decode_cpu_frame_copy=%u\n",
+                result->decode_cpu_frame_copy ? 1U : 0U);
+    if (!result->actual_decode) {
+        std::printf("d3d12_actual_decode=BLOCKED reason=%s\n",
+                    !decode_status_ok ? "decode-status" : "empty-ayuv-surface");
+        return false;
+    }
+    std::puts("d3d12_actual_decode=PASS");
+
+    result->decode_ayuv_to_rgb = probe_d3d12_ayuv_to_rgb(
+        device.Get(), video.Get(), output_texture.Get());
+    std::printf("d3d12_decode_ayuv_to_rgb=%u\n",
+                result->decode_ayuv_to_rgb ? 1U : 0U);
+    return result->decode_ayuv_to_rgb;
+}
+
+static bool probe_d3d12_ayuv_to_rgb(ID3D12Device *device,
+                                    ID3D12VideoDevice *video,
+                                    ID3D12Resource *decoded_texture)
+{
+    if (!device || !video || !decoded_texture)
+        return false;
+
+    D3D12_VIDEO_PROCESS_INPUT_STREAM_DESC input_desc = {};
+    input_desc.Format = DXGI_FORMAT_AYUV;
+    input_desc.ColorSpace = DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709;
+    input_desc.SourceAspectRatio = {1, 1};
+    input_desc.DestinationAspectRatio = {1, 1};
+    input_desc.FrameRate = {kFpsNumerator, kFpsDenominator};
+    input_desc.SourceSizeRange = {kWidth, kHeight, kWidth, kHeight};
+    input_desc.DestinationSizeRange = {kWidth, kHeight, kWidth, kHeight};
+    input_desc.StereoFormat = D3D12_VIDEO_FRAME_STEREO_FORMAT_NONE;
+    input_desc.FieldType = D3D12_VIDEO_FIELD_TYPE_NONE;
+    input_desc.DeinterlaceMode = D3D12_VIDEO_PROCESS_DEINTERLACE_FLAG_NONE;
+
+    D3D12_VIDEO_PROCESS_OUTPUT_STREAM_DESC output_desc = {};
+    output_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    output_desc.ColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    output_desc.AlphaFillMode = D3D12_VIDEO_PROCESS_ALPHA_FILL_MODE_OPAQUE;
+    output_desc.FrameRate = {kFpsNumerator, kFpsDenominator};
+
+    D3D12_FEATURE_DATA_VIDEO_PROCESS_SUPPORT support = {};
+    support.NodeIndex = 0;
+    support.InputSample.Width = kWidth;
+    support.InputSample.Height = kHeight;
+    support.InputSample.Format.Format = input_desc.Format;
+    support.InputSample.Format.ColorSpace = input_desc.ColorSpace;
+    support.InputFieldType = input_desc.FieldType;
+    support.InputStereoFormat = input_desc.StereoFormat;
+    support.InputFrameRate = input_desc.FrameRate;
+    support.OutputFormat.Format = output_desc.Format;
+    support.OutputFormat.ColorSpace = output_desc.ColorSpace;
+    support.OutputStereoFormat = D3D12_VIDEO_FRAME_STEREO_FORMAT_NONE;
+    support.OutputFrameRate = output_desc.FrameRate;
+    HRESULT hr = video->CheckFeatureSupport(
+        D3D12_FEATURE_VIDEO_PROCESS_SUPPORT, &support, sizeof(support));
+    const bool supported = SUCCEEDED(hr) &&
+        (support.SupportFlags & D3D12_VIDEO_PROCESS_SUPPORT_FLAG_SUPPORTED) != 0;
+    if (!supported) {
+        if (FAILED(hr)) print_hr("d3d12-ayuv-to-rgb-support", hr);
+        else std::fputs("BLOCKED stage=d3d12-ayuv-to-rgb reason=unsupported\n",
+                        stderr);
+        return false;
+    }
+
+    ComPtr<ID3D12VideoProcessor> processor;
+    hr = video->CreateVideoProcessor(0, &output_desc, 1, &input_desc,
+                                     IID_PPV_ARGS(&processor));
+    if (FAILED(hr)) {
+        print_hr("d3d12-ayuv-to-rgb-create-processor", hr);
+        return false;
+    }
+
+    D3D12_RESOURCE_DESC rgb_desc = {};
+    rgb_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rgb_desc.Width = kWidth;
+    rgb_desc.Height = kHeight;
+    rgb_desc.DepthOrArraySize = 1;
+    rgb_desc.MipLevels = 1;
+    rgb_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    rgb_desc.SampleDesc.Count = 1;
+    rgb_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    D3D12_HEAP_PROPERTIES default_heap = {};
+    default_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    default_heap.CreationNodeMask = 1;
+    default_heap.VisibleNodeMask = 1;
+    ComPtr<ID3D12Resource> rgb_texture;
+    hr = device->CreateCommittedResource(
+        &default_heap, D3D12_HEAP_FLAG_NONE, &rgb_desc,
+        D3D12_RESOURCE_STATE_VIDEO_PROCESS_WRITE, nullptr,
+        IID_PPV_ARGS(&rgb_texture));
+    if (FAILED(hr)) {
+        print_hr("d3d12-ayuv-to-rgb-output", hr);
+        return false;
+    }
+
+    D3D12_COMMAND_QUEUE_DESC process_queue_desc = {};
+    process_queue_desc.Type = D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS;
+    ComPtr<ID3D12CommandQueue> process_queue;
+    ComPtr<ID3D12CommandAllocator> process_allocator;
+    ComPtr<ID3D12VideoProcessCommandList> process_list;
+    if (FAILED(device->CreateCommandQueue(&process_queue_desc,
+                                          IID_PPV_ARGS(&process_queue))) ||
+        FAILED(device->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS,
+            IID_PPV_ARGS(&process_allocator))) ||
+        FAILED(device->CreateCommandList(
+            0, D3D12_COMMAND_LIST_TYPE_VIDEO_PROCESS, process_allocator.Get(),
+            nullptr, IID_PPV_ARGS(&process_list)))) {
+        std::fputs("BLOCKED stage=d3d12-ayuv-to-rgb reason=process-queue\n",
+                   stderr);
+        return false;
+    }
+
+    D3D12_RESOURCE_BARRIER input_barrier = {};
+    input_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    input_barrier.Transition.pResource = decoded_texture;
+    input_barrier.Transition.Subresource = 0;
+    input_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    input_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_VIDEO_PROCESS_READ;
+    process_list->ResourceBarrier(1, &input_barrier);
+    D3D12_VIDEO_PROCESS_INPUT_STREAM_ARGUMENTS process_input = {};
+    process_input.InputStream[0].pTexture2D = decoded_texture;
+    process_input.InputStream[0].Subresource = 0;
+    process_input.Transform.SourceRectangle = {0, 0,
+                                               static_cast<LONG>(kWidth),
+                                               static_cast<LONG>(kHeight)};
+    process_input.Transform.DestinationRectangle = process_input.Transform.SourceRectangle;
+    process_input.Transform.Orientation = D3D12_VIDEO_PROCESS_ORIENTATION_DEFAULT;
+    process_input.RateInfo.OutputIndex = 0;
+    process_input.RateInfo.InputFrameOrField = 0;
+    D3D12_VIDEO_PROCESS_OUTPUT_STREAM_ARGUMENTS process_output = {};
+    process_output.OutputStream[0].pTexture2D = rgb_texture.Get();
+    process_output.OutputStream[0].Subresource = 0;
+    process_output.TargetRectangle = process_input.Transform.DestinationRectangle;
+    process_list->ProcessFrames(processor.Get(), &process_output, 1,
+                                 &process_input);
+    input_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_VIDEO_PROCESS_READ;
+    input_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    process_list->ResourceBarrier(1, &input_barrier);
+    D3D12_RESOURCE_BARRIER rgb_barrier = {};
+    rgb_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    rgb_barrier.Transition.pResource = rgb_texture.Get();
+    rgb_barrier.Transition.Subresource = 0;
+    rgb_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_VIDEO_PROCESS_WRITE;
+    rgb_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    process_list->ResourceBarrier(1, &rgb_barrier);
+    const HRESULT process_close_hr = process_list->Close();
+    if (FAILED(process_close_hr)) {
+        print_hr("d3d12-ayuv-to-rgb-process-list", process_close_hr);
+        return false;
+    }
+    ID3D12CommandList *process_lists[] = {process_list.Get()};
+    process_queue->ExecuteCommandLists(1, process_lists);
+    ComPtr<ID3D12Fence> process_fence;
+    if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                   IID_PPV_ARGS(&process_fence))) ||
+        FAILED(process_queue->Signal(process_fence.Get(), 1))) {
+        std::fputs("BLOCKED stage=d3d12-ayuv-to-rgb reason=process-fence\n",
+                   stderr);
+        return false;
+    }
+
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+    UINT rows = 0;
+    UINT64 row_size = 0;
+    UINT64 readback_size = 0;
+    device->GetCopyableFootprints(&rgb_desc, 0, 1, 0, &footprint, &rows,
+                                  &row_size, &readback_size);
+    (void)rows;
+    (void)row_size;
+    D3D12_HEAP_PROPERTIES readback_heap = {};
+    readback_heap.Type = D3D12_HEAP_TYPE_READBACK;
+    readback_heap.CreationNodeMask = 1;
+    readback_heap.VisibleNodeMask = 1;
+    D3D12_RESOURCE_DESC readback_desc = {};
+    readback_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    readback_desc.Width = readback_size;
+    readback_desc.Height = 1;
+    readback_desc.DepthOrArraySize = 1;
+    readback_desc.MipLevels = 1;
+    readback_desc.SampleDesc.Count = 1;
+    readback_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ComPtr<ID3D12Resource> readback;
+    hr = device->CreateCommittedResource(
+        &readback_heap, D3D12_HEAP_FLAG_NONE, &readback_desc,
+        D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&readback));
+    if (FAILED(hr)) {
+        print_hr("d3d12-ayuv-to-rgb-readback", hr);
+        return false;
+    }
+
+    ComPtr<ID3D12CommandQueue> copy_queue;
+    ComPtr<ID3D12CommandAllocator> copy_allocator;
+    ComPtr<ID3D12GraphicsCommandList> copy_list;
+    D3D12_COMMAND_QUEUE_DESC copy_queue_desc = {};
+    copy_queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    if (FAILED(device->CreateCommandQueue(&copy_queue_desc,
+                                          IID_PPV_ARGS(&copy_queue))) ||
+        FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                               IID_PPV_ARGS(&copy_allocator))) ||
+        FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                          copy_allocator.Get(), nullptr,
+                                          IID_PPV_ARGS(&copy_list)))) {
+        std::fputs("BLOCKED stage=d3d12-ayuv-to-rgb reason=readback-queue\n",
+                   stderr);
+        return false;
+    }
+    D3D12_RESOURCE_BARRIER copy_barrier = {};
+    copy_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    copy_barrier.Transition.pResource = rgb_texture.Get();
+    copy_barrier.Transition.Subresource = 0;
+    copy_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    copy_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    copy_list->ResourceBarrier(1, &copy_barrier);
+    D3D12_TEXTURE_COPY_LOCATION source = {};
+    source.pResource = rgb_texture.Get();
+    source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    D3D12_TEXTURE_COPY_LOCATION destination = {};
+    destination.pResource = readback.Get();
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    destination.PlacedFootprint = footprint;
+    copy_list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+    copy_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    copy_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    copy_list->ResourceBarrier(1, &copy_barrier);
+    const HRESULT copy_close_hr = copy_list->Close();
+    if (FAILED(copy_close_hr)) {
+        print_hr("d3d12-ayuv-to-rgb-copy-list", copy_close_hr);
+        return false;
+    }
+    ComPtr<ID3D12Fence> copy_fence;
+    if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+                                   IID_PPV_ARGS(&copy_fence))) ||
+        FAILED(copy_queue->Wait(process_fence.Get(), 1))) {
+        std::fputs("BLOCKED stage=d3d12-ayuv-to-rgb reason=copy-wait\n",
+                   stderr);
+        return false;
+    }
+    ID3D12CommandList *copy_lists[] = {copy_list.Get()};
+    copy_queue->ExecuteCommandLists(1, copy_lists);
+    if (FAILED(copy_queue->Signal(copy_fence.Get(), 1))) {
+        std::fputs("BLOCKED stage=d3d12-ayuv-to-rgb reason=copy-fence\n",
+                   stderr);
+        return false;
+    }
+    HANDLE event_handle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!event_handle || FAILED(copy_fence->SetEventOnCompletion(1, event_handle))) {
+        if (event_handle) CloseHandle(event_handle);
+        std::fputs("BLOCKED stage=d3d12-ayuv-to-rgb reason=fence-wait\n",
+                   stderr);
+        return false;
+    }
+    WaitForSingleObject(event_handle, INFINITE);
+    CloseHandle(event_handle);
+
+    void *mapped = nullptr;
+    const D3D12_RANGE read_range = {0, readback_size};
+    hr = readback->Map(0, &read_range, &mapped);
+    bool rgb_evidence = false;
+    std::uint64_t checksum = 1469598103934665603ull;
+    if (SUCCEEDED(hr)) {
+        const auto *bytes = static_cast<const std::uint8_t *>(mapped);
+        for (UINT y = 0; y < kHeight; ++y) {
+            const auto *row = bytes + footprint.Offset +
+                static_cast<UINT64>(y) * footprint.Footprint.RowPitch;
+            for (UINT x = 0; x < kWidth * 4; ++x) {
+                checksum ^= row[x];
+                checksum *= 1099511628211ull;
+            }
+        }
+        rgb_evidence = checksum != 1469598103934665603ull;
+        readback->Unmap(0, nullptr);
+    }
+    if (FAILED(hr)) {
+        print_hr("d3d12-ayuv-to-rgb-map", hr);
+        return false;
+    }
+    std::printf("d3d12_rgb_gpu_checksum=0x%016llx\n",
+                static_cast<unsigned long long>(checksum));
+    if (!rgb_evidence) {
+        std::fputs("BLOCKED stage=d3d12-ayuv-to-rgb reason=empty-rgb-surface\n",
+                   stderr);
+        return false;
+    }
+    std::puts("PASS stage=d3d12-ayuv-to-rgb input=AYUV output=BGRA8 gpu=1");
     return true;
 }
 
@@ -857,6 +1565,33 @@ static bool probe_ayuv_to_rgb(const D3D11Context &d3d11,
         print_hr("host-ayuv-to-rgb-video-processor", hr);
         return false;
     }
+    D3D11_TEXTURE2D_DESC readback_desc = output_desc;
+    readback_desc.Usage = D3D11_USAGE_STAGING;
+    readback_desc.BindFlags = 0;
+    readback_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    readback_desc.MiscFlags = 0;
+    ComPtr<ID3D11Texture2D> readback_texture;
+    hr = d3d11.device->CreateTexture2D(&readback_desc, nullptr,
+                                       &readback_texture);
+    if (SUCCEEDED(hr)) {
+        d3d11.context->CopyResource(readback_texture.Get(), output_texture.Get());
+        d3d11.context->Flush();
+    }
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    bool rgb_evidence = false;
+    if (SUCCEEDED(hr)) hr = d3d11.context->Map(
+        readback_texture.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+    if (SUCCEEDED(hr)) {
+        const auto *pixel = static_cast<const std::uint8_t *>(mapped.pData);
+        rgb_evidence = mapped.RowPitch >= 4 && pixel[3] != 0;
+        d3d11.context->Unmap(readback_texture.Get(), 0);
+    }
+    if (FAILED(hr) || !rgb_evidence) {
+        if (FAILED(hr)) print_hr("host-ayuv-to-rgb-readback", hr);
+        else std::fputs("BLOCKED stage=host-ayuv-to-rgb-video-processor "
+                        "reason=empty-rgb-output\n", stderr);
+        return false;
+    }
     std::puts("PASS stage=host-ayuv-to-rgb-video-processor input=AYUV "
               "output=BGRA8 color_in=BT.709-studio color_out=BT.709-full");
     return true;
@@ -937,7 +1672,7 @@ int wmain(int argc, wchar_t **argv)
     D3D12Result d3d12;
     const bool device_ok = create_d3d11_context(requested_adapter, &d3d11);
     const bool mf_ok = device_ok && probe_media_foundation(d3d11, stream, &mf);
-    const bool d3d12_ok = device_ok && probe_d3d12_decode(d3d11, &d3d12);
+    const bool d3d12_ok = device_ok && probe_d3d12_decode(d3d11, stream, &d3d12);
     const bool presentation_ok =
         mf_ok && mf.actual_decode && mf.decoded_gpu_surface &&
         mf.decoded_format_ayuv &&
@@ -946,7 +1681,8 @@ int wmain(int argc, wchar_t **argv)
     const bool mf_path = mf_ok && mf.hardware_decoder && mf.d3d_manager &&
                          mf.actual_decode && mf.decoded_gpu_surface &&
                          mf.decoded_format_ayuv && presentation_ok;
-    const bool d3d12_path = false;
+    const bool d3d12_path = d3d12_ok && d3d12.actual_decode &&
+        d3d12.decode_ayuv_to_rgb && !d3d12.decode_cpu_frame_copy;
 
     std::puts("=== AppSandbox HEVC444 Host Capability ===");
     std::printf("mf_hevc_hw_decoder=%u\n", mf.hardware_decoder ? 1U : 0U);
@@ -964,8 +1700,20 @@ int wmain(int argc, wchar_t **argv)
                 d3d12.main444_capability ? 1U : 0U);
     std::printf("d3d12_decode_ayuv_capability=%u\n",
                 d3d12.ayuv_capability ? 1U : 0U);
-    (void)d3d12_ok;
-    std::puts("d3d12_actual_decode=not-tested");
+    std::printf("d3d12_decoder_created=%u\n",
+                d3d12.decoder_created ? 1U : 0U);
+    std::printf("d3d12_decoder_heap_created=%u\n",
+                d3d12.decoder_heap_created ? 1U : 0U);
+    std::printf("d3d12_actual_decode=%s\n",
+                d3d12.actual_decode ? "PASS" : "BLOCKED");
+    std::printf("d3d12_decoded_format=%s\n",
+                d3d12.actual_decode ? "AYUV" : "UNKNOWN");
+    std::printf("d3d12_decoded_gpu_surface=%u\n",
+                d3d12.decoded_gpu_surface ? 1U : 0U);
+    std::printf("d3d12_decode_ayuv_to_rgb=%u\n",
+                d3d12.decode_ayuv_to_rgb ? 1U : 0U);
+    std::printf("d3d12_decode_cpu_frame_copy=%u\n",
+                d3d12.decode_cpu_frame_copy ? 1U : 0U);
     std::printf("ayuv_to_rgb_video_processor=%u\n",
                 presentation_ok ? 1U : 0U);
     std::puts("hardware_decode_only=1");

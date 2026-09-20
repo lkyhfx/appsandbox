@@ -15,7 +15,7 @@ after metadata and the generated Annex-B stream pass validation.
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 | Windows Host native D3D12 encode | 0 | 0 (AYUV) | 0 | BLOCKED (capability gate) | n/a | 0 | RTX 4070 run of `appsandbox-hevc444-encode-probe.exe`; HEVC codec=1, resource requirements=1, profile/config/AYUV=0 |
 | Windows Host MF decode + D3D11 presentation | BLOCKED | BLOCKED | n/a | BLOCKED | BLOCKED | BLOCKED | bundled sample reached real MFT probe; hardware HEVC MFT count=0 |
-| Windows Host native D3D12 decode | 1 | AYUV=1 | n/a | capability-only | AYUV object creation only | not tested | standalone decoder/heap capability probe; actual decode not run |
+| Windows Host native D3D12 decode | 1 | AYUV=1 | n/a | actual `DecodeFrame` probe | AYUV GPU surface + readback checksum | 3840x2160@60 decode query | bundled IRAP submitted through `ID3D12VideoDecodeCommandList`; result is reported as PASS/BLOCKED at runtime |
 | Linux Guest GPU-PV D3D12 encode | 0 (Main444) | 0 (AYUV) | BLOCKED | BLOCKED | n/a | 0 (Main444) | latest re-run unavailable: SSH to `yunsen@192.168.42.2` returned `Permission denied`; prior probe recorded standard Main/NV12 4K60 PASS |
 | Windows native NVENC | BLOCKED | BLOCKED | BLOCKED | BLOCKED | n/a | BLOCKED | NVIDIA Video Codec SDK is not installed; DLL loading is not treated as support |
 
