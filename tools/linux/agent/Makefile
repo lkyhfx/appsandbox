@@ -34,7 +34,8 @@ test: $(TEST_BINS)
 	./tests/test_display_snapshot
 
 tests/test_display_snapshot: tests/test_display_snapshot.c \
-		../../../src/core/display_snapshot.h ../../../src/core/display_protocol.h
+		../../../src/core/display_snapshot.h ../../../src/core/display_protocol.h \
+		../../../src/core/display_fb_state.h
 	$(CC) $(CFLAGS) -I../../../src/core -o $@ $<
 
 appsandbox-agent: appsandbox-agent.c

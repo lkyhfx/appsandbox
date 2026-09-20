@@ -229,7 +229,7 @@ struct VmDisplayIdd {
     ULONGLONG      host_gpu_upload_bytes;
     ULONGLONG      host_stats_start_ms;
     ULONGLONG      host_stats_last_log_ms;
-    ULONGLONG      lost_dirty_updates;
+    ULONGLONG      frame_seq_gaps;
     ULONGLONG      last_frame_seq;
     BOOL           have_frame_seq;
 
@@ -1666,13 +1666,13 @@ static void maybe_log_host_stats(VmDisplayIdd *d)
     idd_log(d, L"display_stats scope=host resolution=%ux%u logical_refresh_hz=60 "
             L"host_full_uploads=%llu host_partial_uploads=%llu "
             L"host_gpu_upload_bytes=%llu host_gpu_upload_mib_per_sec=%.3f "
-            L"recv_fps=%.2f present_fps=%.2f lost_dirty_updates=%llu",
+            L"recv_fps=%.2f present_fps=%.2f frame_seq_gaps=%llu",
             d->frame_width, d->frame_height,
             d->host_full_uploads, d->host_partial_uploads,
             d->host_gpu_upload_bytes, mib_per_sec,
             elapsed ? (double)d->recv_count * 1000.0 / elapsed : 0.0,
             elapsed ? (double)d->render_count * 1000.0 / elapsed : 0.0,
-            d->lost_dirty_updates);
+            d->frame_seq_gaps);
 }
 
 static BOOL d3d_init(VmDisplayIdd *d)
@@ -2376,10 +2376,10 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 if (hdr.frame_seq != expected) {
                     ULONGLONG missing = (hdr.frame_seq > expected)
                         ? hdr.frame_seq - expected : 1;
-                    d->lost_dirty_updates += missing;
+                    d->frame_seq_gaps += missing;
                     idd_log(d, L"Frame sequence gap: expected=%llu got=%llu "
-                            L"(lost_dirty_updates=%llu)",
-                            expected, hdr.frame_seq, d->lost_dirty_updates);
+                            L"(frame_seq_gaps=%llu)",
+                            expected, hdr.frame_seq, d->frame_seq_gaps);
                 }
             }
             d->last_frame_seq = hdr.frame_seq;

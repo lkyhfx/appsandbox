@@ -39,6 +39,7 @@
 
 #include "../../../src/core/display_protocol.h"
 #include "../../../src/core/display_snapshot.h"
+#include "../../../src/core/display_fb_state.h"
 
 #define VSOCK_PORT      2
 #define FRAME_MAGIC     ASB_DISPLAY_RAW_MAGIC
@@ -50,7 +51,15 @@
 
 #define CURSOR_TYPE_MASKED_COLOR  1
 #define CURSOR_TYPE_ALPHA         2
-#define STATS_US_BUCKETS          5001u /* last bucket means >= 5000 us */
+#define STATS_US_BUCKETS          50001u /* 0..50 ms at 1 us; last means >= 50 ms */
+
+enum full_frame_reason {
+    FULL_REASON_NONE = 0,
+    FULL_REASON_LAYOUT_CHANGE,
+    FULL_REASON_DIRTY_THRESHOLD,
+    FULL_REASON_RECT_OVERFLOW,
+    FULL_REASON_RECOVERY,
+};
 
 #pragma pack(push, 1)
 typedef AsbDisplayFrameHeader frame_header;
@@ -129,6 +138,9 @@ struct capture_ctx {
     uint32_t width;
     uint32_t height;
     uint32_t stride;
+    uint32_t pixel_format;
+    AsbDisplayFbLayout last_layout;
+    int       last_layout_valid;
     uint8_t *mem;        /* mmapped framebuffer (read-only) */
     size_t   mem_size;
     int      dma_fd;
@@ -149,6 +161,7 @@ struct capture_ctx {
     size_t    snapshot_size;
     size_t    snapshot_cap;
     int       force_full;
+    enum full_frame_reason full_reason;
 
     struct {
         uint64_t frames_scanned;
@@ -165,6 +178,12 @@ struct capture_ctx {
         uint64_t dirty_scan_us_buckets[STATS_US_BUCKETS];
         uint64_t snapshot_pack_us_buckets[STATS_US_BUCKETS];
         uint64_t snapshot_pack_samples;
+        uint64_t fb_id_changes;
+        uint64_t layout_changes;
+        uint64_t full_due_to_layout_change;
+        uint64_t full_due_to_dirty_threshold;
+        uint64_t full_due_to_rect_overflow;
+        uint64_t full_due_to_recovery;
         uint64_t start_ns;
         uint64_t last_log_ns;
     } stats;
@@ -186,9 +205,10 @@ static void stats_record_us(uint64_t *total, uint64_t *buckets,
     buckets[bucket]++;
 }
 
-static uint64_t stats_p95_us(const uint64_t *buckets, uint64_t samples)
+static uint64_t stats_percentile_us(const uint64_t *buckets, uint64_t samples,
+                                    uint64_t percentile)
 {
-    uint64_t target = (samples * 95 + 99) / 100;
+    uint64_t target = (samples * percentile + 99) / 100;
     uint64_t seen = 0;
     uint64_t i;
 
@@ -198,6 +218,38 @@ static uint64_t stats_p95_us(const uint64_t *buckets, uint64_t samples)
         if (seen >= target) return i;
     }
     return STATS_US_BUCKETS - 1;
+}
+
+static void request_full(struct capture_ctx *c, enum full_frame_reason reason)
+{
+    int was_full = c->force_full;
+
+    c->force_full = 1;
+    if (reason != FULL_REASON_NONE &&
+        (!was_full || c->full_reason == FULL_REASON_NONE ||
+         reason == FULL_REASON_RECOVERY))
+        c->full_reason = reason;
+}
+
+static void record_full_reason(struct capture_ctx *c,
+                               enum full_frame_reason reason)
+{
+    switch (reason) {
+    case FULL_REASON_LAYOUT_CHANGE:
+        c->stats.full_due_to_layout_change++;
+        break;
+    case FULL_REASON_DIRTY_THRESHOLD:
+        c->stats.full_due_to_dirty_threshold++;
+        break;
+    case FULL_REASON_RECT_OVERFLOW:
+        c->stats.full_due_to_rect_overflow++;
+        break;
+    case FULL_REASON_RECOVERY:
+    case FULL_REASON_NONE:
+    default:
+        c->stats.full_due_to_recovery++;
+        break;
+    }
 }
 
 static int checked_frame_size(uint32_t stride, uint32_t height, size_t *out)
@@ -252,6 +304,7 @@ static void free_capture_buffers(struct capture_ctx *c)
     c->snapshot = NULL;
     c->shadow_size = c->dirty_tiles_cap = c->work_rects_cap = 0;
     c->snapshot_size = c->snapshot_cap = 0;
+    c->shadow_stride = c->shadow_width = c->shadow_height = 0;
 }
 
 static int ensure_snapshot_buffer(struct capture_ctx *c, size_t size)
@@ -276,17 +329,28 @@ static int ensure_snapshot_buffer(struct capture_ctx *c, size_t size)
     return 0;
 }
 
-static int prepare_shadow(struct capture_ctx *c, size_t size)
+static void invalidate_shadow(struct capture_ctx *c,
+                              enum full_frame_reason reason)
+{
+    free(c->shadow);
+    c->shadow = NULL;
+    c->shadow_size = 0;
+    c->shadow_stride = c->shadow_width = c->shadow_height = 0;
+    request_full(c, reason);
+}
+
+static int prepare_shadow(struct capture_ctx *c, size_t size,
+                           enum full_frame_reason reason)
 {
     if (c->shadow_width == c->width && c->shadow_height == c->height &&
         c->shadow_stride == c->stride && c->shadow_size == size && c->shadow)
         return 0;
 
-    free(c->shadow);
+    invalidate_shadow(c, reason);
     c->shadow = (uint8_t *)malloc(size);
     if (!c->shadow) {
         c->shadow_size = 0;
-        c->force_full = 1;
+        request_full(c, FULL_REASON_RECOVERY);
         return -1;
     }
     c->shadow_size = size;
@@ -294,7 +358,7 @@ static int prepare_shadow(struct capture_ctx *c, size_t size)
     c->shadow_width = c->width;
     c->shadow_height = c->height;
     memset(c->shadow, 0, size);
-    c->force_full = 1;
+    request_full(c, reason);
     return 0;
 }
 
@@ -306,10 +370,10 @@ static void drm_release_fb(struct capture_ctx *c)
     }
     if (c->dma_fd >= 0) { close(c->dma_fd); c->dma_fd = -1; }
     c->fb_id_last = 0;
-    c->width = c->height = c->stride = 0;
-    /* A new GEM buffer has no relationship to the old shadow, even when its
-     * dimensions happen to match. The next successful send must be full. */
-    c->force_full = 1;
+    c->width = c->height = c->stride = c->pixel_format = 0;
+    /* Release only the mapping. Keep last_layout and shadow state so a
+     * subsequent FB_ID can be compared against them. A page flip is not a
+     * display-layout change and must not invalidate the host shadow. */
 }
 
 /* Find the active primary-plane framebuffer and map it for read.
@@ -360,6 +424,8 @@ static int drm_acquire_fb(struct capture_ctx *c)
         }
 
         uint32_t fb_id = p->fb_id;
+        uint32_t old_fb_id = c->fb_id_last;
+        AsbDisplayFbLayout old_layout = c->last_layout;
         drmModeFB2 *fb2 = drmModeGetFB2(c->fd, fb_id);
         drmModeFreePlane(p);
         if (!fb2) continue;
@@ -371,6 +437,7 @@ static int drm_acquire_fb(struct capture_ctx *c)
             continue;
         }
 
+        uint32_t pixel_format = fb2->pixel_format;
         uint32_t handle = fb2->handles[0];
         uint32_t pitch  = fb2->pitches[0];
         uint32_t height = fb2->height;
@@ -396,15 +463,38 @@ static int drm_acquire_fb(struct capture_ctx *c)
             continue;
         }
 
+        AsbDisplayFbLayout new_layout = {
+            width, height, pitch, pixel_format
+        };
+        int have_old_layout = c->last_layout_valid;
+        int same_layout = have_old_layout &&
+                          asb_display_fb_layout_equal(&old_layout, &new_layout);
+        int shadow_usable = c->shadow &&
+                            c->shadow_size == size &&
+                            c->shadow_width == width &&
+                            c->shadow_height == height &&
+                            c->shadow_stride == pitch;
+        enum full_frame_reason shadow_reason =
+            !same_layout ? FULL_REASON_LAYOUT_CHANGE :
+            (shadow_usable ? FULL_REASON_NONE : FULL_REASON_RECOVERY);
+
+        if (old_fb_id && old_fb_id != fb_id)
+            c->stats.fb_id_changes++;
+        if (have_old_layout && !same_layout)
+            c->stats.layout_changes++;
+
         drm_release_fb(c);
         c->fb_id_last = fb_id;
         c->width  = width;
         c->height = height;
         c->stride = pitch;
+        c->pixel_format = pixel_format;
+        c->last_layout = new_layout;
+        c->last_layout_valid = 1;
         c->mem      = (uint8_t *)m;
         c->mem_size = size;
         c->dma_fd   = dma_fd;
-        (void)prepare_shadow(c, size);
+        (void)prepare_shadow(c, size, shadow_reason);
         (void)ensure_tile_buffers(c);
         rc = 0;
         goto out;
@@ -673,10 +763,13 @@ static int scan_dirty_tiles(struct capture_ctx *c, AsbDisplayRect *rects,
     *dirty_area = 0;
     *full = c->force_full || !c->shadow;
     if (*full) {
+        if (c->full_reason == FULL_REASON_NONE)
+            request_full(c, FULL_REASON_RECOVERY);
         *dirty_area = total_area;
         return 0;
     }
     if (ensure_tile_buffers(c) < 0) {
+        request_full(c, FULL_REASON_RECOVERY);
         *full = 1;
         *dirty_area = total_area;
         return 0;
@@ -713,6 +806,7 @@ static int scan_dirty_tiles(struct capture_ctx *c, AsbDisplayRect *rects,
     /* Once the changed area is close to the full desktop, one contiguous
      * upload is cheaper and avoids producing a pathological rect list. */
     if (*dirty_area * 100 >= total_area * 60) {
+        request_full(c, FULL_REASON_DIRTY_THRESHOLD);
         *full = 1;
         *dirty_area = total_area;
         return 0;
@@ -747,6 +841,7 @@ static int scan_dirty_tiles(struct capture_ctx *c, AsbDisplayRect *rects,
                 c->work_rects[work_count - 1].bottom = run.bottom;
             } else {
                 if (work_count >= c->work_rects_cap) {
+                    request_full(c, FULL_REASON_RECT_OVERFLOW);
                     *full = 1;
                     *dirty_area = total_area;
                     return 0;
@@ -757,6 +852,7 @@ static int scan_dirty_tiles(struct capture_ctx *c, AsbDisplayRect *rects,
     }
 
     if (work_count > MAX_DIRTY_RECTS) {
+        request_full(c, FULL_REASON_RECT_OVERFLOW);
         *full = 1;
         *dirty_area = total_area;
         return 0;
@@ -812,6 +908,7 @@ static int commit_shadow_from_snapshot(struct capture_ctx *c,
                                     rects, rect_count, full) < 0)
         return -1;
     c->force_full = 0;
+    c->full_reason = FULL_REASON_NONE;
     return 0;
 }
 
@@ -854,8 +951,9 @@ static void maybe_log_stats(struct capture_ctx *c)
     uint64_t now = monotonic_ns();
     uint64_t total = c->stats.frames_scanned;
     uint64_t target, seen = 0, p95_bucket = 100;
-    double seconds, avg, mib_per_sec;
-    uint64_t dirty_scan_p95, snapshot_pack_p95;
+    double seconds, avg, mib_per_sec, fb_id_changes_per_sec;
+    uint64_t dirty_scan_p95, dirty_scan_p99;
+    uint64_t snapshot_pack_p95, snapshot_pack_p99;
     int i;
 
     if (!c->stats.start_ns) c->stats.start_ns = now;
@@ -869,37 +967,58 @@ static void maybe_log_stats(struct capture_ctx *c)
         if (seen >= target) { p95_bucket = (uint64_t)i; break; }
     }
     seconds = (double)(now - c->stats.start_ns) / 1000000000.0;
+    fb_id_changes_per_sec = seconds > 0.0
+        ? (double)c->stats.fb_id_changes / seconds : 0.0;
     avg = (double)c->stats.dirty_area_sum /
           ((double)total * c->width * c->height);
     mib_per_sec = seconds > 0.0
         ? (double)c->stats.wire_bytes_total / seconds / (1024.0 * 1024.0)
         : 0.0;
-    dirty_scan_p95 = stats_p95_us(c->stats.dirty_scan_us_buckets, total);
-    snapshot_pack_p95 = stats_p95_us(c->stats.snapshot_pack_us_buckets,
-                                     c->stats.snapshot_pack_samples);
+    dirty_scan_p95 = stats_percentile_us(c->stats.dirty_scan_us_buckets,
+                                         total, 95);
+    dirty_scan_p99 = stats_percentile_us(c->stats.dirty_scan_us_buckets,
+                                         total, 99);
+    snapshot_pack_p95 = stats_percentile_us(c->stats.snapshot_pack_us_buckets,
+                                            c->stats.snapshot_pack_samples, 95);
+    snapshot_pack_p99 = stats_percentile_us(c->stats.snapshot_pack_us_buckets,
+                                            c->stats.snapshot_pack_samples, 99);
     agent_log("display_stats scope=guest resolution=%ux%u logical_refresh_hz=%u "
               "frames_scanned=%llu frames_sent=%llu full_frames_sent=%llu "
               "dirty_frames_sent=%llu unchanged_frames_skipped=%llu "
+              "fb_id_changes=%llu fb_id_changes_per_sec=%.3f layout_changes=%llu "
+              "full_due_to_layout_change=%llu "
+              "full_due_to_dirty_threshold=%llu "
+              "full_due_to_rect_overflow=%llu full_due_to_recovery=%llu "
               "dirty_rects_total=%llu dirty_area_ratio_avg=%.5f "
               "dirty_area_ratio_p95=%.2f wire_bytes_total=%llu wire_mib_per_sec=%.3f "
-              "dirty_scan_us_avg=%.2f dirty_scan_us_p95=%llu "
+              "dirty_scan_us_avg=%.2f dirty_scan_us_p95=%llu dirty_scan_us_p99=%llu "
               "snapshot_pack_us_avg=%.2f snapshot_pack_us_p95=%llu "
+              "snapshot_pack_us_p99=%llu "
               "DRM_DAMAGE_AVAILABLE=%u fallback=tile64",
               c->width, c->height, TARGET_FPS,
               (unsigned long long)c->stats.frames_scanned,
               (unsigned long long)c->stats.frames_sent,
-              (unsigned long long)c->stats.full_frames_sent,
-              (unsigned long long)c->stats.dirty_frames_sent,
-              (unsigned long long)c->stats.unchanged_frames_skipped,
-              (unsigned long long)c->stats.dirty_rects_total, avg,
+               (unsigned long long)c->stats.full_frames_sent,
+               (unsigned long long)c->stats.dirty_frames_sent,
+               (unsigned long long)c->stats.unchanged_frames_skipped,
+               (unsigned long long)c->stats.fb_id_changes,
+               fb_id_changes_per_sec,
+               (unsigned long long)c->stats.layout_changes,
+               (unsigned long long)c->stats.full_due_to_layout_change,
+               (unsigned long long)c->stats.full_due_to_dirty_threshold,
+               (unsigned long long)c->stats.full_due_to_rect_overflow,
+               (unsigned long long)c->stats.full_due_to_recovery,
+               (unsigned long long)c->stats.dirty_rects_total, avg,
               (double)p95_bucket / 100.0,
               (unsigned long long)c->stats.wire_bytes_total, mib_per_sec,
               total ? (double)c->stats.dirty_scan_us_total / total : 0.0,
-              (unsigned long long)dirty_scan_p95,
+               (unsigned long long)dirty_scan_p95,
+               (unsigned long long)dirty_scan_p99,
               c->stats.snapshot_pack_samples
                   ? (double)c->stats.snapshot_pack_us_total /
                     c->stats.snapshot_pack_samples : 0.0,
-              (unsigned long long)snapshot_pack_p95,
+               (unsigned long long)snapshot_pack_p95,
+               (unsigned long long)snapshot_pack_p99,
               ASB_DISPLAY_DRM_DAMAGE_AVAILABLE);
 }
 
@@ -1086,6 +1205,7 @@ have_card:
                 ctx.stats.unchanged_frames_skipped++;
             } else {
                 uint64_t pack_start = monotonic_ns();
+                enum full_frame_reason sent_reason = ctx.full_reason;
                 int pack_rc = build_frame_snapshot(&ctx, rects, rect_count, full);
                 stats_record_us(&ctx.stats.snapshot_pack_us_total,
                                 ctx.stats.snapshot_pack_us_buckets,
@@ -1094,7 +1214,7 @@ have_card:
                 if (pack_rc < 0) {
                     /* Keep the shadow untouched. Retry as a full snapshot on
                      * the next tick if staging allocation/layout failed. */
-                    ctx.force_full = 1;
+                    request_full(&ctx, FULL_REASON_RECOVERY);
                     agent_log("snapshot staging failed; retrying full frame");
                 } else if (send_frame_snapshot(client_fd, &ctx, ++seq,
                                                rects, rect_count, full,
@@ -1102,14 +1222,17 @@ have_card:
                     agent_log("client disconnected");
                     break;
                 } else if (commit_shadow_from_snapshot(&ctx, rects,
-                                                       rect_count, full) < 0) {
+                                                        rect_count, full) < 0) {
                     agent_log("snapshot shadow commit failed; forcing full frame");
-                    ctx.force_full = 1;
+                    request_full(&ctx, FULL_REASON_RECOVERY);
                 } else {
                     ctx.stats.frames_sent++;
                     ctx.stats.wire_bytes_total += wire_bytes;
                     ctx.stats.dirty_rects_total += rect_count;
-                    if (full) ctx.stats.full_frames_sent++;
+                    if (full) {
+                        ctx.stats.full_frames_sent++;
+                        record_full_reason(&ctx, sent_reason);
+                    }
                     else      ctx.stats.dirty_frames_sent++;
                 }
             }
