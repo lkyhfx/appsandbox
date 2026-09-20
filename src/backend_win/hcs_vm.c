@@ -1028,7 +1028,8 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
 
     /* ComPorts — virtual COM1 wired to a named pipe (\\.\pipe\<vm>.com1)
        for Linux VMs. systemd's StandardOutput=journal+console writes
-       firstboot script output to /dev/console (= /dev/ttyS0 = com1),
+       firstboot script output to /dev/console (= ttyS0 on x64 or ttyAMA0 on
+       ARM64 = com1),
        which is the only practical way to debug agent / DKMS build
        failures from the host without an SSH session into the guest.
        Windows VMs omit it. */

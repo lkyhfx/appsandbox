@@ -189,6 +189,14 @@
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
     </DriverSign>
   </ItemDefinitionGroup>
+  <!-- The VAD sources contain valid UTF-8 comments. Keep MSVC from decoding them
+       with the host code page (for example CP936), which raises C4819 and, with
+       /WX enabled, fails the build as C2220. -->
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+  </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="adapter.cpp" />
     <ClCompile Include="adaptercommon.cpp" />

@@ -17,6 +17,7 @@
 #include "vmms_cert.h"
 #include "vm_agent.h"
 #include "vm_ssh_proxy.h"
+#include "linux_tty.h"
 #include "prereq.h"
 #include "ui.h"
 
@@ -887,6 +888,7 @@ static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
                (snapshot/branch revert), so "deployed" is only valid per boot.
                The guest-side write is idempotent. */
             instance->ssh_key_deployed = FALSE;
+            linux_tty_stop(instance);
             hcs_stop_monitor(instance);
             vm_ssh_proxy_stop(instance);
             vm_agent_stop(instance);
@@ -1181,6 +1183,7 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
             asb_alert(L"The host doesn't have enough resources to start this VM.");
     } else {
         asb_log(L"VM \"%s\" started.", vm->name);
+        linux_tty_start(vm);
         /* Agent + IDD probe run for any OS: hcs_service_guid() resolves
            per-OS to the correct HV-socket service GUID, and the in-VM
            agent listens on AF_HYPERV (Windows) or AF_VSOCK (Linux). */
@@ -1542,6 +1545,7 @@ done:
                 LeaveCriticalSection(&g_cs);
 
                 hcs_start_monitor(inst);
+                linux_tty_start(inst);
                 if (inst->is_template) {
                     asb_log(L"Template \"%s\" building (sysprep will shut down when ready).", inst->name);
                 } else {
@@ -2696,6 +2700,7 @@ done:
                 LeaveCriticalSection(&g_cs);
 
                 hcs_start_monitor(inst);
+                linux_tty_start(inst);
                 vm_agent_start(inst);
                 idd_probe_start(inst);
                 asb_log(L"VM \"%s\" created and started.", inst->name);
@@ -2828,6 +2833,7 @@ ASB_API void asb_cleanup(void)
     if (!g_initialized) return;
 
     for (i = 0; i < g_vm_count; i++) {
+        linux_tty_stop(&g_vms[i]);
         hcs_stop_monitor(&g_vms[i]);
         vm_ssh_proxy_stop(&g_vms[i]);
         vm_agent_stop(&g_vms[i]);
@@ -2857,6 +2863,7 @@ ASB_API void asb_detach(void)
        handle.  Instead, let the OS close it during process teardown after
        the callback is already gone. */
     for (i = 0; i < g_vm_count; i++) {
+        linux_tty_stop(&g_vms[i]);
         hcs_stop_monitor(&g_vms[i]);
         vm_ssh_proxy_stop(&g_vms[i]);
         vm_agent_stop(&g_vms[i]);
@@ -3636,6 +3643,7 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     asb_log(L"Starting VM \"%s\"...", cfg.name);
     hr = hcs_start_vm(inst);
     if (SUCCEEDED(hr)) {
+        linux_tty_start(inst);
         hcs_start_monitor(inst);
         vm_agent_start(inst);
         idd_probe_start(inst);
@@ -3754,6 +3762,7 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
             return hr;
         }
         asb_log(L"VM \"%s\" started.", inst->name);
+        linux_tty_start(inst);
         vm_agent_start(inst);
         idd_probe_start(inst);
         hcs_start_monitor(inst);
@@ -3810,6 +3819,7 @@ ASB_API HRESULT asb_vm_stop(AsbVm vm)
     inst->shutdown_requested = FALSE;
     inst->hyperv_video_off = FALSE;
     inst->ssh_key_deployed = FALSE;   /* disk may change while stopped (revert) -- re-deploy next boot */
+    linux_tty_stop(inst);
     hcs_stop_monitor(inst);
     vm_ssh_proxy_stop(inst);
     vm_agent_stop(inst);
@@ -3853,6 +3863,7 @@ ASB_API HRESULT asb_vm_delete(AsbVm vm)
     }
     if (!(attrs & FILE_ATTRIBUTE_DIRECTORY)) return HRESULT_FROM_WIN32(ERROR_DIRECTORY);
 
+    linux_tty_stop(inst);
     hcs_stop_monitor(inst);
     vm_ssh_proxy_stop(inst);
     vm_agent_stop(inst);

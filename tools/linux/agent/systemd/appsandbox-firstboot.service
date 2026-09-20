@@ -18,8 +18,10 @@ ExecStart=/opt/appsandbox/setup.sh
 ExecStartPost=/bin/rm -f /etc/appsandbox-firstboot.marker
 # apt install of ubuntu-desktop-minimal can take 10-15 min on a slow link.
 TimeoutStartSec=45min
-StandardOutput=journal
-StandardError=journal
+# Keep the journal copy and mirror the service's output to the kernel console
+# so HCS COM1 captures first-boot diagnostics.
+StandardOutput=journal+console
+StandardError=journal+console
 RemainAfterExit=true
 
 [Install]
