@@ -68,40 +68,14 @@
     </Exec>
     <PropertyGroup>
       <AsbSourceRefFromGit>$([System.String]::Copy('$(AsbGitCommitOutput)').Trim())</AsbSourceRefFromGit>
-      <AsbSourceRefFromGitIsSha>$([System.Text.RegularExpressions.Regex]::IsMatch('$(AsbSourceRefFromGit)', '^[0-9A-Fa-f]{40}
-    <ItemGroup>
-      <_AsbSourceHeaderLines Include="#ifndef ASB_BUILD_SOURCE_H" />
-      <_AsbSourceHeaderLines Include="#define ASB_BUILD_SOURCE_H" />
-      <_AsbSourceHeaderLines Include="#define ASB_SOURCE_REPO &quot;$(AsbSourceRepo)&quot;" />
-      <_AsbSourceHeaderLines Include="#define ASB_SOURCE_REF &quot;$(AsbSourceRef)&quot;" />
-      <_AsbSourceHeaderLines Include="#endif" />
-    </ItemGroup>
-    <WriteLinesToFile File="$(AsbGeneratedDir)asb_build_source.h"
-                      Lines="@(_AsbSourceHeaderLines)"
-                      Overwrite="true" />
-  </Target>
-</Project>
-))</AsbSourceRefFromGitIsSha>
+      <AsbSourceRefFromGitIsSha>$([System.Text.RegularExpressions.Regex]::IsMatch('$(AsbSourceRefFromGit)', '^[0-9A-Fa-f]{40}$'))</AsbSourceRefFromGitIsSha>
       <AsbStrictSourceBinding Condition="'$(Configuration)' == 'Release' Or '$(CI)' == 'true' Or '$(CI)' == '1'">true</AsbStrictSourceBinding>
       <AsbGitDirty Condition="'$(AsbGitCommitExitCode)' == '0' And '$(AsbGitDirtyExitCode)' != '0'">true</AsbGitDirty>
 
       <AsbSourceRef Condition="'$(AsbSourceRef)' == '' And '$(AsbGitCommitExitCode)' == '0' And '$(AsbSourceRefFromGitIsSha)' == 'True'">$(AsbSourceRefFromGit)</AsbSourceRef>
       <AsbSourceRef Condition="'$(AsbSourceRef)' == ''">main</AsbSourceRef>
       <AsbSourceRefFallback Condition="'$(AsbSourceRefWasSupplied)' != 'true' And ('$(AsbGitCommitExitCode)' != '0' Or '$(AsbSourceRefFromGitIsSha)' != 'True')">true</AsbSourceRefFallback>
-      <AsbSourceRefIsSha>$([System.Text.RegularExpressions.Regex]::IsMatch('$(AsbSourceRef)', '^[0-9A-Fa-f]{40}
-    <ItemGroup>
-      <_AsbSourceHeaderLines Include="#ifndef ASB_BUILD_SOURCE_H" />
-      <_AsbSourceHeaderLines Include="#define ASB_BUILD_SOURCE_H" />
-      <_AsbSourceHeaderLines Include="#define ASB_SOURCE_REPO &quot;$(AsbSourceRepo)&quot;" />
-      <_AsbSourceHeaderLines Include="#define ASB_SOURCE_REF &quot;$(AsbSourceRef)&quot;" />
-      <_AsbSourceHeaderLines Include="#endif" />
-    </ItemGroup>
-    <WriteLinesToFile File="$(AsbGeneratedDir)asb_build_source.h"
-                      Lines="@(_AsbSourceHeaderLines)"
-                      Overwrite="true" />
-  </Target>
-</Project>
-))</AsbSourceRefIsSha>
+      <AsbSourceRefIsSha>$([System.Text.RegularExpressions.Regex]::IsMatch('$(AsbSourceRef)', '^[0-9A-Fa-f]{40}$'))</AsbSourceRefIsSha>
     </PropertyGroup>
 
     <Error Condition="'$(AsbStrictSourceBinding)' == 'true' And '$(AsbSourceRefFallback)' == 'true'"
