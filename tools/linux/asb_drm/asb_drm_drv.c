@@ -17,6 +17,7 @@
 
 #include <linux/module.h>
 #include <linux/moduleparam.h>
+#include <linux/kernel.h>
 #include <linux/platform_device.h>
 #include <linux/string.h>
 #include <linux/version.h>
@@ -41,16 +42,108 @@
 static unsigned int width_param   = ASB_DEFAULT_WIDTH;
 static unsigned int height_param  = ASB_DEFAULT_HEIGHT;
 static unsigned int refresh_param = ASB_DEFAULT_REFRESH;
-static char profile_param[8]      = "1080p";
+static char profile_param[8]      = "720p";
 
 module_param_named(width,   width_param,   uint, 0444);
-MODULE_PARM_DESC(width,   "Initial display width  (default 1920)");
+MODULE_PARM_DESC(width,   "Initial display width  (default 1280)");
 module_param_named(height,  height_param,  uint, 0444);
-MODULE_PARM_DESC(height,  "Initial display height (default 1080)");
+MODULE_PARM_DESC(height,  "Initial display height (default 720)");
 module_param_named(refresh, refresh_param, uint, 0444);
 MODULE_PARM_DESC(refresh, "Refresh rate in Hz     (default 60)");
 module_param_string(profile, profile_param, sizeof(profile_param), 0444);
-MODULE_PARM_DESC(profile, "Display profile: 1080p (default) or 4k (3840x2160@60)");
+MODULE_PARM_DESC(profile, "Display profile: 720p (default), 1080p, or 4k (3840x2160@60)");
+
+void asb_mode_snapshot(struct asb_device *asb, unsigned int *width,
+                       unsigned int *height, unsigned int *refresh,
+                       bool *runtime_mode)
+{
+	mutex_lock(&asb->mode_lock);
+	if (width) *width = asb->width;
+	if (height) *height = asb->height;
+	if (refresh) *refresh = asb->refresh;
+	if (runtime_mode) *runtime_mode = asb->runtime_mode;
+	mutex_unlock(&asb->mode_lock);
+}
+
+int asb_mode_set_runtime(struct asb_device *asb, unsigned int width,
+                         unsigned int height, unsigned int refresh)
+{
+	bool changed;
+
+	if (width < ASB_MIN_WIDTH || width > ASB_MAX_WIDTH ||
+	    height < ASB_MIN_HEIGHT || height > ASB_MAX_HEIGHT ||
+	    refresh < 24 || refresh > 240)
+		return -EINVAL;
+	/* Keep direct sysfs writers on the same boundaries as the display
+	 * control protocol. The guest agent normally performs this normalization
+	 * before reaching sysfs, but the kernel entry point must be safe alone. */
+	width = width > ASB_MAX_WIDTH - 7u ? ASB_MAX_WIDTH : (width + 7u) & ~7u;
+	height = height > ASB_MAX_HEIGHT - 1u ? ASB_MAX_HEIGHT : (height + 1u) & ~1u;
+
+	mutex_lock(&asb->mode_lock);
+	changed = !asb->runtime_mode || asb->width != width ||
+	          asb->height != height || asb->refresh != refresh;
+	asb->width = width;
+	asb->height = height;
+	asb->refresh = refresh;
+	asb->runtime_mode = true;
+	WRITE_ONCE(asb->vblank_period, ns_to_ktime(NSEC_PER_SEC / refresh));
+	mutex_unlock(&asb->mode_lock);
+
+	if (!changed)
+		return 0;
+
+	/* Publish the new preferred mode before asking userspace to reprobe. */
+	asb_build_edid(asb);
+	drm_kms_helper_hotplug_event(&asb->drm);
+	return 0;
+}
+
+static ssize_t mode_show(struct device *dev, struct device_attribute *attr,
+                         char *buf)
+{
+	struct drm_device *drm = dev_get_drvdata(dev);
+	struct asb_device *asb = to_asb(drm);
+	unsigned int width, height, refresh;
+
+	asb_mode_snapshot(asb, &width, &height, &refresh, NULL);
+	return sysfs_emit(buf, "%ux%u@%u\n", width, height, refresh);
+}
+
+static ssize_t mode_store(struct device *dev, struct device_attribute *attr,
+                          const char *buf, size_t count)
+{
+	struct drm_device *drm = dev_get_drvdata(dev);
+	struct asb_device *asb = to_asb(drm);
+	char mode[32];
+	char *p, *x, *at;
+	unsigned int width, height, refresh;
+	int ret;
+
+	if (count == 0 || count >= sizeof(mode))
+		return -EINVAL;
+	memcpy(mode, buf, count);
+	mode[count] = '\0';
+	p = strim(mode);
+	x = strchr(p, 'x');
+	at = x ? strchr(x + 1, '@') : NULL;
+	if (!x || !at || x == p || at == x + 1 || !at[1])
+		return -EINVAL;
+	*x = '\0';
+	*at = '\0';
+	ret = kstrtouint(p, 10, &width);
+	if (ret) return ret;
+	ret = kstrtouint(x + 1, 10, &height);
+	if (ret) return ret;
+	ret = kstrtouint(at + 1, 10, &refresh);
+	if (ret) return ret;
+	ret = asb_mode_set_runtime(asb, width, height, refresh);
+	if (ret) return ret;
+	dev_info(dev, "runtime_mode=%ux%u@%uHz\n", width, height, refresh);
+	return count;
+}
+
+static DEVICE_ATTR_RW(mode);
 
 /* --------------------------------------------------------------------------
  * drm_driver
@@ -113,8 +206,8 @@ static int asb_mode_config_setup(struct asb_device *asb)
 	if (ret)
 		return ret;
 
-	drm->mode_config.min_width   = 64;
-	drm->mode_config.min_height  = 64;
+	drm->mode_config.min_width   = ASB_MIN_WIDTH;
+	drm->mode_config.min_height  = ASB_MIN_HEIGHT;
 	drm->mode_config.max_width   = ASB_MAX_WIDTH;
 	drm->mode_config.max_height  = ASB_MAX_HEIGHT;
 	drm->mode_config.cursor_width  = ASB_CURSOR_MAX_W;
@@ -151,16 +244,22 @@ static int asb_probe(struct platform_device *pdev)
 	drm = &asb->drm;
 	platform_set_drvdata(pdev, drm);
 
-	/* Clamp module params into the supported range. The named profile is the
-	 * explicit per-VM switch for 4K; the existing width/height/refresh params
-	 * remain available for custom modes and retain the 1080p default. */
+	mutex_init(&asb->mode_lock);
+	asb->runtime_mode = false;
+
+	/* Clamp module params into the supported range. Named profiles remain
+	 * compatible, while the no-profile default is now 1280x720. */
 	if (!strcmp(profile_param, "4k")) {
 		asb->width = ASB_4K_WIDTH;
 		asb->height = ASB_4K_HEIGHT;
 		asb->refresh = ASB_4K_REFRESH;
+	} else if (!strcmp(profile_param, "1080p")) {
+		asb->width = 1920;
+		asb->height = 1080;
+		asb->refresh = ASB_DEFAULT_REFRESH;
 	} else {
-		asb->width   = clamp(width_param,   64u, (unsigned)ASB_MAX_WIDTH);
-		asb->height  = clamp(height_param,  64u, (unsigned)ASB_MAX_HEIGHT);
+		asb->width   = clamp(width_param,   (unsigned)ASB_MIN_WIDTH, (unsigned)ASB_MAX_WIDTH);
+		asb->height  = clamp(height_param,  (unsigned)ASB_MIN_HEIGHT, (unsigned)ASB_MAX_HEIGHT);
 		asb->refresh = clamp(refresh_param, 24u, 240u);
 	}
 
@@ -204,6 +303,13 @@ static int asb_probe(struct platform_device *pdev)
 		return ret;
 	}
 
+	ret = device_create_file(&pdev->dev, &dev_attr_mode);
+	if (ret) {
+		dev_err(&pdev->dev, "mode sysfs attribute failed: %d\n", ret);
+		drm_dev_unregister(drm);
+		return ret;
+	}
+
 	dev_info(&pdev->dev, "AppSandbox virtual display ready: %ux%u@%uHz\n",
 	         asb->width, asb->height, asb->refresh);
 	return 0;
@@ -214,6 +320,7 @@ static void asb_remove(struct platform_device *pdev)
 	struct drm_device *drm = platform_get_drvdata(pdev);
 	struct asb_device *asb = to_asb(drm);
 
+	device_remove_file(&pdev->dev, &dev_attr_mode);
 	drm_dev_unplug(drm);
 	asb_mode_fini(asb);
 	drm_atomic_helper_shutdown(drm);

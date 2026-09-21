@@ -36,7 +36,7 @@ static enum hrtimer_restart asb_vblank_timer_fn(struct hrtimer *timer)
 	if (!asb->vblank_enabled)
 		return HRTIMER_NORESTART;
 
-	hrtimer_forward_now(timer, asb->vblank_period);
+	hrtimer_forward_now(timer, READ_ONCE(asb->vblank_period));
 	return HRTIMER_RESTART;
 }
 
@@ -45,7 +45,7 @@ static int asb_crtc_enable_vblank(struct drm_crtc *crtc)
 	struct asb_device *asb = crtc_to_asb(crtc);
 
 	asb->vblank_enabled = true;
-	hrtimer_start(&asb->vblank_timer, asb->vblank_period, HRTIMER_MODE_REL);
+	hrtimer_start(&asb->vblank_timer, READ_ONCE(asb->vblank_period), HRTIMER_MODE_REL);
 	return 0;
 }
 
@@ -134,7 +134,7 @@ int asb_mode_init(struct asb_device *asb)
 	 * an argument. */
 	hrtimer_setup(&asb->vblank_timer, asb_vblank_timer_fn,
 	              CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	asb->vblank_period = ns_to_ktime(NSEC_PER_SEC / asb->refresh);
+	WRITE_ONCE(asb->vblank_period, ns_to_ktime(NSEC_PER_SEC / asb->refresh));
 
 	ret = drm_crtc_init_with_planes(drm, &asb->crtc,
 	                                &asb->primary_plane,

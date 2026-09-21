@@ -69,8 +69,11 @@ void asb_build_edid(struct asb_device *asb)
 {
 	u8 *e = asb->edid;
 	struct drm_display_mode m;
+	unsigned int width, height, refresh;
 	int i, sum = 0;
 	const char *name = "AppSandbox";
+
+	asb_mode_snapshot(asb, &width, &height, &refresh, NULL);
 
 	memset(e, 0, ASB_EDID_LEN);
 
@@ -114,9 +117,9 @@ void asb_build_edid(struct asb_device *asb)
 
 	/* DTD #1 (bytes 54..71): the preferred mode, computed from CVT. */
 	{
-		struct drm_display_mode *cvt = drm_cvt_mode(NULL, asb->width,
-		                                            asb->height,
-		                                            asb->refresh,
+		struct drm_display_mode *cvt = drm_cvt_mode(NULL, width,
+		                                            height,
+		                                            refresh,
 		                                            false, false, false);
 		if (cvt) {
 			m = *cvt;
@@ -159,14 +162,18 @@ static int asb_connector_get_modes(struct drm_connector *connector)
 {
 	struct asb_device *asb = to_asb(connector->dev);
 	struct drm_display_mode *m;
+	unsigned int width, height, refresh;
+	bool runtime_mode;
 	int count = 0;
+
+	asb_mode_snapshot(asb, &width, &height, &refresh, &runtime_mode);
 
 	drm_connector_update_edid_property(connector,
 	                                   (const struct edid *)asb->edid);
 
 	/* Preferred mode first — what the EDID DTD also points at. */
 	m = drm_cvt_mode(connector->dev,
-	                 asb->width, asb->height, asb->refresh,
+	                 width, height, refresh,
 	                 false, false, false);
 	if (m) {
 		m->type |= DRM_MODE_TYPE_PREFERRED | DRM_MODE_TYPE_DRIVER;
@@ -174,11 +181,18 @@ static int asb_connector_get_modes(struct drm_connector *connector)
 		count++;
 	}
 
-	/* Common fallbacks. Mutter typically ignores these unless the user
-	 * explicitly switches resolution, but they're cheap to publish. */
+	/* Runtime target modes are intentionally the only published mode. Keeping
+	 * stale fallbacks here makes Mutter preserve the old active mode after a
+	 * hotplug instead of applying the target requested by the host. */
+	if (runtime_mode)
+		return count;
+
+	/* Common startup fallbacks. */
 	{
 		static const struct { int w, h, hz; } fallbacks[] = {
+			{ 3840, 2160, 60 },
 			{ 2560, 1440, 60 },
+			{ 1920, 1080, 60 },
 			{ 1920, 1200, 60 },
 			{ 1680, 1050, 60 },
 			{ 1280,  720, 60 },
@@ -187,8 +201,8 @@ static int asb_connector_get_modes(struct drm_connector *connector)
 		size_t i;
 
 		for (i = 0; i < ARRAY_SIZE(fallbacks); i++) {
-			if (fallbacks[i].w == (int)asb->width &&
-			    fallbacks[i].h == (int)asb->height)
+			if (fallbacks[i].w == (int)width &&
+			    fallbacks[i].h == (int)height)
 				continue;
 			m = drm_cvt_mode(connector->dev,
 			                 fallbacks[i].w, fallbacks[i].h,

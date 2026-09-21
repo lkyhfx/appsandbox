@@ -17,6 +17,7 @@
 #define _ASB_DRM_H_
 
 #include <linux/hrtimer.h>
+#include <linux/mutex.h>
 #include <linux/platform_device.h>
 
 #include <drm/drm_device.h>
@@ -30,8 +31,8 @@
  * Tunables. Module params override these at load time where applicable.
  * -------------------------------------------------------------------------- */
 
-#define ASB_DEFAULT_WIDTH     1920
-#define ASB_DEFAULT_HEIGHT    1080
+#define ASB_DEFAULT_WIDTH     1280
+#define ASB_DEFAULT_HEIGHT    720
 #define ASB_DEFAULT_REFRESH   60
 #define ASB_4K_WIDTH          3840
 #define ASB_4K_HEIGHT         2160
@@ -42,6 +43,8 @@
  * capture daemon a reliable FB_DAMAGE_CLIPS snapshot to consume. */
 #define ASB_DRM_DAMAGE_AVAILABLE 0
 
+#define ASB_MIN_WIDTH         320
+#define ASB_MIN_HEIGHT        180
 #define ASB_MAX_WIDTH         7680
 #define ASB_MAX_HEIGHT        4320
 
@@ -71,6 +74,8 @@ struct asb_device {
 	unsigned int            width;
 	unsigned int            height;
 	unsigned int            refresh;
+	bool                    runtime_mode;
+	struct mutex            mode_lock;
 
 	/* Synthesized 128-byte EDID. Built once at probe, served via
 	 * drm_connector_attach_edid_property() → drm_connector_update_edid_property(). */
@@ -110,5 +115,12 @@ int  asb_writeback_init(struct asb_device *asb);
 
 /* Build the synthesized EDID into asb->edid. Called from connector_init. */
 void asb_build_edid(struct asb_device *asb);
+
+/* Runtime mode control used by the host->guest display control plane. */
+void asb_mode_snapshot(struct asb_device *asb, unsigned int *width,
+	                       unsigned int *height, unsigned int *refresh,
+	                       bool *runtime_mode);
+int asb_mode_set_runtime(struct asb_device *asb, unsigned int width,
+	                         unsigned int height, unsigned int refresh);
 
 #endif /* _ASB_DRM_H_ */

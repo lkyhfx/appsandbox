@@ -31,6 +31,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
+#include <sys/poll.h>
 #include <linux/vm_sockets.h>
 
 #include <xf86drm.h>
@@ -42,6 +43,7 @@
 #include "../../../src/core/display_fb_state.h"
 
 #define VSOCK_PORT      2
+#define ASB_DRM_MODE_PATH "/sys/devices/platform/asb_drm.0/mode"
 #define FRAME_MAGIC     ASB_DISPLAY_RAW_MAGIC
 #define CURSOR_MAGIC    ASB_DISPLAY_CURSOR_MAGIC
 #define TARGET_FPS      60
@@ -177,6 +179,13 @@ struct capture_ctx {
         uint64_t ratio_buckets[101];
         uint64_t dirty_scan_us_total;
         uint64_t snapshot_pack_us_total;
+        uint64_t tile_memcmp_ns_total;
+        uint64_t tile_merge_ns_total;
+        uint64_t dirty_scan_other_ns_total;
+        uint64_t bytes_compared_total;
+        uint64_t tiles_compared_total;
+        uint64_t coarse_rows_compared_total;
+        uint64_t early_exit_tiles_total;
         uint64_t dirty_scan_us_buckets[STATS_US_BUCKETS];
         uint64_t snapshot_pack_us_buckets[STATS_US_BUCKETS];
         uint64_t snapshot_pack_samples;
@@ -197,6 +206,133 @@ static uint64_t monotonic_ns(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+struct control_rx {
+    uint8_t data[sizeof(AsbDisplayControl) * 4];
+    size_t len;
+};
+
+static int send_control(int fd, uint16_t type, uint32_t request_id,
+                        uint32_t width, uint32_t height, uint32_t refresh,
+                        uint32_t status_or_flags)
+{
+    AsbDisplayControl msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.magic = ASB_DISPLAY_CONTROL_MAGIC;
+    msg.version = ASB_DISPLAY_CONTROL_VERSION;
+    msg.type = type;
+    msg.request_id = request_id;
+    msg.width = width;
+    msg.height = height;
+    msg.refresh_hz = refresh;
+    msg.status_or_flags = status_or_flags;
+    return send_all(fd, &msg, sizeof(msg)) < 0 ? -1 : 0;
+}
+
+static int send_control_hello(int fd)
+{
+    agent_log("display_control hello version=%u flags=dynamic_resize",
+              ASB_DISPLAY_CONTROL_VERSION);
+    return send_control(fd, ASB_DISPLAY_CONTROL_HELLO, 0, 0, 0, 0,
+                        ASB_DISPLAY_CONTROL_FLAG_DYNAMIC_RESIZE);
+}
+
+static int write_runtime_mode(uint32_t width, uint32_t height, uint32_t refresh)
+{
+    char mode[64];
+    int fd;
+    int len;
+    ssize_t written;
+
+    len = snprintf(mode, sizeof(mode), "%ux%u@%u\n", width, height, refresh);
+    if (len <= 0 || (size_t)len >= sizeof(mode)) return -1;
+    fd = open(ASB_DRM_MODE_PATH, O_WRONLY | O_CLOEXEC);
+    if (fd < 0) {
+        agent_log("display_control open %s failed: %s", ASB_DRM_MODE_PATH,
+                  strerror(errno));
+        return -1;
+    }
+    written = write(fd, mode, (size_t)len);
+    close(fd);
+    if (written != len) {
+        agent_log("display_control runtime mode %ux%u@%u failed: %s",
+                  width, height, refresh, strerror(errno));
+        return -1;
+    }
+    agent_log("asb_drm runtime_mode=%ux%u@%uHz", width, height, refresh);
+    return 0;
+}
+
+/* Read only the host->guest half of the full-duplex :2 stream. MSG_DONTWAIT
+ * keeps this out of the 60Hz capture path's critical timing; frame sending is
+ * still performed by the same thread, so messages cannot interleave. */
+static int poll_display_control(int fd, struct control_rx *rx)
+{
+    for (;;) {
+        ssize_t n;
+        if (rx->len == sizeof(rx->data)) {
+            agent_log("display_control receive buffer overflow");
+            return -1;
+        }
+        n = recv(fd, rx->data + rx->len, sizeof(rx->data) - rx->len,
+                 MSG_DONTWAIT);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            return -1;
+        }
+        if (n == 0) return -1;
+        rx->len += (size_t)n;
+    }
+
+    while (rx->len >= sizeof(AsbDisplayControl)) {
+        AsbDisplayControl msg;
+        uint32_t width, height, refresh, status;
+
+        memcpy(&msg, rx->data, sizeof(msg));
+        if (msg.magic != ASB_DISPLAY_CONTROL_MAGIC) {
+            memmove(rx->data, rx->data + 1, --rx->len);
+            continue;
+        }
+        memmove(rx->data, rx->data + sizeof(msg), rx->len - sizeof(msg));
+        rx->len -= sizeof(msg);
+
+        if (msg.version != ASB_DISPLAY_CONTROL_VERSION) {
+            agent_log("display_control unsupported version=%u", msg.version);
+            continue;
+        }
+        if (msg.type != ASB_DISPLAY_CONTROL_RESIZE_REQUEST ||
+            msg.request_id == 0) {
+            agent_log("display_control unexpected type=%u request=%u",
+                      msg.type, msg.request_id);
+            continue;
+        }
+
+        width = msg.width;
+        height = msg.height;
+        asb_display_normalize_resolution(&width, &height);
+        refresh = msg.refresh_hz ? msg.refresh_hz
+                                 : ASB_DISPLAY_CONTROL_DEFAULT_REFRESH;
+        status = (refresh < 24 || refresh > 240)
+            ? ASB_DISPLAY_CONTROL_STATUS_BAD_REQUEST
+            : ASB_DISPLAY_CONTROL_STATUS_ACCEPTED;
+        agent_log("display_control resize request=%u requested=%ux%u "
+                  "normalized=%ux%u", msg.request_id, msg.width, msg.height,
+                  width, height);
+        if (status == ASB_DISPLAY_CONTROL_STATUS_ACCEPTED &&
+            write_runtime_mode(width, height, refresh) < 0)
+            status = ASB_DISPLAY_CONTROL_STATUS_MODE_FAILED;
+        if (send_control(fd, ASB_DISPLAY_CONTROL_RESIZE_ACK, msg.request_id,
+                         width, height, refresh, status) < 0)
+            return -1;
+        agent_log("display_control resize ack request=%u status=%s target=%ux%u",
+                  msg.request_id,
+                  status == ASB_DISPLAY_CONTROL_STATUS_ACCEPTED
+                      ? "accepted" : "failed",
+                  width, height);
+    }
+    return 0;
 }
 
 static void stats_record_us(uint64_t *total, uint64_t *buckets,
@@ -782,13 +918,28 @@ static int cursor_tick(int client_fd, int drm_fd, struct cursor_state *cur)
 
 static int scan_dirty_tiles(struct capture_ctx *c, AsbDisplayRect *rects,
                             uint32_t *rect_count, int *full,
-                            uint64_t *dirty_area)
+                            uint64_t *dirty_area,
+                            uint64_t *compare_ns_out,
+                            uint64_t *merge_ns_out,
+                            uint64_t *bytes_compared_out,
+                            uint64_t *tiles_compared_out,
+                            uint64_t *coarse_rows_compared_out,
+                            uint64_t *early_exit_tiles_out)
 {
     uint64_t cols = ((uint64_t)c->width + TILE_SIZE - 1) / TILE_SIZE;
     uint64_t rows = ((uint64_t)c->height + TILE_SIZE - 1) / TILE_SIZE;
     uint64_t total_area = (uint64_t)c->width * c->height;
     size_t work_count = 0;
     uint32_t ty;
+    uint64_t compare_start;
+    uint64_t merge_start;
+
+    if (compare_ns_out) *compare_ns_out = 0;
+    if (merge_ns_out) *merge_ns_out = 0;
+    if (bytes_compared_out) *bytes_compared_out = 0;
+    if (tiles_compared_out) *tiles_compared_out = 0;
+    if (coarse_rows_compared_out) *coarse_rows_compared_out = 0;
+    if (early_exit_tiles_out) *early_exit_tiles_out = 0;
 
     *rect_count = 0;
     *dirty_area = 0;
@@ -807,30 +958,58 @@ static int scan_dirty_tiles(struct capture_ctx *c, AsbDisplayRect *rects,
     }
 
     memset(c->dirty_tiles, 0, (size_t)(cols * rows));
+    compare_start = monotonic_ns();
+
+    /* Coarse-to-fine scan. A static 4K desktop has about 2,040 64x64 tiles;
+     * comparing every tile one row at a time makes that roughly 70,000
+     * memcmp calls per frame. First compare each visible row as one contiguous
+     * span. Equal rows prove that all of their tiles are equal; only rows with
+     * a difference are split into tile-sized comparisons. This preserves the
+     * no-false-negative guarantee while reducing the static path to one
+     * memcmp per row and keeping fine work bounded to changed rows. */
     for (ty = 0; ty < rows; ty++) {
-        uint32_t tx;
         uint32_t top = ty * TILE_SIZE;
         uint32_t bottom = top + TILE_SIZE < c->height
             ? top + TILE_SIZE : c->height;
-        for (tx = 0; tx < cols; tx++) {
-            uint32_t left = tx * TILE_SIZE;
-            uint32_t right = left + TILE_SIZE < c->width
-                ? left + TILE_SIZE : c->width;
-            uint32_t y;
-            int changed = 0;
+        uint32_t y;
+        uint32_t row_bytes = c->width * 4;
 
-            for (y = top; y < bottom && !changed; y++) {
-                const uint8_t *now = c->mem + (size_t)y * c->stride + left * 4;
-                const uint8_t *old = c->shadow + (size_t)y * c->shadow_stride + left * 4;
-                if (memcmp(now, old, (size_t)(right - left) * 4) != 0)
-                    changed = 1;
-            }
-            if (changed) {
-                c->dirty_tiles[(size_t)ty * cols + tx] = 1;
-                *dirty_area += (uint64_t)(right - left) * (bottom - top);
+        for (y = top; y < bottom; y++) {
+            const uint8_t *now = c->mem + (size_t)y * c->stride;
+            const uint8_t *old = c->shadow + (size_t)y * c->shadow_stride;
+            uint32_t tx;
+
+            if (coarse_rows_compared_out) (*coarse_rows_compared_out)++;
+            if (bytes_compared_out) *bytes_compared_out += row_bytes;
+            if (memcmp(now, old, row_bytes) == 0)
+                continue;
+
+            for (tx = 0; tx < cols; tx++) {
+                size_t tile_index = (size_t)ty * cols + tx;
+                uint32_t left;
+                uint32_t right;
+                uint32_t tile_row_bytes;
+
+                if (c->dirty_tiles[tile_index]) continue;
+                left = tx * TILE_SIZE;
+                right = left + TILE_SIZE < c->width
+                    ? left + TILE_SIZE : c->width;
+                tile_row_bytes = (right - left) * 4;
+                if (tiles_compared_out) (*tiles_compared_out)++;
+                if (bytes_compared_out) *bytes_compared_out += tile_row_bytes;
+                if (memcmp(now + (size_t)left * 4,
+                           old + (size_t)left * 4,
+                           tile_row_bytes) != 0) {
+                    c->dirty_tiles[tile_index] = 1;
+                    *dirty_area += (uint64_t)(right - left) *
+                                   (bottom - top);
+                    if (early_exit_tiles_out && y + 1 < bottom)
+                        (*early_exit_tiles_out)++;
+                }
             }
         }
     }
+    if (compare_ns_out) *compare_ns_out = monotonic_ns() - compare_start;
 
     if (!*dirty_area) return 0;
 
@@ -844,6 +1023,7 @@ static int scan_dirty_tiles(struct capture_ctx *c, AsbDisplayRect *rects,
     }
 
     /* Build horizontal tile runs and vertically coalesce equal runs. */
+    merge_start = monotonic_ns();
     for (ty = 0; ty < rows; ty++) {
         uint32_t tx = 0;
         uint32_t top = ty * TILE_SIZE;
@@ -875,6 +1055,8 @@ static int scan_dirty_tiles(struct capture_ctx *c, AsbDisplayRect *rects,
                     request_full(c, FULL_REASON_RECT_OVERFLOW);
                     *full = 1;
                     *dirty_area = total_area;
+                    if (merge_ns_out)
+                        *merge_ns_out = monotonic_ns() - merge_start;
                     return 0;
                 }
                 c->work_rects[work_count++] = run;
@@ -886,10 +1068,13 @@ static int scan_dirty_tiles(struct capture_ctx *c, AsbDisplayRect *rects,
         request_full(c, FULL_REASON_RECT_OVERFLOW);
         *full = 1;
         *dirty_area = total_area;
+        if (merge_ns_out)
+            *merge_ns_out = monotonic_ns() - merge_start;
         return 0;
     }
     memcpy(rects, c->work_rects, work_count * sizeof(*rects));
     *rect_count = (uint32_t)work_count;
+    if (merge_ns_out) *merge_ns_out = monotonic_ns() - merge_start;
     return 0;
 }
 
@@ -983,6 +1168,11 @@ static void maybe_log_stats(struct capture_ctx *c)
     uint64_t total = c->stats.frames_scanned;
     uint64_t target, seen = 0, p95_bucket = 100;
     double seconds, avg, mib_per_sec, fb_id_changes_per_sec;
+    double frames_scanned_per_sec, frames_sent_per_sec;
+    double dirty_frames_per_sec, unchanged_frames_per_sec;
+    double tile_memcmp_us, tile_merge_us, other_us;
+    double bytes_compared_avg, tiles_compared_avg;
+    double coarse_rows_compared_avg, early_exit_tiles_avg;
     uint64_t dirty_scan_p95, dirty_scan_p99;
     uint64_t snapshot_pack_p95, snapshot_pack_p99;
     int i;
@@ -1000,6 +1190,14 @@ static void maybe_log_stats(struct capture_ctx *c)
     seconds = (double)(now - c->stats.start_ns) / 1000000000.0;
     fb_id_changes_per_sec = seconds > 0.0
         ? (double)c->stats.fb_id_changes / seconds : 0.0;
+    frames_scanned_per_sec = seconds > 0.0
+        ? (double)c->stats.frames_scanned / seconds : 0.0;
+    frames_sent_per_sec = seconds > 0.0
+        ? (double)c->stats.frames_sent / seconds : 0.0;
+    dirty_frames_per_sec = seconds > 0.0
+        ? (double)c->stats.dirty_frames_sent / seconds : 0.0;
+    unchanged_frames_per_sec = seconds > 0.0
+        ? (double)c->stats.unchanged_frames_skipped / seconds : 0.0;
     avg = (double)c->stats.dirty_area_sum /
           ((double)total * c->width * c->height);
     mib_per_sec = seconds > 0.0
@@ -1013,9 +1211,22 @@ static void maybe_log_stats(struct capture_ctx *c)
                                             c->stats.snapshot_pack_samples, 95);
     snapshot_pack_p99 = stats_percentile_us(c->stats.snapshot_pack_us_buckets,
                                             c->stats.snapshot_pack_samples, 99);
+    tile_memcmp_us = (double)c->stats.tile_memcmp_ns_total /
+                     ((double)total * 1000.0);
+    tile_merge_us = (double)c->stats.tile_merge_ns_total /
+                    ((double)total * 1000.0);
+    other_us = (double)c->stats.dirty_scan_other_ns_total /
+               ((double)total * 1000.0);
+    bytes_compared_avg = (double)c->stats.bytes_compared_total / total;
+    tiles_compared_avg = (double)c->stats.tiles_compared_total / total;
+    coarse_rows_compared_avg =
+        (double)c->stats.coarse_rows_compared_total / total;
+    early_exit_tiles_avg = (double)c->stats.early_exit_tiles_total / total;
     agent_log("display_stats scope=guest resolution=%ux%u logical_refresh_hz=%u "
               "frames_scanned=%llu frames_sent=%llu full_frames_sent=%llu "
               "dirty_frames_sent=%llu unchanged_frames_skipped=%llu "
+              "frames_scanned_per_sec=%.3f frames_sent_per_sec=%.3f "
+              "dirty_frames_per_sec=%.3f unchanged_frames_per_sec=%.3f "
               "fb_id_changes=%llu fb_id_changes_per_sec=%.3f layout_changes=%llu "
               "full_due_to_initial=%llu "
               "full_due_to_layout_change=%llu "
@@ -1024,6 +1235,9 @@ static void maybe_log_stats(struct capture_ctx *c)
               "dirty_rects_total=%llu dirty_area_ratio_avg=%.5f "
               "dirty_area_ratio_p95=%.2f wire_bytes_total=%llu wire_mib_per_sec=%.3f "
               "dirty_scan_us_avg=%.2f dirty_scan_us_p95=%llu dirty_scan_us_p99=%llu "
+              "tile_memcmp_us=%.2f tile_merge_us=%.2f other_us=%.2f "
+              "bytes_compared_avg=%.0f tiles_compared_avg=%.2f "
+              "coarse_rows_compared_avg=%.2f early_exit_tiles_avg=%.2f "
               "snapshot_pack_us_avg=%.2f snapshot_pack_us_p95=%llu "
               "snapshot_pack_us_p99=%llu "
               "DRM_DAMAGE_AVAILABLE=%u fallback=tile64",
@@ -1033,6 +1247,8 @@ static void maybe_log_stats(struct capture_ctx *c)
                (unsigned long long)c->stats.full_frames_sent,
                (unsigned long long)c->stats.dirty_frames_sent,
                (unsigned long long)c->stats.unchanged_frames_skipped,
+               frames_scanned_per_sec, frames_sent_per_sec,
+               dirty_frames_per_sec, unchanged_frames_per_sec,
                (unsigned long long)c->stats.fb_id_changes,
                fb_id_changes_per_sec,
                (unsigned long long)c->stats.layout_changes,
@@ -1047,7 +1263,10 @@ static void maybe_log_stats(struct capture_ctx *c)
               total ? (double)c->stats.dirty_scan_us_total / total : 0.0,
                (unsigned long long)dirty_scan_p95,
                (unsigned long long)dirty_scan_p99,
-              c->stats.snapshot_pack_samples
+               tile_memcmp_us, tile_merge_us, other_us,
+               bytes_compared_avg, tiles_compared_avg,
+               coarse_rows_compared_avg, early_exit_tiles_avg,
+               c->stats.snapshot_pack_samples
                   ? (double)c->stats.snapshot_pack_us_total /
                     c->stats.snapshot_pack_samples : 0.0,
                (unsigned long long)snapshot_pack_p95,
@@ -1058,6 +1277,7 @@ static void maybe_log_stats(struct capture_ctx *c)
 static void capture_loop(int client_fd)
 {
     struct capture_ctx ctx = { .fd = -1, .dma_fd = -1 };
+    struct control_rx control = {0};
 
     /* Find a /dev/dri/cardN by DRM driver name, in preference order:
      *   asb_drm     — our custom virtual display driver (preferred)
@@ -1208,6 +1428,13 @@ have_card:
     int last_status = 0;
 
     while (!g_stop) {
+        /* Host resize requests share the full-duplex frame socket. Polling
+         * with MSG_DONTWAIT ensures a slow or idle control sender never
+         * stalls capture. */
+        if (poll_display_control(client_fd, &control) < 0) {
+            agent_log("client disconnected (control)");
+            break;
+        }
         int rc = drm_acquire_fb(&ctx);
         if (rc < 0) {
             if (last_status != -1) {
@@ -1229,10 +1456,32 @@ have_card:
             ctx.stats.frames_scanned++;
             {
                 uint64_t scan_start = monotonic_ns();
-                (void)scan_dirty_tiles(&ctx, rects, &rect_count, &full, &dirty_area);
+                uint64_t compare_ns = 0;
+                uint64_t merge_ns = 0;
+                uint64_t bytes_compared = 0;
+                uint64_t tiles_compared = 0;
+                uint64_t coarse_rows_compared = 0;
+                uint64_t early_exit_tiles = 0;
+                uint64_t scan_ns;
+
+                (void)scan_dirty_tiles(&ctx, rects, &rect_count, &full,
+                                       &dirty_area, &compare_ns, &merge_ns,
+                                       &bytes_compared, &tiles_compared,
+                                       &coarse_rows_compared,
+                                       &early_exit_tiles);
+                scan_ns = monotonic_ns() - scan_start;
                 stats_record_us(&ctx.stats.dirty_scan_us_total,
                                 ctx.stats.dirty_scan_us_buckets,
-                                monotonic_ns() - scan_start);
+                                scan_ns);
+                ctx.stats.tile_memcmp_ns_total += compare_ns;
+                ctx.stats.tile_merge_ns_total += merge_ns;
+                ctx.stats.dirty_scan_other_ns_total +=
+                    scan_ns > compare_ns + merge_ns
+                        ? scan_ns - compare_ns - merge_ns : 0;
+                ctx.stats.bytes_compared_total += bytes_compared;
+                ctx.stats.tiles_compared_total += tiles_compared;
+                ctx.stats.coarse_rows_compared_total += coarse_rows_compared;
+                ctx.stats.early_exit_tiles_total += early_exit_tiles;
             }
             if (!full && rect_count == 0) {
                 ctx.stats.unchanged_frames_skipped++;
@@ -1327,6 +1576,11 @@ int main(void)
             break;
         }
         agent_log("client connected (cid=%u)", peer.svm_cid);
+        if (send_control_hello(c) < 0) {
+            agent_log("client disconnected before display_control hello");
+            close(c);
+            continue;
+        }
         capture_loop(c);
         close(c);
     }

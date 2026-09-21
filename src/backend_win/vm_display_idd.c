@@ -114,11 +114,15 @@ typedef struct AudioFrameHeader {
 #define WM_IDD_FOCUS            (WM_USER + 101)
 #define WM_IDD_INPUT_READY      (WM_USER + 102)
 #define WM_IDD_CURSOR_CHANGED   (WM_USER + 103)
+#define WM_IDD_RESIZE_CAPABLE   (WM_USER + 104)
+#define WM_IDD_ACTUAL_SIZE      (WM_USER + 105)
 
 /* Timer for Present cadence when no frames arrive */
 #define IDT_PRESENT     2001
 #define PRESENT_MS      16   /* ~60 fps */
 #define IDT_FULLSCREEN_TOOLBAR 2002
+#define IDT_DISPLAY_RESIZE 2003
+#define DISPLAY_RESIZE_DEBOUNCE_MS 125
 #define IDM_ENTER_FULLSCREEN 0x1030
 #define TOOLBAR_POLL_MS 100
 #define TOOLBAR_HIDE_MS 700
@@ -236,6 +240,33 @@ struct VmDisplayIdd {
     UINT           render_count;     /* number of renders (for one-shot logging) */
     volatile UINT  recv_count;       /* number of frames received over HvSocket */
 
+    /* Host <-> guest display-control state. ACK is not completion: the
+     * pending request is cleared only after an ASFR with matching dimensions. */
+    SOCKET         frame_socket;
+    SRWLOCK        frame_send_lock;
+    HANDLE         control_send_event;
+    HANDLE         control_send_thread;
+    volatile BOOL  control_send_stop;
+    SRWLOCK        control_queue_lock;
+    AsbDisplayControl queued_control;
+    BOOL           control_queued;
+    volatile LONG  resize_capable;
+    SRWLOCK        resize_lock;
+    UINT           desired_width;
+    UINT           desired_height;
+    UINT           actual_width;
+    UINT           actual_height;
+    UINT           queued_resize_width;
+    UINT           queued_resize_height;
+    UINT           pending_resize_width;
+    UINT           pending_resize_height;
+    UINT32         resize_request_id;
+    UINT32         pending_resize_id;
+    BOOL           resize_queued;
+    BOOL           resize_interactive;
+    BOOL           applying_guest_size;
+    ULONGLONG      last_resize_send_tick;
+
     /* Input forwarding */
     volatile SOCKET input_socket;   /* input socket for keyboard/mouse forwarding */
     SRWLOCK        input_lock;
@@ -306,6 +337,13 @@ static void idd_register_fullscreen_toolbar_class(HINSTANCE hInst);
 static void idd_enter_fullscreen(VmDisplayIdd *d);
 static void idd_exit_fullscreen(VmDisplayIdd *d);
 static void idd_show_fullscreen_toolbar(VmDisplayIdd *d);
+static void idd_schedule_resize(VmDisplayIdd *d, UINT width, UINT height,
+                                BOOL immediate);
+static void idd_flush_resize(VmDisplayIdd *d);
+static void idd_apply_guest_size(VmDisplayIdd *d);
+static BOOL idd_send_display_control(VmDisplayIdd *d,
+                                     const AsbDisplayControl *control);
+static DWORD WINAPI idd_control_send_thread_proc(LPVOID param);
 static void window_to_vm_coords(HWND hwnd, int wx, int wy, UINT vm_w, UINT vm_h,
                                 UINT *vx, UINT *vy);
 
@@ -1267,6 +1305,217 @@ static SOCKET connect_to_hv_service(const GUID *vm_runtime_id, const GUID *servi
     return s;
 }
 
+static BOOL idd_send_display_control(VmDisplayIdd *d,
+                                      const AsbDisplayControl *control)
+{
+    SOCKET s;
+    int sent = 0;
+    BOOL ok = FALSE;
+
+    if (!d || !control ||
+        InterlockedCompareExchange(&d->resize_capable, 0, 0) == 0)
+        return FALSE;
+
+    AcquireSRWLockShared(&d->frame_send_lock);
+    s = d->frame_socket;
+    if (s != INVALID_SOCKET) {
+        DWORD timeout = 200;
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&timeout,
+                   sizeof(timeout));
+        while (sent < (int)sizeof(*control)) {
+            int n = send(s, (const char *)control + sent,
+                         (int)sizeof(*control) - sent, 0);
+            if (n <= 0) break;
+            sent += n;
+        }
+        ok = sent == (int)sizeof(*control);
+        if (!ok)
+            shutdown(s, SD_BOTH);
+    }
+    ReleaseSRWLockShared(&d->frame_send_lock);
+    if (!ok)
+        idd_log(d, L"display_control send failed; frame channel will reconnect.");
+    return ok;
+}
+
+static void idd_requeue_failed_resize(VmDisplayIdd *d,
+                                      const AsbDisplayControl *control)
+{
+    if (!d || !control || control->type != ASB_DISPLAY_CONTROL_RESIZE_REQUEST)
+        return;
+    AcquireSRWLockExclusive(&d->resize_lock);
+    if (d->pending_resize_id == control->request_id) {
+        d->resize_queued = TRUE;
+        d->queued_resize_width = control->width;
+        d->queued_resize_height = control->height;
+        d->pending_resize_id = 0;
+    }
+    ReleaseSRWLockExclusive(&d->resize_lock);
+}
+
+static BOOL idd_queue_display_control(VmDisplayIdd *d,
+                                       const AsbDisplayControl *control)
+{
+    if (!d || !control || !d->control_send_event)
+        return FALSE;
+    AcquireSRWLockExclusive(&d->control_queue_lock);
+    d->queued_control = *control;
+    d->control_queued = TRUE;
+    ReleaseSRWLockExclusive(&d->control_queue_lock);
+    SetEvent(d->control_send_event);
+    return TRUE;
+}
+
+static DWORD WINAPI idd_control_send_thread_proc(LPVOID param)
+{
+    VmDisplayIdd *d = (VmDisplayIdd *)param;
+
+    while (!d->control_send_stop) {
+        AsbDisplayControl control;
+        BOOL have_control = FALSE;
+
+        WaitForSingleObject(d->control_send_event, 1000);
+        if (d->control_send_stop) break;
+        AcquireSRWLockExclusive(&d->control_queue_lock);
+        if (d->control_queued) {
+            control = d->queued_control;
+            d->control_queued = FALSE;
+            have_control = TRUE;
+        }
+        ReleaseSRWLockExclusive(&d->control_queue_lock);
+        if (!have_control) continue;
+
+        if (!idd_send_display_control(d, &control))
+            idd_requeue_failed_resize(d, &control);
+        else if (control.type == ASB_DISPLAY_CONTROL_RESIZE_REQUEST)
+            idd_log(d, L"display_resize request id=%u requested=%ux%u "
+                    L"normalized=%ux%u", control.request_id,
+                    d->desired_width, d->desired_height, control.width,
+                    control.height);
+    }
+    return 0;
+}
+
+static void idd_flush_resize(VmDisplayIdd *d)
+{
+    AsbDisplayControl control;
+    UINT width, height;
+    UINT32 request_id;
+    ULONGLONG now;
+
+    if (!d || InterlockedCompareExchange(&d->resize_capable, 0, 0) == 0)
+        return;
+    now = GetTickCount64();
+    AcquireSRWLockExclusive(&d->resize_lock);
+    if (!d->resize_queued ||
+        (d->resize_interactive &&
+         now - d->last_resize_send_tick < DISPLAY_RESIZE_DEBOUNCE_MS)) {
+        ReleaseSRWLockExclusive(&d->resize_lock);
+        return;
+    }
+    width = d->queued_resize_width;
+    height = d->queued_resize_height;
+    request_id = (UINT32)InterlockedIncrement((volatile LONG *)&d->resize_request_id);
+    d->resize_queued = FALSE;
+    d->pending_resize_width = width;
+    d->pending_resize_height = height;
+    d->pending_resize_id = request_id;
+    d->last_resize_send_tick = now;
+    ReleaseSRWLockExclusive(&d->resize_lock);
+
+    ZeroMemory(&control, sizeof(control));
+    control.magic = ASB_DISPLAY_CONTROL_MAGIC;
+    control.version = ASB_DISPLAY_CONTROL_VERSION;
+    control.type = ASB_DISPLAY_CONTROL_RESIZE_REQUEST;
+    control.request_id = request_id;
+    control.width = width;
+    control.height = height;
+    control.refresh_hz = ASB_DISPLAY_CONTROL_DEFAULT_REFRESH;
+    if (!idd_queue_display_control(d, &control)) {
+        idd_requeue_failed_resize(d, &control);
+        idd_log(d, L"display_control sender unavailable; resize queued.");
+        return;
+    }
+}
+
+static void idd_schedule_resize(VmDisplayIdd *d, UINT width, UINT height,
+                                BOOL immediate)
+{
+    uint32_t normalized_width = width;
+    uint32_t normalized_height = height;
+    BOOL queue;
+    ULONGLONG now;
+
+    if (!d || width == 0 || height == 0) return;
+    asb_display_normalize_resolution(&normalized_width, &normalized_height);
+    d->desired_width = (UINT)normalized_width;
+    d->desired_height = (UINT)normalized_height;
+
+    AcquireSRWLockExclusive(&d->resize_lock);
+    queue = d->actual_width != d->desired_width ||
+            d->actual_height != d->desired_height;
+    if (queue) {
+        d->queued_resize_width = d->desired_width;
+        d->queued_resize_height = d->desired_height;
+        d->resize_queued = TRUE;
+    } else
+        d->resize_queued = FALSE;
+    ReleaseSRWLockExclusive(&d->resize_lock);
+
+    if (!queue || InterlockedCompareExchange(&d->resize_capable, 0, 0) == 0) {
+        if (d->hwnd) KillTimer(d->hwnd, IDT_DISPLAY_RESIZE);
+        return;
+    }
+    now = GetTickCount64();
+    if (immediate || !d->resize_interactive ||
+        now - d->last_resize_send_tick >= DISPLAY_RESIZE_DEBOUNCE_MS) {
+        idd_flush_resize(d);
+    } else if (d->hwnd) {
+        SetTimer(d->hwnd, IDT_DISPLAY_RESIZE, DISPLAY_RESIZE_DEBOUNCE_MS, NULL);
+    }
+}
+
+static void idd_apply_guest_size(VmDisplayIdd *d)
+{
+    RECT client, outer;
+    DWORD style, exstyle;
+    UINT width, height;
+    BOOL resize_pending;
+
+    if (!d || !d->hwnd || d->fullscreen || d->resize_interactive ||
+        d->applying_guest_size)
+        return;
+    AcquireSRWLockShared(&d->resize_lock);
+    width = d->actual_width;
+    height = d->actual_height;
+    resize_pending = d->pending_resize_id != 0 || d->resize_queued;
+    ReleaseSRWLockShared(&d->resize_lock);
+    if (resize_pending)
+        return;
+    if (!width || !height || !GetClientRect(d->hwnd, &client) ||
+        ((UINT)client.right == width && (UINT)client.bottom == height))
+        return;
+
+    style = (DWORD)GetWindowLongW(d->hwnd, GWL_STYLE);
+    exstyle = (DWORD)GetWindowLongW(d->hwnd, GWL_EXSTYLE);
+    outer.left = 0;
+    outer.top = 0;
+    outer.right = (LONG)width;
+    outer.bottom = (LONG)height;
+    if (!AdjustWindowRectEx(&outer, style, FALSE, exstyle))
+        return;
+    if (!GetWindowRect(d->hwnd, &client)) return;
+    d->applying_guest_size = TRUE;
+    SetWindowPos(d->hwnd, NULL, client.left, client.top,
+                 outer.right - outer.left, outer.bottom - outer.top,
+                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    d->applying_guest_size = FALSE;
+    d->desired_width = width;
+    d->desired_height = height;
+    idd_log(d, L"display_resize host client corrected to actual=%ux%u",
+            width, height);
+}
+
 static SOCKET connect_input(VmDisplayIdd *d)
 {
     static volatile LONG request_id;
@@ -1654,6 +1903,12 @@ static void maybe_log_host_stats(VmDisplayIdd *d)
     ULONGLONG now = GetTickCount64();
     ULONGLONG elapsed;
     double mib_per_sec;
+    SOCKET frame_socket;
+
+    AcquireSRWLockShared(&d->frame_send_lock);
+    frame_socket = d->frame_socket;
+    ReleaseSRWLockShared(&d->frame_send_lock);
+    if (frame_socket == INVALID_SOCKET) return;
 
     if (!d->host_stats_start_ms) d->host_stats_start_ms = now;
     if (d->host_stats_last_log_ms && now - d->host_stats_last_log_ms < 5000)
@@ -2279,6 +2534,21 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         }
 
         idd_log(d, L"Frame channel connected.");
+        AcquireSRWLockExclusive(&d->frame_send_lock);
+        d->frame_socket = s;
+        InterlockedExchange(&d->resize_capable, 0);
+        ReleaseSRWLockExclusive(&d->frame_send_lock);
+        /* Start a fresh host display-stats epoch for every frame-channel
+         * connection. Frame sequence numbers are connection-scoped, so the
+         * rate counters and gap count must not span reconnects either. */
+        d->host_stats_start_ms = GetTickCount64();
+        d->host_stats_last_log_ms = 0;
+        d->host_full_uploads = 0;
+        d->host_partial_uploads = 0;
+        d->host_gpu_upload_bytes = 0;
+        d->recv_count = 0;
+        d->render_count = 0;
+        d->frame_seq_gaps = 0;
         d->cursor_visible = TRUE;
         /* frame_seq is scoped to one Guest connection. A real sequence gap
          * is the only host-side evidence we can provide for a dropped dirty
@@ -2348,6 +2618,58 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 if (cursor_changed)
                     PostMessageW(d->hwnd, WM_IDD_CURSOR_CHANGED, 0, 0);
                 continue;  /* back to message loop */
+            }
+
+            if (magic == ASB_DISPLAY_CONTROL_MAGIC) {
+                AsbDisplayControl control;
+                control.magic = magic;
+                if (!recv_exact(s, (BYTE *)&control + sizeof(UINT32),
+                                sizeof(control) - sizeof(UINT32)))
+                    break;
+                if (control.version != ASB_DISPLAY_CONTROL_VERSION) {
+                    idd_log(d, L"display_control unsupported version=%u.",
+                            control.version);
+                    continue;
+                }
+                if (control.type == ASB_DISPLAY_CONTROL_HELLO) {
+                    BOOL capable = (control.status_or_flags &
+                                    ASB_DISPLAY_CONTROL_FLAG_DYNAMIC_RESIZE) != 0;
+                    InterlockedExchange(&d->resize_capable, capable ? 1 : 0);
+                    idd_log(d, L"display_control hello version=%u flags=0x%08X "
+                            L"dynamic_resize=%s.", control.version,
+                            control.status_or_flags, capable ? L"yes" : L"no");
+                    if (capable && d->hwnd)
+                        PostMessageW(d->hwnd, WM_IDD_RESIZE_CAPABLE, 0, 0);
+                } else if (control.type == ASB_DISPLAY_CONTROL_RESIZE_ACK) {
+                    uint32_t ack_width = control.width;
+                    uint32_t ack_height = control.height;
+                    BOOL ack_accepted = control.status_or_flags ==
+                        ASB_DISPLAY_CONTROL_STATUS_ACCEPTED;
+                    BOOL ack_dimensions_valid = ack_width >= ASB_DISPLAY_CONTROL_MIN_WIDTH &&
+                        ack_height >= ASB_DISPLAY_CONTROL_MIN_HEIGHT &&
+                        ack_width <= ASB_DISPLAY_CONTROL_MAX_WIDTH &&
+                        ack_height <= ASB_DISPLAY_CONTROL_MAX_HEIGHT;
+                    if (control.request_id == 0 ||
+                        control.status_or_flags > ASB_DISPLAY_CONTROL_STATUS_MODE_FAILED ||
+                        !ack_dimensions_valid ||
+                        (ack_accepted && (control.refresh_hz < 24 ||
+                                          control.refresh_hz > 240))) {
+                        idd_log(d, L"display_control invalid resize ack id=%u "
+                                L"target=%ux%u refresh=%u.", control.request_id,
+                                control.width, control.height, control.refresh_hz);
+                        continue;
+                    }
+                    const wchar_t *status =
+                        control.status_or_flags == ASB_DISPLAY_CONTROL_STATUS_ACCEPTED
+                            ? L"accepted" : L"failed";
+                    idd_log(d, L"display_resize ack id=%u status=%s target=%ux%u",
+                            control.request_id, status, control.width,
+                            control.height);
+                } else {
+                    idd_log(d, L"display_control unexpected type=%u.",
+                            control.type);
+                }
+                continue;
             }
 
             if (magic != FRAME_MAGIC) {
@@ -2464,6 +2786,32 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     d->frame_width  = hdr.width;
                     d->frame_height = hdr.height;
                     d->frame_stride = new_stride;
+                    {
+                        UINT32 completed_id = 0;
+                        AcquireSRWLockExclusive(&d->resize_lock);
+                        d->actual_width = hdr.width;
+                        d->actual_height = hdr.height;
+                        if (d->pending_resize_id &&
+                            d->pending_resize_width == hdr.width &&
+                            d->pending_resize_height == hdr.height) {
+                            completed_id = d->pending_resize_id;
+                            d->pending_resize_id = 0;
+                        }
+                        if (d->resize_queued &&
+                            d->queued_resize_width == hdr.width &&
+                            d->queued_resize_height == hdr.height)
+                            d->resize_queued = FALSE;
+                        ReleaseSRWLockExclusive(&d->resize_lock);
+                        if (completed_id) {
+                            idd_log(d, L"display_resize frame id=%u actual=%ux%u",
+                                    completed_id, hdr.width, hdr.height);
+                            idd_log(d, L"display_resize complete id=%u actual=%ux%u",
+                                    completed_id, hdr.width, hdr.height);
+                        }
+                        if (d->hwnd)
+                            PostMessageW(d->hwnd, WM_IDD_ACTUAL_SIZE,
+                                         (WPARAM)hdr.width, (LPARAM)hdr.height);
+                    }
                     idd_log(d, L"Frame resolution changed: %ux%u (stride=%u)",
                             hdr.width, hdr.height, hdr.stride);
                     pending_mark_full_locked(d);
@@ -2557,6 +2905,11 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         d->frame_connected = FALSE;
         d->cursor_visible = TRUE;
         PostMessageW(d->hwnd, WM_IDD_CURSOR_CHANGED, 0, 0);
+        AcquireSRWLockExclusive(&d->frame_send_lock);
+        if (d->frame_socket == s)
+            d->frame_socket = INVALID_SOCKET;
+        InterlockedExchange(&d->resize_capable, 0);
+        ReleaseSRWLockExclusive(&d->frame_send_lock);
         closesocket(s);
         idd_log(d, L"Frame channel disconnected, reconnecting...");
 
@@ -2593,6 +2946,10 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
     if (recv_buf)
         HeapFree(GetProcessHeap(), 0, recv_buf);
 
+    AcquireSRWLockExclusive(&d->frame_send_lock);
+    d->frame_socket = INVALID_SOCKET;
+    InterlockedExchange(&d->resize_capable, 0);
+    ReleaseSRWLockExclusive(&d->frame_send_lock);
     WSACleanup();
     return 0;
 }
@@ -2689,6 +3046,11 @@ static void idd_enter_fullscreen(VmDisplayIdd *d)
                  mi.rcMonitor.right - mi.rcMonitor.left,
                  mi.rcMonitor.bottom - mi.rcMonitor.top,
                  SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+    {
+        RECT rc;
+        if (GetClientRect(hwnd, &rc))
+            idd_schedule_resize(d, (UINT)rc.right, (UINT)rc.bottom, TRUE);
+    }
     idd_update_kbd_hook(d);
     idd_update_relative_mouse(d);
     idd_log(d, L"Entered borderless fullscreen.");
@@ -2710,6 +3072,11 @@ static void idd_exit_fullscreen(VmDisplayIdd *d)
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
                  SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
     SetWindowPlacement(hwnd, &d->windowed_placement);
+    {
+        RECT rc;
+        if (GetClientRect(hwnd, &rc))
+            idd_schedule_resize(d, (UINT)rc.right, (UINT)rc.bottom, TRUE);
+    }
     idd_update_kbd_hook(d);
     idd_update_relative_mouse(d);
     idd_log(d, L"Exited borderless fullscreen.");
@@ -2725,11 +3092,12 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
 
     swprintf_s(title, 300, L"%s - IDD Display", d->vm_name);
 
-    /* Compute outer window size so the client area is exactly 1920x1080 */
+    /* Compute outer window size so the client area is exactly the shared
+       default resolution. */
     {
         DWORD style   = WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN;
         DWORD exstyle = 0;
-        RECT wr = { 0, 0, 1920, 1080 };
+        RECT wr = { 0, 0, DEFAULT_WIDTH, DEFAULT_HEIGHT };
         AdjustWindowRectEx(&wr, style, FALSE, exstyle);
 
         d->hwnd = CreateWindowExW(
@@ -2831,6 +3199,19 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         d->hwnd = NULL;
         d->open = FALSE;
         return 1;
+    }
+
+    d->control_send_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (d->control_send_event)
+        d->control_send_thread = CreateThread(NULL, 0,
+                                               idd_control_send_thread_proc,
+                                               d, 0, NULL);
+    if (!d->control_send_thread) {
+        idd_log(d, L"IDD: display control sender unavailable.");
+        if (d->control_send_event) {
+            CloseHandle(d->control_send_event);
+            d->control_send_event = NULL;
+        }
     }
 
     /* Start the recv thread now that the window and D3D11 are ready */
@@ -2950,6 +3331,22 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
             /* Stop recv threads */
             d->stop = TRUE;
+            d->control_send_stop = TRUE;
+            if (d->control_send_event)
+                SetEvent(d->control_send_event);
+            if (d->control_send_thread) {
+                WaitForSingleObject(d->control_send_thread, 2000);
+                CloseHandle(d->control_send_thread);
+                d->control_send_thread = NULL;
+            }
+            if (d->control_send_event) {
+                CloseHandle(d->control_send_event);
+                d->control_send_event = NULL;
+            }
+            AcquireSRWLockShared(&d->frame_send_lock);
+            if (d->frame_socket != INVALID_SOCKET)
+                shutdown(d->frame_socket, SD_BOTH);
+            ReleaseSRWLockShared(&d->frame_send_lock);
             idd_update_relative_mouse(d);
 
             /* Destroy clipboard module */
@@ -3003,6 +3400,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_DESTROY:
         KillTimer(hwnd, IDT_PRESENT);
+        KillTimer(hwnd, IDT_DISPLAY_RESIZE);
         KillTimer(hwnd, IDT_FULLSCREEN_TOOLBAR);
         if (d) idd_remove_kbd_hook(d);  /* safety net if WM_CLOSE was bypassed */
         if (d) {
@@ -3024,10 +3422,12 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         AdjustWindowRectEx(&wr, style, FALSE, exstyle);
         mmi->ptMinTrackSize.x = wr.right - wr.left;
         mmi->ptMinTrackSize.y = wr.bottom - wr.top;
-        /* Max: native frame size */
-        if (d && d->frame_width > 0 && d->frame_height > 0) {
+        /* Max: protocol limit, never the current frame size. This lets a
+           window grow before the guest has produced its larger ASFR. */
+        if (!d || !d->fullscreen) {
             wr.left = 0; wr.top = 0;
-            wr.right = (LONG)d->frame_width; wr.bottom = (LONG)d->frame_height;
+            wr.right = (LONG)ASB_DISPLAY_RAW_MAX_WIDTH;
+            wr.bottom = (LONG)ASB_DISPLAY_RAW_MAX_HEIGHT;
             AdjustWindowRectEx(&wr, style, FALSE, exstyle);
             mmi->ptMaxTrackSize.x = wr.right - wr.left;
             mmi->ptMaxTrackSize.y = wr.bottom - wr.top;
@@ -3070,6 +3470,13 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (d->fullscreen_toolbar_visible)
                 idd_layout_fullscreen_toolbar(d);
             d3d_resize_swap_chain(d);
+            if (!d->applying_guest_size && wp != SIZE_MINIMIZED) {
+                RECT target;
+                if (GetClientRect(hwnd, &target))
+                    idd_schedule_resize(d, (UINT)target.right,
+                                        (UINT)target.bottom,
+                                        !d->resize_interactive);
+            }
             if (d->relative_mouse) {
                 AcquireSRWLockExclusive(&g_mouse_capture_lock);
                 if (g_mouse_capture_hwnd == hwnd) idd_clip_mouse(d);
@@ -3092,6 +3499,13 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_EXITSIZEMOVE:
         if (d) {
             d->input_sizing = msg == WM_ENTERSIZEMOVE;
+            d->resize_interactive = msg == WM_ENTERSIZEMOVE;
+            if (msg == WM_EXITSIZEMOVE) {
+                RECT rc;
+                if (GetClientRect(hwnd, &rc))
+                    idd_schedule_resize(d, (UINT)rc.right, (UINT)rc.bottom, TRUE);
+                idd_apply_guest_size(d);
+            }
             idd_update_relative_mouse(d);
         }
         break;
@@ -3123,11 +3537,37 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (d->mouse_sync_pending) idd_poll_mouse_position(d);
             if (d->frame_dirty)
                 d3d_render_frame(d);
+            else
+                maybe_log_host_stats(d);
+        }
+        if (wp == IDT_DISPLAY_RESIZE && d) {
+            idd_flush_resize(d);
+            if (!d->resize_queued ||
+                InterlockedCompareExchange(&d->resize_capable, 0, 0) == 0)
+                KillTimer(hwnd, IDT_DISPLAY_RESIZE);
         }
         return 0;
 
     case WM_IDD_FRAME_READY:
         if (d) d3d_render_frame(d);
+        return 0;
+
+    case WM_IDD_RESIZE_CAPABLE:
+        if (d) {
+            RECT rc;
+            if (GetClientRect(hwnd, &rc))
+                idd_schedule_resize(d, (UINT)rc.right, (UINT)rc.bottom, TRUE);
+        }
+        return 0;
+
+    case WM_IDD_ACTUAL_SIZE:
+        if (d) {
+            AcquireSRWLockExclusive(&d->resize_lock);
+            d->actual_width = (UINT)wp;
+            d->actual_height = (UINT)lp;
+            ReleaseSRWLockExclusive(&d->resize_lock);
+            idd_apply_guest_size(d);
+        }
         return 0;
 
     case WM_CLIPBOARDUPDATE:
@@ -3444,8 +3884,12 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     d->keyboard_version   = 1;
     d->input_socket       = INVALID_SOCKET;
     d->audio_socket       = INVALID_SOCKET;
+    d->frame_socket       = INVALID_SOCKET;
     d->clipboard          = NULL;
     d->cursor_visible     = TRUE;
+    InitializeSRWLock(&d->frame_send_lock);
+    InitializeSRWLock(&d->control_queue_lock);
+    InitializeSRWLock(&d->resize_lock);
 
     /* Load the per-VM display setting, creating display_settings.json with
        the default (off) if this VM doesn't have one yet. The hook itself is
@@ -3456,6 +3900,10 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     d->frame_width  = DEFAULT_WIDTH;
     d->frame_height = DEFAULT_HEIGHT;
     d->frame_stride = DEFAULT_WIDTH * 4;
+    d->desired_width = DEFAULT_WIDTH;
+    d->desired_height = DEFAULT_HEIGHT;
+    d->actual_width = DEFAULT_WIDTH;
+    d->actual_height = DEFAULT_HEIGHT;
     d->frame_buf    = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
                                          d->frame_stride * d->frame_height);
     if (!d->frame_buf) {
