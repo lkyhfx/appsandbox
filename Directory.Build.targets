@@ -61,14 +61,63 @@
       <Output TaskParameter="ConsoleOutput" PropertyName="AsbGitCommitOutput" />
       <Output TaskParameter="ExitCode" PropertyName="AsbGitCommitExitCode" />
     </Exec>
+    <Exec Command="git -C &quot;$(MSBuildThisFileDirectory).&quot; diff --quiet HEAD --"
+          IgnoreExitCode="true"
+          Condition="'$(AsbGitCommitExitCode)' == '0'">
+      <Output TaskParameter="ExitCode" PropertyName="AsbGitDirtyExitCode" />
+    </Exec>
     <PropertyGroup>
       <AsbSourceRefFromGit>$([System.String]::Copy('$(AsbGitCommitOutput)').Trim())</AsbSourceRefFromGit>
-      <AsbSourceRef Condition="'$(AsbSourceRef)' == '' And '$(AsbGitCommitExitCode)' == '0'">$(AsbSourceRefFromGit)</AsbSourceRef>
+      <AsbSourceRefFromGitIsSha>$([System.Text.RegularExpressions.Regex]::IsMatch('$(AsbSourceRefFromGit)', '^[0-9A-Fa-f]{40}
+    <ItemGroup>
+      <_AsbSourceHeaderLines Include="#ifndef ASB_BUILD_SOURCE_H" />
+      <_AsbSourceHeaderLines Include="#define ASB_BUILD_SOURCE_H" />
+      <_AsbSourceHeaderLines Include="#define ASB_SOURCE_REPO &quot;$(AsbSourceRepo)&quot;" />
+      <_AsbSourceHeaderLines Include="#define ASB_SOURCE_REF &quot;$(AsbSourceRef)&quot;" />
+      <_AsbSourceHeaderLines Include="#endif" />
+    </ItemGroup>
+    <WriteLinesToFile File="$(AsbGeneratedDir)asb_build_source.h"
+                      Lines="@(_AsbSourceHeaderLines)"
+                      Overwrite="true" />
+  </Target>
+</Project>
+))</AsbSourceRefFromGitIsSha>
+      <AsbStrictSourceBinding Condition="'$(Configuration)' == 'Release' Or '$(CI)' == 'true' Or '$(CI)' == '1'">true</AsbStrictSourceBinding>
+      <AsbGitDirty Condition="'$(AsbGitCommitExitCode)' == '0' And '$(AsbGitDirtyExitCode)' != '0'">true</AsbGitDirty>
+
+      <AsbSourceRef Condition="'$(AsbSourceRef)' == '' And '$(AsbGitCommitExitCode)' == '0' And '$(AsbSourceRefFromGitIsSha)' == 'True'">$(AsbSourceRefFromGit)</AsbSourceRef>
       <AsbSourceRef Condition="'$(AsbSourceRef)' == ''">main</AsbSourceRef>
-      <AsbSourceRefFallback Condition="'$(AsbSourceRefWasSupplied)' != 'true' And '$(AsbSourceRefFromGit)' == ''">true</AsbSourceRefFallback>
+      <AsbSourceRefFallback Condition="'$(AsbSourceRefWasSupplied)' != 'true' And ('$(AsbGitCommitExitCode)' != '0' Or '$(AsbSourceRefFromGitIsSha)' != 'True')">true</AsbSourceRefFallback>
+      <AsbSourceRefIsSha>$([System.Text.RegularExpressions.Regex]::IsMatch('$(AsbSourceRef)', '^[0-9A-Fa-f]{40}
+    <ItemGroup>
+      <_AsbSourceHeaderLines Include="#ifndef ASB_BUILD_SOURCE_H" />
+      <_AsbSourceHeaderLines Include="#define ASB_BUILD_SOURCE_H" />
+      <_AsbSourceHeaderLines Include="#define ASB_SOURCE_REPO &quot;$(AsbSourceRepo)&quot;" />
+      <_AsbSourceHeaderLines Include="#define ASB_SOURCE_REF &quot;$(AsbSourceRef)&quot;" />
+      <_AsbSourceHeaderLines Include="#endif" />
+    </ItemGroup>
+    <WriteLinesToFile File="$(AsbGeneratedDir)asb_build_source.h"
+                      Lines="@(_AsbSourceHeaderLines)"
+                      Overwrite="true" />
+  </Target>
+</Project>
+))</AsbSourceRefIsSha>
     </PropertyGroup>
-    <Warning Condition="'$(AsbSourceRefFallback)' == 'true'"
-             Text="ASB source commit unavailable; falling back to ref 'main'. Pass /p:AsbSourceRef=&lt;commit&gt; for a reproducible Guest source." />
+
+    <Error Condition="'$(AsbStrictSourceBinding)' == 'true' And '$(AsbSourceRefFallback)' == 'true'"
+           Text="ASB source commit unavailable. Release/CI builds require an exact Guest source commit; pass /p:AsbSourceRef=&lt;40-char-commit-sha&gt;." />
+    <Warning Condition="'$(AsbStrictSourceBinding)' != 'true' And '$(AsbSourceRefFallback)' == 'true'"
+             Text="ASB source commit unavailable; development build is falling back to ref 'main'. Pass /p:AsbSourceRef=&lt;commit&gt; for a reproducible Guest source." />
+
+    <Error Condition="'$(AsbStrictSourceBinding)' == 'true' And '$(AsbSourceRefIsSha)' != 'True'"
+           Text="Release/CI builds require AsbSourceRef to be an exact 40-character commit SHA, not a branch or tag." />
+    <Warning Condition="'$(AsbStrictSourceBinding)' != 'true' And '$(AsbSourceRefIsSha)' != 'True'"
+             Text="ASB Guest source ref '$(AsbSourceRef)' is not an exact commit SHA; this development build is not reproducible." />
+
+    <Error Condition="'$(AsbStrictSourceBinding)' == 'true' And '$(AsbGitDirty)' == 'true' And '$(AsbSourceRefWasSupplied)' != 'true'"
+           Text="Working tree is dirty. Release/CI Host binaries must not embed uncommitted code while binding Guest sources to HEAD." />
+    <Warning Condition="'$(AsbStrictSourceBinding)' != 'true' And '$(AsbGitDirty)' == 'true' And '$(AsbSourceRefWasSupplied)' != 'true'"
+             Text="Working tree is dirty: Host binary may contain uncommitted changes while Guest sources are pinned to HEAD." />
     <ItemGroup>
       <_AsbSourceHeaderLines Include="#ifndef ASB_BUILD_SOURCE_H" />
       <_AsbSourceHeaderLines Include="#define ASB_BUILD_SOURCE_H" />
