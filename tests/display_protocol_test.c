@@ -14,6 +14,8 @@ int main(void)
     assert(asb_display_is_preset(1920, 1080));
     assert(asb_display_is_preset(2560, 1440));
     assert(asb_display_is_preset(3840, 2160));
+    assert(ASB_DISPLAY_RUNTIME_REQUEST_TIMEOUT_MS == 15000u);
+    assert(ASB_DISPLAY_CONTROL_STATUS_BUSY == 4);
     assert(!asb_display_is_preset(1576, 888));
     asb_display_normalize_resolution(&width, &height);
     assert(width == 1576 && height == 888);

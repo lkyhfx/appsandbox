@@ -35,6 +35,7 @@
 #include <sys/types.h>
 #include <sys/ioctl.h>
 #include <sys/poll.h>
+#include <pthread.h>
 #include <linux/vm_sockets.h>
 
 #include <xf86drm.h>
@@ -170,6 +171,14 @@ struct capture_ctx {
     int       force_full;
     enum full_frame_reason full_reason;
 
+    /* Mutter applies are deliberately off the capture/control loop. The
+     * control ABI ACK is acceptance, not completion; one worker at a time
+     * prevents concurrent ApplyMonitorsConfig calls. */
+    pthread_mutex_t mode_lock;
+    int              mode_active;
+    pthread_t        mode_thread;
+    int              mode_thread_valid;
+
     struct {
         uint64_t frames_scanned;
         uint64_t frames_sent;
@@ -243,13 +252,22 @@ static int send_control_hello(int fd)
 
 static int connect_display_helper(void)
 {
-    char candidates[16][sizeof(((struct sockaddr_un *)0)->sun_path)];
-    size_t count = 0, i;
+    uid_t candidates[16];
+    size_t count = 0, sort_start = 0, i, j;
     const char *runtime = getenv("XDG_RUNTIME_DIR");
 
-    if (runtime && runtime[0])
-        snprintf(candidates[count++], sizeof(candidates[0]), "%s/%s",
-                 runtime, DISPLAY_HELPER_SOCKET);
+    /* Prefer an explicitly supplied graphical session, then inspect numeric
+     * /run/user entries in sorted order. readdir() order is unspecified and
+     * previously made multi-session selection nondeterministic. */
+    if (runtime && runtime[0]) {
+        const char *p = strrchr(runtime, '/');
+        char *end = NULL;
+        unsigned long uid = p ? strtoul(p + 1, &end, 10) : 0;
+        if (p && p[1] && end && *end == '\0' && uid >= 100 && uid <= UINT32_MAX) {
+            candidates[count++] = (uid_t)uid;
+            sort_start = count;
+        }
+    }
 
     /* The capture daemon is deliberately root. Discover a user-session
      * helper by its private runtime socket instead of borrowing the session
@@ -264,23 +282,43 @@ static int connect_display_helper(void)
             if (entry->d_name[0] == '.') continue;
             uid = strtoul(entry->d_name, &end, 10);
             if (!end || *end || uid < 100) continue;
-            snprintf(candidates[count++], sizeof(candidates[0]),
-                     "/run/user/%s/%s", entry->d_name, DISPLAY_HELPER_SOCKET);
+            if (uid > UINT32_MAX) continue;
+            for (i = 0; i < count; i++)
+                if (candidates[i] == (uid_t)uid) break;
+            if (i == count && count < sizeof(candidates) / sizeof(candidates[0]))
+                candidates[count++] = (uid_t)uid;
         }
         if (dir) closedir(dir);
     }
 
+    for (i = sort_start; i < count; i++) {
+        for (j = i + 1; j < count; j++) {
+            if (candidates[j] < candidates[i]) {
+                uid_t tmp = candidates[i];
+                candidates[i] = candidates[j];
+                candidates[j] = tmp;
+            }
+        }
+    }
+
     for (i = 0; i < count; i++) {
+        char path[sizeof(((struct sockaddr_un *)0)->sun_path)];
         int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
         struct sockaddr_un addr;
         if (fd < 0) continue;
+        snprintf(path, sizeof(path), "/run/user/%u/%s",
+                 (unsigned)candidates[i], DISPLAY_HELPER_SOCKET);
         memset(&addr, 0, sizeof(addr));
         addr.sun_family = AF_UNIX;
-        strncpy(addr.sun_path, candidates[i], sizeof(addr.sun_path) - 1);
-        if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0)
+        strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+        if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+            agent_log("display_helper uid=%u session=runtime socket=%s",
+                      (unsigned)candidates[i], path);
             return fd;
+        }
         close(fd);
     }
+    agent_log("display_helper no active user-session socket found");
     return -1;
 }
 
@@ -322,10 +360,76 @@ static int apply_runtime_mode(uint32_t width, uint32_t height, uint32_t refresh)
     return 0;
 }
 
+struct runtime_mode_job {
+    struct capture_ctx *ctx;
+    uint32_t request_id;
+    uint32_t width;
+    uint32_t height;
+    uint32_t refresh;
+};
+
+static void *runtime_mode_worker(void *opaque)
+{
+    struct runtime_mode_job *job = (struct runtime_mode_job *)opaque;
+    struct capture_ctx *ctx = job->ctx;
+    int rc = apply_runtime_mode(job->width, job->height, job->refresh);
+
+    agent_log("display_control modeset request=%u target=%ux%u result=%s",
+              job->request_id, job->width, job->height,
+              rc == 0 ? "ok" : "failed");
+    pthread_mutex_lock(&ctx->mode_lock);
+    ctx->mode_active = 0;
+    pthread_mutex_unlock(&ctx->mode_lock);
+    free(job);
+    return NULL;
+}
+
+/* 0 = worker started, 1 = another request is active, -1 = worker creation
+ * failed. The caller maps these to BUSY or MODE_FAILED ACK status. */
+static int start_runtime_mode(struct capture_ctx *ctx, uint32_t request_id,
+                              uint32_t width, uint32_t height,
+                              uint32_t refresh)
+{
+    struct runtime_mode_job *job;
+    int rc;
+
+    pthread_mutex_lock(&ctx->mode_lock);
+    if (ctx->mode_active) {
+        pthread_mutex_unlock(&ctx->mode_lock);
+        return 1;
+    }
+    if (ctx->mode_thread_valid) {
+        pthread_join(ctx->mode_thread, NULL);
+        ctx->mode_thread_valid = 0;
+    }
+    job = (struct runtime_mode_job *)calloc(1, sizeof(*job));
+    if (!job) {
+        pthread_mutex_unlock(&ctx->mode_lock);
+        return -1;
+    }
+    job->ctx = ctx;
+    job->request_id = request_id;
+    job->width = width;
+    job->height = height;
+    job->refresh = refresh;
+    ctx->mode_active = 1;
+    rc = pthread_create(&ctx->mode_thread, NULL, runtime_mode_worker, job);
+    if (rc != 0) {
+        ctx->mode_active = 0;
+        free(job);
+        pthread_mutex_unlock(&ctx->mode_lock);
+        return -1;
+    }
+    ctx->mode_thread_valid = 1;
+    pthread_mutex_unlock(&ctx->mode_lock);
+    return 0;
+}
+
 /* Read only the host->guest half of the full-duplex :2 stream. MSG_DONTWAIT
  * keeps this out of the 60Hz capture path's critical timing; frame sending is
  * still performed by the same thread, so messages cannot interleave. */
-static int poll_display_control(int fd, struct control_rx *rx)
+static int poll_display_control(struct capture_ctx *ctx, int fd,
+                                struct control_rx *rx)
 {
     for (;;) {
         ssize_t n;
@@ -378,16 +482,21 @@ static int poll_display_control(int fd, struct control_rx *rx)
         agent_log("display_control resize request=%u requested=%ux%u "
                   "normalized=%ux%u", msg.request_id, msg.width, msg.height,
                   width, height);
-        if (status == ASB_DISPLAY_CONTROL_STATUS_ACCEPTED &&
-            apply_runtime_mode(width, height, refresh) < 0)
-            status = ASB_DISPLAY_CONTROL_STATUS_MODE_FAILED;
+        if (status == ASB_DISPLAY_CONTROL_STATUS_ACCEPTED) {
+            int mode_rc = start_runtime_mode(ctx, msg.request_id, width,
+                                              height, refresh);
+            if (mode_rc > 0)
+                status = ASB_DISPLAY_CONTROL_STATUS_BUSY;
+            else if (mode_rc < 0)
+                status = ASB_DISPLAY_CONTROL_STATUS_MODE_FAILED;
+        }
         if (send_control(fd, ASB_DISPLAY_CONTROL_RESIZE_ACK, msg.request_id,
                          width, height, refresh, status) < 0)
             return -1;
         agent_log("display_control resize ack request=%u status=%s target=%ux%u",
                   msg.request_id,
-                  status == ASB_DISPLAY_CONTROL_STATUS_ACCEPTED
-                      ? "accepted" : "failed",
+                  status == ASB_DISPLAY_CONTROL_STATUS_ACCEPTED ? "accepted" :
+                  status == ASB_DISPLAY_CONTROL_STATUS_BUSY ? "busy" : "failed",
                   width, height);
     }
     return 0;
@@ -1337,6 +1446,8 @@ static void capture_loop(int client_fd)
     struct capture_ctx ctx = { .fd = -1, .dma_fd = -1 };
     struct control_rx control = {0};
 
+    pthread_mutex_init(&ctx.mode_lock, NULL);
+
     /* Find a /dev/dri/cardN by DRM driver name, in preference order:
      *   asb_drm     — our custom virtual display driver (preferred)
      *   hyperv_drm  — Hyper-V synthetic GPU (fallback for VMs without asb_drm)
@@ -1445,6 +1556,7 @@ static void capture_loop(int client_fd)
     }
     if (ctx.fd < 0) {
         agent_log("no /dev/dri/cardN with a connected output");
+        pthread_mutex_destroy(&ctx.mode_lock);
         return;
     }
 
@@ -1489,7 +1601,7 @@ have_card:
         /* Host resize requests share the full-duplex frame socket. Polling
          * with MSG_DONTWAIT ensures a slow or idle control sender never
          * stalls capture. */
-        if (poll_display_control(client_fd, &control) < 0) {
+        if (poll_display_control(&ctx, client_fd, &control) < 0) {
             agent_log("client disconnected (control)");
             break;
         }
@@ -1601,6 +1713,16 @@ have_card:
 
     drm_release_fb(&ctx);
     free_capture_buffers(&ctx);
+    pthread_mutex_lock(&ctx.mode_lock);
+    if (ctx.mode_thread_valid) {
+        pthread_t mode_thread = ctx.mode_thread;
+        ctx.mode_thread_valid = 0;
+        pthread_mutex_unlock(&ctx.mode_lock);
+        pthread_join(mode_thread, NULL);
+    } else {
+        pthread_mutex_unlock(&ctx.mode_lock);
+    }
+    pthread_mutex_destroy(&ctx.mode_lock);
     close(ctx.fd);
 }
 

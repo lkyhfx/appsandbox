@@ -52,6 +52,7 @@ static inline int asb_display_is_preset(uint32_t width, uint32_t height)
 #define ASB_DISPLAY_RESIZE_ACK_TIMEOUT_MS 1250u
 #define ASB_DISPLAY_RESIZE_COMPLETION_TIMEOUT_MS 2500u
 #define ASB_DISPLAY_RESIZE_RETRY_LIMIT 2u
+#define ASB_DISPLAY_RUNTIME_REQUEST_TIMEOUT_MS 15000u
 
 enum {
     ASB_DISPLAY_CONTROL_HELLO = 1,
@@ -68,6 +69,8 @@ enum {
     ASB_DISPLAY_CONTROL_STATUS_BAD_REQUEST = 1,
     ASB_DISPLAY_CONTROL_STATUS_UNSUPPORTED = 2,
     ASB_DISPLAY_CONTROL_STATUS_MODE_FAILED = 3,
+    /* The guest already has one asynchronous Mutter modeset in flight. */
+    ASB_DISPLAY_CONTROL_STATUS_BUSY = 4,
 };
 
 /* Resolution normalization is deliberately shared by the host and guest:

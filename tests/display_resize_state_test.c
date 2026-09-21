@@ -26,6 +26,8 @@ typedef struct ResizeModel {
     uint32_t retry_count;
     uint64_t deadline;
     bool send_completed;
+    bool runtime_active;
+    uint64_t runtime_deadline;
     enum {
         PHASE_NONE = 0,
         PHASE_WAIT_ACK,
@@ -33,6 +35,47 @@ typedef struct ResizeModel {
     } phase;
     bool queued;
 } ResizeModel;
+
+static void model_runtime_begin(ResizeModel *s, uint32_t width,
+                                uint32_t height, uint64_t now)
+{
+    s->runtime_active = true;
+    s->runtime_deadline = now + ASB_DISPLAY_RUNTIME_REQUEST_TIMEOUT_MS;
+    s->desired_width = width;
+    s->desired_height = height;
+}
+
+static bool model_runtime_terminal(ResizeModel *s, uint64_t now)
+{
+    if (!s->runtime_active || !s->runtime_deadline ||
+        now < s->runtime_deadline)
+        return false;
+    s->runtime_active = false;
+    s->runtime_deadline = 0;
+    s->pending_id = 0;
+    s->pending_generation = 0;
+    s->pending_width = 0;
+    s->pending_height = 0;
+    s->deadline = 0;
+    s->phase = PHASE_NONE;
+    s->queued = false;
+    return true;
+}
+
+static bool model_runtime_abort(ResizeModel *s)
+{
+    if (!s->runtime_active) return false;
+    s->runtime_active = false;
+    s->runtime_deadline = 0;
+    s->pending_id = 0;
+    s->pending_generation = 0;
+    s->pending_width = 0;
+    s->pending_height = 0;
+    s->deadline = 0;
+    s->phase = PHASE_NONE;
+    s->queued = false;
+    return true;
+}
 
 static void model_disconnect(ResizeModel *s)
 {
@@ -266,6 +309,43 @@ int main(void)
     assert(s.send_completed && s.phase == PHASE_WAIT_FRAME);
     assert(model_frame(&s, 1920, 1080, 7));
     assert(s.pending_id == 0 && s.phase == PHASE_NONE);
+
+    /* A request made before HELLO must have an independent lifecycle deadline;
+     * resize ACK/frame timers alone cannot expire it. */
+    s = (ResizeModel){0};
+    model_runtime_begin(&s, 1920, 1080, 100);
+    assert(s.runtime_active);
+    assert(!model_runtime_terminal(&s,
+                                   100 + ASB_DISPLAY_RUNTIME_REQUEST_TIMEOUT_MS - 1));
+    assert(model_runtime_terminal(&s,
+                                  100 + ASB_DISPLAY_RUNTIME_REQUEST_TIMEOUT_MS));
+    assert(!s.runtime_active && s.pending_id == 0 && s.phase == PHASE_NONE);
+
+    /* A frame disconnect is terminal for the explicit UI request. A later
+     * reconnect may synchronize the persisted value, but cannot revive the
+     * failed request. */
+    s = (ResizeModel){0};
+    model_runtime_begin(&s, 2560, 1440, 200);
+    begin_request(&s, 30, 2, 2560, 1440);
+    assert(model_prepare_send(&s, 201));
+    assert(model_runtime_abort(&s)); /* disconnect during WAIT_ACK */
+    model_disconnect(&s);
+    assert(s.pending_id == 0 && s.phase == PHASE_NONE);
+
+    s = (ResizeModel){0};
+    model_runtime_begin(&s, 3840, 2160, 300);
+    begin_request(&s, 31, 3, 3840, 2160);
+    assert(model_prepare_send(&s, 301));
+    assert(model_ack(&s, 31, ASB_DISPLAY_CONTROL_STATUS_ACCEPTED,
+                     3840, 2160, 3, 302));
+    assert(s.phase == PHASE_WAIT_FRAME);
+    assert(model_runtime_abort(&s)); /* disconnect during WAIT_FRAME */
+    assert(!s.runtime_active && s.pending_id == 0);
+
+    s = (ResizeModel){0};
+    model_runtime_begin(&s, 1920, 1080, 400);
+    assert(model_runtime_abort(&s)); /* IDD destroy / VM stop */
+    assert(!s.runtime_active && s.pending_id == 0);
 
     return 0;
 }

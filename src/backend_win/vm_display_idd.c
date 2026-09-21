@@ -291,6 +291,7 @@ struct VmDisplayIdd {
     BOOL           runtime_request_active;
     UINT           runtime_request_width;
     UINT           runtime_request_height;
+    ULONGLONG      runtime_request_deadline;
 
     /* Input forwarding */
     volatile SOCKET input_socket;   /* input socket for keyboard/mouse forwarding */
@@ -366,6 +367,7 @@ static void idd_schedule_resize(VmDisplayIdd *d, UINT width, UINT height,
                                 BOOL immediate);
 static void idd_flush_resize(VmDisplayIdd *d);
 static void idd_check_resize_timeout(VmDisplayIdd *d);
+static void idd_check_runtime_request_timeout(VmDisplayIdd *d);
 static void idd_post_runtime_result(VmDisplayIdd *d, BOOL success,
                                     UINT width, UINT height);
 static BOOL idd_send_display_control(VmDisplayIdd *d,
@@ -1421,9 +1423,11 @@ static void idd_requeue_failed_resize(VmDisplayIdd *d,
  * desired_* is deliberately retained so HELLO can synchronize it again. */
 static void idd_invalidate_resize_connection(VmDisplayIdd *d)
 {
+    BOOL fail_runtime = FALSE;
     if (!d) return;
 
     AcquireSRWLockExclusive(&d->resize_lock);
+    fail_runtime = d->runtime_request_active;
     d->actual_valid = FALSE;
     d->force_resize_sync = FALSE;
     d->actual_generation = 0;
@@ -1443,6 +1447,12 @@ static void idd_invalidate_resize_connection(VmDisplayIdd *d)
     d->control_queued = FALSE;
     d->queued_control_generation = 0;
     ReleaseSRWLockExclusive(&d->control_queue_lock);
+
+    /* A frame/control disconnect is terminal for the explicit UI request.
+     * Reconnect may still synchronize the persisted target once HELLO
+     * returns, but it must not revive a request already reported as failed. */
+    if (fail_runtime)
+        idd_post_runtime_result(d, FALSE, 0, 0);
 }
 
 static BOOL idd_queue_display_control(VmDisplayIdd *d,
@@ -1596,6 +1606,16 @@ static void idd_post_runtime_result(VmDisplayIdd *d, BOOL success,
     if (!width) width = d->runtime_request_width;
     if (!height) height = d->runtime_request_height;
     d->runtime_request_active = FALSE;
+    d->runtime_request_deadline = 0;
+    d->pending_resize_width = 0;
+    d->pending_resize_height = 0;
+    d->pending_resize_id = 0;
+    d->pending_resize_generation = 0;
+    d->pending_resize_deadline = 0;
+    d->pending_resize_phase = DISPLAY_RESIZE_PHASE_NONE;
+    d->pending_resize_retry_count = 0;
+    d->resize_queued = FALSE;
+    d->queued_resize_width = 0;
     notify = d->runtime_notify_hwnd;
     if (!success && d->vm) {
         uint32_t configured_width = d->vm->display_width;
@@ -1610,6 +1630,11 @@ static void idd_post_runtime_result(VmDisplayIdd *d, BOOL success,
     }
     ReleaseSRWLockExclusive(&d->resize_lock);
 
+    AcquireSRWLockExclusive(&d->control_queue_lock);
+    d->control_queued = FALSE;
+    d->queued_control_generation = 0;
+    ReleaseSRWLockExclusive(&d->control_queue_lock);
+
     result = (VmDisplayRuntimeResult *)HeapAlloc(
         GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*result));
     if (!result) return;
@@ -1620,6 +1645,31 @@ static void idd_post_runtime_result(VmDisplayIdd *d, BOOL success,
     if (!notify || !PostMessageW(notify, WM_VM_DISPLAY_RUNTIME_RESULT,
                                  0, (LPARAM)result))
         HeapFree(GetProcessHeap(), 0, result);
+}
+
+static void idd_check_runtime_request_timeout(VmDisplayIdd *d)
+{
+    ULONGLONG now;
+    ULONGLONG deadline = 0;
+    BOOL expired = FALSE;
+    UINT width = 0, height = 0;
+
+    if (!d) return;
+    now = GetTickCount64();
+    AcquireSRWLockShared(&d->resize_lock);
+    if (d->runtime_request_active && d->runtime_request_deadline &&
+        now >= d->runtime_request_deadline) {
+        expired = TRUE;
+        deadline = d->runtime_request_deadline;
+        width = d->runtime_request_width;
+        height = d->runtime_request_height;
+    }
+    ReleaseSRWLockShared(&d->resize_lock);
+    if (expired) {
+        idd_log(d, L"display_resize request_timeout target=%ux%u deadline=%llu",
+                width, height, deadline);
+        idd_post_runtime_result(d, FALSE, width, height);
+    }
 }
 
 static void idd_schedule_resize(VmDisplayIdd *d, UINT width, UINT height,
@@ -1671,6 +1721,7 @@ static void idd_handle_resize_ack(VmDisplayIdd *d,
 {
     BOOL accepted;
     BOOL retry = FALSE;
+    BOOL busy = FALSE;
     BOOL abandon = FALSE;
     BOOL disable_resize = FALSE;
     UINT32 pending_id;
@@ -1682,7 +1733,7 @@ static void idd_handle_resize_ack(VmDisplayIdd *d,
         return;
 
     if (control->request_id == 0 ||
-        control->status_or_flags > ASB_DISPLAY_CONTROL_STATUS_MODE_FAILED) {
+        control->status_or_flags > ASB_DISPLAY_CONTROL_STATUS_BUSY) {
         idd_log(d, L"display_control invalid resize ack id=%u status=%u.",
                 control->request_id, control->status_or_flags);
         return;
@@ -1743,10 +1794,15 @@ static void idd_handle_resize_ack(VmDisplayIdd *d,
     d->pending_resize_deadline = 0;
     d->pending_resize_phase = DISPLAY_RESIZE_PHASE_NONE;
 
-    if (control->status_or_flags == ASB_DISPLAY_CONTROL_STATUS_MODE_FAILED &&
+    if ((control->status_or_flags == ASB_DISPLAY_CONTROL_STATUS_MODE_FAILED ||
+         control->status_or_flags == ASB_DISPLAY_CONTROL_STATUS_BUSY) &&
         retry_count < DISPLAY_RESIZE_RETRY_LIMIT &&
         InterlockedCompareExchange(&d->resize_capable, 0, 0) != 0) {
-        d->pending_resize_retry_count = retry_count + 1;
+        busy = control->status_or_flags == ASB_DISPLAY_CONTROL_STATUS_BUSY;
+        /* BUSY means the guest's previous asynchronous modeset is still
+         * running. Keep retry budget for actual timeout/failure cases and
+         * poll again later instead of burning all retries in milliseconds. */
+        d->pending_resize_retry_count = busy ? retry_count : retry_count + 1;
         d->queued_resize_width = d->desired_width;
         d->queued_resize_height = d->desired_height;
         d->resize_queued = TRUE;
@@ -1768,8 +1824,12 @@ static void idd_handle_resize_ack(VmDisplayIdd *d,
     if (retry) {
         idd_log(d, L"display_resize retry id=%u target=%ux%u",
                 control->request_id, d->desired_width, d->desired_height);
-        if (d->hwnd)
-            PostMessageW(d->hwnd, WM_IDD_RESIZE_RETRY, 0, 0);
+        if (d->hwnd) {
+            if (busy)
+                SetTimer(d->hwnd, IDT_DISPLAY_RESIZE, 250, NULL);
+            else
+                PostMessageW(d->hwnd, WM_IDD_RESIZE_RETRY, 0, 0);
+        }
     } else if (abandon) {
         idd_log(d, L"display_resize abandoned target=%ux%u actual=%ux%u",
                 d->desired_width, d->desired_height,
@@ -1793,6 +1853,8 @@ static void idd_check_resize_timeout(VmDisplayIdd *d)
 
     if (!d) return;
     now = GetTickCount64();
+
+    idd_check_runtime_request_timeout(d);
 
     AcquireSRWLockExclusive(&d->resize_lock);
     if (!d->pending_resize_id ||
@@ -3890,7 +3952,8 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             {
                 BOOL keep_timer;
                 AcquireSRWLockShared(&d->resize_lock);
-                keep_timer = d->resize_queued || d->pending_resize_id != 0;
+                keep_timer = d->resize_queued || d->pending_resize_id != 0 ||
+                             d->runtime_request_active;
                 ReleaseSRWLockShared(&d->resize_lock);
                 if (!keep_timer ||
                     InterlockedCompareExchange(&d->resize_capable, 0, 0) == 0)
@@ -4301,6 +4364,8 @@ BOOL vm_display_idd_set_runtime_display(VmDisplayIdd *display,
     display->runtime_request_active = TRUE;
     display->runtime_request_width = width;
     display->runtime_request_height = height;
+    display->runtime_request_deadline =
+        GetTickCount64() + ASB_DISPLAY_RUNTIME_REQUEST_TIMEOUT_MS;
     already_actual = display->actual_valid &&
                      display->actual_width == width &&
                      display->actual_height == height &&
@@ -4312,6 +4377,12 @@ BOOL vm_display_idd_set_runtime_display(VmDisplayIdd *display,
         return TRUE;
     }
 
+    /* Keep the lifecycle deadline running even before frame HELLO/capability
+     * arrives. A disconnected or never-started guest must not leave the UI
+     * in Applying forever. */
+    if (display->hwnd)
+        SetTimer(display->hwnd, IDT_DISPLAY_RESIZE, 250, NULL);
+
     /* idd_schedule_resize retains the desired target until HELLO arrives,
      * so a request made while the frame helper is reconnecting is not lost. */
     idd_schedule_resize(display, width, height, TRUE);
@@ -4321,6 +4392,9 @@ BOOL vm_display_idd_set_runtime_display(VmDisplayIdd *display,
 void vm_display_idd_destroy(VmDisplayIdd *display)
 {
     if (!display) return;
+
+    if (display->runtime_request_active)
+        idd_post_runtime_result(display, FALSE, 0, 0);
 
     /* Signal stop */
     display->stop = TRUE;
