@@ -21,6 +21,7 @@
 #include "prereq.h"
 #include "ui.h"
 #include "../core/display_protocol.h"
+#include "asb_build_source.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -2498,27 +2499,45 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
        staging dir, since the prefetches write directly into it.) */
 
     /* ---- 1a. Set up staging dir + run 3 prefetches that populate it
-       directly (no host cache). Order doesn't matter functionally;
-       sequential for simpler logging. Failures are non-fatal — VM
-       still builds; firstboot STEP 17 verification will flag any
-       missing artifacts in the rootfs. ---- */
+       directly (no host cache). Sequential for simpler logging. Missing
+       source/artifacts fail closed before a VHDX is produced. ---- */
     swprintf_s(staging, MAX_PATH, L"%s\\_vhdx_staging", args->vhdx_dir);
-    CreateDirectoryW(staging, NULL);
+    if (GetFileAttributesW(staging) != INVALID_FILE_ATTRIBUTES) {
+        asb_log(L"Removing stale Linux staging directory before prefetch: %s", staging);
+        if (!remove_dir_recursive(staging)) {
+            args->result = E_FAIL;
+            wcscpy_s(args->error_msg, ARRAYSIZE(args->error_msg),
+                     L"Could not remove stale Linux staging directory.");
+            goto done;
+        }
+    }
+    if (!CreateDirectoryW(staging, NULL)) {
+        args->result = E_FAIL;
+        wcscpy_s(args->error_msg, ARRAYSIZE(args->error_msg),
+                 L"Could not create Linux staging directory.");
+        goto done;
+    }
     swprintf_s(manifest, MAX_PATH, L"%s\\manifest.txt", staging);
 
     {
         wchar_t extras[MAX_PATH], args_buf[2048];
         swprintf_s(extras, MAX_PATH, L"%s\\extras", staging);
-        CreateDirectoryW(extras, NULL);
+        if (!CreateDirectoryW(extras, NULL)) {
+            args->result = E_FAIL;
+            wcscpy_s(args->error_msg, ARRAYSIZE(args->error_msg),
+                     L"Could not create Linux extras staging directory.");
+            goto done;
+        }
 
         /* Prefetch 1: Linux sources from GitHub. Writes agent-src/,
            asb_drm-src/, dxgkrnl-src/, systemd/, modprobe.d-asb_drm.conf,
            50-appsandbox-gpu, org.gnome.Shell-no-gpu.conf, appsandbox-gpu,
            wsl-mesa.tar.zst directly into <staging>/extras/. */
         asb_log(L"Prefetch 1/3: downloading Linux sources from GitHub...");
+        asb_log(L"guest_source repo=%S ref=%S", ASB_SOURCE_REPO, ASB_SOURCE_REF);
         swprintf_s(args_buf, 2048,
-            L"--prefetch-repo --branch \"main\" --out-dir \"%s\"",
-            extras);
+            L"--prefetch-repo --repo \"%S\" --ref \"%S\" --out-dir \"%s\"",
+            ASB_SOURCE_REPO, ASB_SOURCE_REF, extras);
         if (spawn_iso_patch_prefetch(args_buf) != 0) {
             args->result = E_FAIL;
             wcscpy_s(args->error_msg, ARRAYSIZE(args->error_msg),

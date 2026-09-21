@@ -36,9 +36,48 @@
   <!-- Make the version string available to C/C++ sources from the same single source, for
        code that reports it at runtime (e.g. the headless API's /version response). Passed
        UNQUOTED and stringized in the source, mirroring the version.rc injection above. -->
+  <PropertyGroup>
+    <AsbGeneratedDir Condition="'$(IntDir)' != ''">$(IntDir)generated\</AsbGeneratedDir>
+  </PropertyGroup>
+
   <ItemDefinitionGroup>
     <ClCompile>
       <PreprocessorDefinitions>ASB_VERSION_SHORT=$(AsbVersionShort);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories Condition="'$(AsbGeneratedDir)' != ''">$(AsbGeneratedDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
   </ItemDefinitionGroup>
+
+  <!--
+    Bind Host and Guest source provenance at build time. The generated header
+    is consumed by asb_core.c when it invokes the repo prefetch mode.
+    Release/CI may pass /p:AsbSourceRef=<commit>; otherwise resolve HEAD from
+    the checkout. A missing git ref is allowed only for an explicit, noisy
+    development fallback to main.
+  -->
+  <Target Name="GenerateAsbSourceMetadata" BeforeTargets="ClCompile">
+    <MakeDir Directories="$(AsbGeneratedDir)" Condition="'$(AsbGeneratedDir)' != ''" />
+    <Exec Command="git -C &quot;$(MSBuildThisFileDirectory).&quot; rev-parse HEAD"
+          ConsoleToMSBuild="true" IgnoreExitCode="true">
+      <Output TaskParameter="ConsoleOutput" PropertyName="AsbGitCommitOutput" />
+      <Output TaskParameter="ExitCode" PropertyName="AsbGitCommitExitCode" />
+    </Exec>
+    <PropertyGroup>
+      <AsbSourceRefFromGit>$([System.String]::Copy('$(AsbGitCommitOutput)').Trim())</AsbSourceRefFromGit>
+      <AsbSourceRef Condition="'$(AsbSourceRef)' == '' And '$(AsbGitCommitExitCode)' == '0'">$(AsbSourceRefFromGit)</AsbSourceRef>
+      <AsbSourceRef Condition="'$(AsbSourceRef)' == ''">main</AsbSourceRef>
+      <AsbSourceRefFallback Condition="'$(AsbSourceRefWasSupplied)' != 'true' And '$(AsbSourceRefFromGit)' == ''">true</AsbSourceRefFallback>
+    </PropertyGroup>
+    <Warning Condition="'$(AsbSourceRefFallback)' == 'true'"
+             Text="ASB source commit unavailable; falling back to ref 'main'. Pass /p:AsbSourceRef=&lt;commit&gt; for a reproducible Guest source." />
+    <ItemGroup>
+      <_AsbSourceHeaderLines Include="#ifndef ASB_BUILD_SOURCE_H" />
+      <_AsbSourceHeaderLines Include="#define ASB_BUILD_SOURCE_H" />
+      <_AsbSourceHeaderLines Include="#define ASB_SOURCE_REPO &quot;$(AsbSourceRepo)&quot;" />
+      <_AsbSourceHeaderLines Include="#define ASB_SOURCE_REF &quot;$(AsbSourceRef)&quot;" />
+      <_AsbSourceHeaderLines Include="#endif" />
+    </ItemGroup>
+    <WriteLinesToFile File="$(AsbGeneratedDir)asb_build_source.h"
+                      Lines="@(_AsbSourceHeaderLines)"
+                      Overwrite="true" />
+  </Target>
 </Project>

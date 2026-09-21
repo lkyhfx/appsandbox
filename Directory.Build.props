@@ -21,6 +21,13 @@
     <AsbVersion>$(AsbVersionMajor).$(AsbVersionMinor).$(AsbVersionPatch).$(AsbVersionRevision)</AsbVersion>
     <AsbVersionComma>$(AsbVersionMajor),$(AsbVersionMinor),$(AsbVersionPatch),$(AsbVersionRevision)</AsbVersionComma>
     <AsbVersionShort>$(AsbVersionMajor).$(AsbVersionMinor).$(AsbVersionPatch)</AsbVersionShort>
+
+    <!-- Guest Linux sources must come from the same repository as the Host.
+         CI/release builds may override AsbSourceRepo/AsbSourceRef on the
+         MSBuild command line; AsbSourceRef otherwise comes from git HEAD in
+         Directory.Build.targets. -->
+    <AsbSourceRepo Condition="'$(AsbSourceRepo)' == ''">lkyhfx/appsandbox</AsbSourceRepo>
+    <AsbSourceRefWasSupplied Condition="'$(AsbSourceRef)' != ''">true</AsbSourceRefWasSupplied>
   </PropertyGroup>
 
   <!--

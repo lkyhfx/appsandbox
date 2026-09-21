@@ -7,7 +7,7 @@
 
 #include <windows.h>
 
-/* Download github.com/jamesstringer90/appsandbox @ <branch> and place
+/* Download github.com/<owner>/<repo> @ <ref> and place
  * the tools/linux/ subtree directly into <out_dir> in the final layout
  * the manifest writer expects:
  *
@@ -26,7 +26,11 @@
  *     appsandbox-gpu
  *     wsl-mesa.tar.zst     (from tools/linux/wsl-mesa/prebuilt/...)
  *
+ * source-version is also written at <out_dir>/source-version with the exact
+ * repo/ref used for this staging operation.
+ *
  * Returns 0 on success; non-zero on any failure. */
-int do_prefetch_repo(const wchar_t *branch, const wchar_t *out_dir);
+int do_prefetch_repo(const wchar_t *repo, const wchar_t *ref,
+                     const wchar_t *out_dir);
 
 #endif
