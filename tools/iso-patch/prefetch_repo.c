@@ -481,8 +481,7 @@ int do_prefetch_repo(const wchar_t *repo, const wchar_t *ref,
         const wchar_t *units[] = {
             L"appsandbox-agent.service", L"appsandbox-audio.service",
             L"appsandbox-clipboard.service", L"appsandbox-display.service",
-            L"appsandbox-input.service", L"appsandbox-display-helper.service",
-            L"appsandbox-firstboot.service"
+            L"appsandbox-input.service", L"appsandbox-display-helper.service"
         };
         for (int i = 0; i < (int)(sizeof(units) / sizeof(units[0])); i++) {
             swprintf_s(s, _countof(s),

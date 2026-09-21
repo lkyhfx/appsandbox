@@ -42,9 +42,9 @@
 #include <xf86drmMode.h>
 #include <drm_fourcc.h>
 
-#include "core/display_protocol.h"
-#include "core/display_snapshot.h"
-#include "core/display_fb_state.h"
+#include "display_protocol.h"
+#include "display_snapshot.h"
+#include "display_fb_state.h"
 
 #define VSOCK_PORT      2
 #define DISPLAY_HELPER_SOCKET "appsandbox/display-control.sock"

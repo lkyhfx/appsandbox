@@ -1776,7 +1776,9 @@ static void plant_firstboot_service(ext4_writer_t *ew)
                          0755, 0, 0, (uint32_t)time(NULL),
                          firstboot_sh, strlen(firstboot_sh));
 
-    /* Unit: oneshot, RemainAfterExit so systemd remembers it ran. Output
+    /* Single source of truth for the Ubuntu firstboot unit. Keep this unit
+       here rather than staging a second copy from tools/linux/agent/systemd.
+       It is oneshot, RemainAfterExit so systemd remembers it ran. Output
        goes to journal + console so the com1 named pipe captures every
        step boundary in real time. WantedBy=multi-user.target — pre-enabled
        via the symlink below. */
@@ -1792,7 +1794,7 @@ static void plant_firstboot_service(ext4_writer_t *ew)
         "ExecStart=/usr/local/bin/appsandbox-firstboot.sh\n"
         "StandardOutput=journal+console\n"
         "StandardError=journal+console\n"
-        "TimeoutStartSec=300\n"
+        "TimeoutStartSec=45min\n"
         "\n"
         "[Install]\n"
         "WantedBy=multi-user.target\n";
