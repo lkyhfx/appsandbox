@@ -1701,8 +1701,14 @@ static void idd_schedule_resize(VmDisplayIdd *d, UINT width, UINT height,
     ReleaseSRWLockExclusive(&d->resize_lock);
 
     if (!queue || InterlockedCompareExchange(&d->resize_capable, 0, 0) == 0) {
+        BOOL keep_timer;
         AcquireSRWLockShared(&d->resize_lock);
-        if (!d->pending_resize_id && d->hwnd)
+        /* A runtime request owns the timer until its lifecycle deadline,
+         * even before HELLO/capability arrives. */
+        keep_timer = d->runtime_request_active ||
+                     (InterlockedCompareExchange(&d->resize_capable, 0, 0) != 0 &&
+                      (d->resize_queued || d->pending_resize_id != 0));
+        if (!keep_timer && d->hwnd)
             KillTimer(d->hwnd, IDT_DISPLAY_RESIZE);
         ReleaseSRWLockShared(&d->resize_lock);
         return;
@@ -3951,12 +3957,16 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             idd_flush_resize(d);
             {
                 BOOL keep_timer;
+                BOOL resize_capable;
+                BOOL runtime_request_active;
                 AcquireSRWLockShared(&d->resize_lock);
-                keep_timer = d->resize_queued || d->pending_resize_id != 0 ||
-                             d->runtime_request_active;
+                runtime_request_active = d->runtime_request_active;
+                keep_timer = d->resize_queued || d->pending_resize_id != 0;
                 ReleaseSRWLockShared(&d->resize_lock);
-                if (!keep_timer ||
-                    InterlockedCompareExchange(&d->resize_capable, 0, 0) == 0)
+                resize_capable = InterlockedCompareExchange(&d->resize_capable, 0, 0) != 0;
+                /* runtime_request_active is an independent lifecycle timer;
+                 * resize capability must not stop it before HELLO. */
+                if (!runtime_request_active && (!resize_capable || !keep_timer))
                     KillTimer(hwnd, IDT_DISPLAY_RESIZE);
             }
         }

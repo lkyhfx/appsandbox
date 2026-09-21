@@ -28,6 +28,8 @@ typedef struct ResizeModel {
     bool send_completed;
     bool runtime_active;
     uint64_t runtime_deadline;
+    bool resize_capable;
+    bool timer_armed;
     enum {
         PHASE_NONE = 0,
         PHASE_WAIT_ACK,
@@ -36,6 +38,17 @@ typedef struct ResizeModel {
     bool queued;
 } ResizeModel;
 
+static bool model_resize_timer_needed(const ResizeModel *s)
+{
+    return s->runtime_active ||
+           (s->resize_capable && (s->queued || s->pending_id != 0));
+}
+
+static void model_update_resize_timer(ResizeModel *s)
+{
+    s->timer_armed = model_resize_timer_needed(s);
+}
+
 static void model_runtime_begin(ResizeModel *s, uint32_t width,
                                 uint32_t height, uint64_t now)
 {
@@ -43,6 +56,7 @@ static void model_runtime_begin(ResizeModel *s, uint32_t width,
     s->runtime_deadline = now + ASB_DISPLAY_RUNTIME_REQUEST_TIMEOUT_MS;
     s->desired_width = width;
     s->desired_height = height;
+    s->timer_armed = true;
 }
 
 static bool model_runtime_terminal(ResizeModel *s, uint64_t now)
@@ -59,6 +73,7 @@ static bool model_runtime_terminal(ResizeModel *s, uint64_t now)
     s->deadline = 0;
     s->phase = PHASE_NONE;
     s->queued = false;
+    model_update_resize_timer(s);
     return true;
 }
 
@@ -74,6 +89,7 @@ static bool model_runtime_abort(ResizeModel *s)
     s->deadline = 0;
     s->phase = PHASE_NONE;
     s->queued = false;
+    model_update_resize_timer(s);
     return true;
 }
 
@@ -101,6 +117,32 @@ static void model_schedule(ResizeModel *s, uint32_t width, uint32_t height)
     s->desired_height = height;
     s->queued = !s->actual_valid || s->actual_width != width ||
                 s->actual_height != height;
+    model_update_resize_timer(s);
+}
+
+static void model_schedule_resize(ResizeModel *s, uint32_t width,
+                                   uint32_t height, bool resize_capable)
+{
+    s->resize_capable = resize_capable;
+    model_schedule(s, width, height);
+
+    /* Mirrors both Windows paths under test: a queued resize cannot be sent
+     * before capability/HELLO, but an active runtime request must keep the
+     * lifecycle timer armed. */
+    model_update_resize_timer(s);
+}
+
+static void begin_request(ResizeModel *s, uint32_t request_id,
+                          uint64_t generation, uint32_t width,
+                          uint32_t height);
+
+static void model_flush_resize(ResizeModel *s)
+{
+    if (!s->resize_capable || !s->queued || s->pending_id != 0)
+        return;
+    s->queued = false;
+    begin_request(s, 100, 1, s->desired_width, s->desired_height);
+    s->timer_armed = true;
 }
 
 static bool model_ack(ResizeModel *s, uint32_t request_id,
@@ -311,15 +353,39 @@ int main(void)
     assert(s.pending_id == 0 && s.phase == PHASE_NONE);
 
     /* A request made before HELLO must have an independent lifecycle deadline;
-     * resize ACK/frame timers alone cannot expire it. */
+     * resize ACK/frame timers alone cannot expire it. The timer must remain
+     * armed while resize_capable is false, then stop only after terminal
+     * failure. */
     s = (ResizeModel){0};
     model_runtime_begin(&s, 1920, 1080, 100);
+    model_schedule_resize(&s, 1920, 1080, false); /* never HELLO */
     assert(s.runtime_active);
+    assert(s.timer_armed);
     assert(!model_runtime_terminal(&s,
                                    100 + ASB_DISPLAY_RUNTIME_REQUEST_TIMEOUT_MS - 1));
+    assert(s.timer_armed);
     assert(model_runtime_terminal(&s,
                                   100 + ASB_DISPLAY_RUNTIME_REQUEST_TIMEOUT_MS));
-    assert(!s.runtime_active && s.pending_id == 0 && s.phase == PHASE_NONE);
+    assert(!s.runtime_active && !s.timer_armed && s.pending_id == 0 &&
+           s.phase == PHASE_NONE && !s.queued);
+
+    /* A request before HELLO keeps its lifecycle deadline, and a later
+     * capable HELLO resumes the ordinary resize request path. */
+    s = (ResizeModel){0};
+    model_runtime_begin(&s, 2560, 1440, 200);
+    model_schedule_resize(&s, 2560, 1440, false);
+    assert(s.timer_armed && s.runtime_active);
+    model_schedule_resize(&s, 2560, 1440, true); /* HELLO */
+    model_flush_resize(&s);
+    assert(s.timer_armed && s.runtime_active && s.pending_id != 0 &&
+           s.phase == PHASE_NONE);
+
+    /* Once the runtime request reaches a terminal timeout, no pending work
+     * remains and the timer may finally stop. */
+    assert(model_runtime_terminal(&s,
+                                  200 + ASB_DISPLAY_RUNTIME_REQUEST_TIMEOUT_MS));
+    assert(!s.runtime_active && !s.timer_armed && s.pending_id == 0 &&
+           s.phase == PHASE_NONE && !s.queued);
 
     /* A frame disconnect is terminal for the explicit UI request. A later
      * reconnect may synchronize the persisted value, but cannot revive the
