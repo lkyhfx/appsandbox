@@ -118,6 +118,12 @@ typedef struct AudioFrameHeader {
 #define WM_IDD_ACTUAL_SIZE      (WM_USER + 105)
 #define WM_IDD_RESIZE_RETRY     (WM_USER + 106)
 
+typedef enum DisplayResizePhase {
+    DISPLAY_RESIZE_PHASE_NONE = 0,
+    DISPLAY_RESIZE_PHASE_WAIT_ACK,
+    DISPLAY_RESIZE_PHASE_WAIT_FRAME,
+} DisplayResizePhase;
+
 /* Timer for Present cadence when no frames arrive */
 #define IDT_PRESENT     2001
 #define PRESENT_MS      16   /* ~60 fps */
@@ -271,6 +277,7 @@ struct VmDisplayIdd {
     UINT32         pending_resize_id;
     ULONGLONG      pending_resize_generation;
     ULONGLONG      pending_resize_deadline;
+    DisplayResizePhase pending_resize_phase;
     UINT           pending_resize_retry_count;
     BOOL           resize_queued;
     BOOL           resize_interactive;
@@ -358,7 +365,11 @@ static BOOL idd_send_display_control(VmDisplayIdd *d,
                                      const AsbDisplayControl *control,
                                      ULONGLONG generation);
 static void idd_handle_resize_ack(VmDisplayIdd *d,
-                                  const AsbDisplayControl *control);
+                                  const AsbDisplayControl *control,
+                                  ULONGLONG connection_generation);
+static void idd_mark_resize_sent(VmDisplayIdd *d,
+                                  const AsbDisplayControl *control,
+                                  ULONGLONG generation);
 static void idd_invalidate_resize_connection(VmDisplayIdd *d);
 static DWORD WINAPI idd_control_send_thread_proc(LPVOID param);
 static void window_to_vm_coords(HWND hwnd, int wx, int wy, UINT vm_w, UINT vm_h,
@@ -1350,6 +1361,8 @@ static BOOL idd_send_display_control(VmDisplayIdd *d,
             sent += n;
         }
         ok = sent == (int)sizeof(*control);
+        if (ok && control->type == ASB_DISPLAY_CONTROL_RESIZE_REQUEST)
+            idd_mark_resize_sent(d, control, generation);
         if (!ok)
             shutdown(s, SD_BOTH);
     }
@@ -1381,6 +1394,7 @@ static void idd_requeue_failed_resize(VmDisplayIdd *d,
         d->pending_resize_height = 0;
         d->pending_resize_generation = 0;
         d->pending_resize_deadline = 0;
+        d->pending_resize_phase = DISPLAY_RESIZE_PHASE_NONE;
         d->resize_queued = TRUE;
         d->queued_resize_width = d->desired_width;
         d->queued_resize_height = d->desired_height;
@@ -1405,6 +1419,7 @@ static void idd_invalidate_resize_connection(VmDisplayIdd *d)
     d->pending_resize_id = 0;
     d->pending_resize_generation = 0;
     d->pending_resize_deadline = 0;
+    d->pending_resize_phase = DISPLAY_RESIZE_PHASE_NONE;
     d->pending_resize_retry_count = 0;
     d->resize_queued = FALSE;
     d->queued_resize_width = 0;
@@ -1467,13 +1482,34 @@ static DWORD WINAPI idd_control_send_thread_proc(LPVOID param)
 
         if (!idd_send_display_control(d, &control, generation))
             idd_requeue_failed_resize(d, &control, generation);
-        else if (control.type == ASB_DISPLAY_CONTROL_RESIZE_REQUEST)
-            idd_log(d, L"display_resize request id=%u requested=%ux%u "
-                    L"normalized=%ux%u", control.request_id,
-                    d->desired_width, d->desired_height, control.width,
-                    control.height);
+        else if (control.type == ASB_DISPLAY_CONTROL_RESIZE_REQUEST) {
+            idd_log(d, L"display_resize sent id=%u target=%ux%u "
+                    L"phase=wait_ack", control.request_id,
+                    control.width, control.height);
+        }
     }
     return 0;
+}
+
+/* A request is not eligible for timeout handling until the sender thread has
+ * written the complete control message to the current frame connection. */
+static void idd_mark_resize_sent(VmDisplayIdd *d,
+                                 const AsbDisplayControl *control,
+                                 ULONGLONG generation)
+{
+    ULONGLONG now;
+
+    if (!d || !control || control->type != ASB_DISPLAY_CONTROL_RESIZE_REQUEST)
+        return;
+
+    now = GetTickCount64();
+    AcquireSRWLockExclusive(&d->resize_lock);
+    if (d->pending_resize_id == control->request_id &&
+        d->pending_resize_generation == generation) {
+        d->pending_resize_phase = DISPLAY_RESIZE_PHASE_WAIT_ACK;
+        d->pending_resize_deadline = now + ASB_DISPLAY_RESIZE_ACK_TIMEOUT_MS;
+    }
+    ReleaseSRWLockExclusive(&d->resize_lock);
 }
 
 static void idd_flush_resize(VmDisplayIdd *d)
@@ -1506,6 +1542,7 @@ static void idd_flush_resize(VmDisplayIdd *d)
     ReleaseSRWLockShared(&d->frame_send_lock);
     d->pending_resize_generation = generation;
     d->pending_resize_deadline = 0;
+    d->pending_resize_phase = DISPLAY_RESIZE_PHASE_NONE;
     d->force_resize_sync = FALSE;
     d->last_resize_send_tick = now;
     ReleaseSRWLockExclusive(&d->resize_lock);
@@ -1615,7 +1652,8 @@ static void idd_apply_guest_size(VmDisplayIdd *d)
 }
 
 static void idd_handle_resize_ack(VmDisplayIdd *d,
-                                  const AsbDisplayControl *control)
+                                  const AsbDisplayControl *control,
+                                  ULONGLONG connection_generation)
 {
     BOOL accepted;
     BOOL retry = FALSE;
@@ -1651,7 +1689,9 @@ static void idd_handle_resize_ack(VmDisplayIdd *d,
 
     AcquireSRWLockExclusive(&d->resize_lock);
     pending_id = d->pending_resize_id;
-    if (pending_id == 0 || pending_id != control->request_id) {
+    if (pending_id == 0 || pending_id != control->request_id ||
+        d->pending_resize_generation != connection_generation ||
+        d->pending_resize_phase != DISPLAY_RESIZE_PHASE_WAIT_ACK) {
         ReleaseSRWLockExclusive(&d->resize_lock);
         idd_log(d, L"display_resize stale_ack id=%u pending=%u",
                 control->request_id, pending_id);
@@ -1664,6 +1704,7 @@ static void idd_handle_resize_ack(VmDisplayIdd *d,
         d->pending_resize_width = control->width;
         d->pending_resize_height = control->height;
         now = GetTickCount64();
+        d->pending_resize_phase = DISPLAY_RESIZE_PHASE_WAIT_FRAME;
         d->pending_resize_deadline =
             now + DISPLAY_RESIZE_COMPLETION_TIMEOUT_MS;
         ReleaseSRWLockExclusive(&d->resize_lock);
@@ -1681,6 +1722,7 @@ static void idd_handle_resize_ack(VmDisplayIdd *d,
     d->pending_resize_id = 0;
     d->pending_resize_generation = 0;
     d->pending_resize_deadline = 0;
+    d->pending_resize_phase = DISPLAY_RESIZE_PHASE_NONE;
 
     if (control->status_or_flags == ASB_DISPLAY_CONTROL_STATUS_MODE_FAILED &&
         retry_count < DISPLAY_RESIZE_RETRY_LIMIT &&
@@ -1723,6 +1765,7 @@ static void idd_check_resize_timeout(VmDisplayIdd *d)
     UINT32 request_id;
     UINT retry_count;
     UINT requested_width, requested_height;
+    DisplayResizePhase phase;
     UINT actual_width, actual_height;
     BOOL retry = FALSE;
     BOOL abandon = FALSE;
@@ -1731,7 +1774,9 @@ static void idd_check_resize_timeout(VmDisplayIdd *d)
     now = GetTickCount64();
 
     AcquireSRWLockExclusive(&d->resize_lock);
-    if (!d->pending_resize_id || !d->pending_resize_deadline ||
+    if (!d->pending_resize_id ||
+        d->pending_resize_phase == DISPLAY_RESIZE_PHASE_NONE ||
+        !d->pending_resize_deadline ||
         now < d->pending_resize_deadline) {
         ReleaseSRWLockExclusive(&d->resize_lock);
         return;
@@ -1742,6 +1787,7 @@ static void idd_check_resize_timeout(VmDisplayIdd *d)
     retry_count = d->pending_resize_retry_count;
     requested_width = d->pending_resize_width;
     requested_height = d->pending_resize_height;
+    phase = d->pending_resize_phase;
     actual_width = d->actual_width;
     actual_height = d->actual_height;
     d->pending_resize_id = 0;
@@ -1749,6 +1795,7 @@ static void idd_check_resize_timeout(VmDisplayIdd *d)
     d->pending_resize_height = 0;
     d->pending_resize_generation = 0;
     d->pending_resize_deadline = 0;
+    d->pending_resize_phase = DISPLAY_RESIZE_PHASE_NONE;
 
     if (retry_count < DISPLAY_RESIZE_RETRY_LIMIT &&
         InterlockedCompareExchange(&d->resize_capable, 0, 0) != 0 &&
@@ -1766,10 +1813,13 @@ static void idd_check_resize_timeout(VmDisplayIdd *d)
     }
     ReleaseSRWLockExclusive(&d->resize_lock);
 
-    idd_log(d, L"display_resize timeout id=%u requested=%ux%u actual=%ux%u "
-            L"retry=%u deadline=%llu", request_id, requested_width,
-            requested_height, actual_width, actual_height, retry_count,
-            deadline);
+    idd_log(d, phase == DISPLAY_RESIZE_PHASE_WAIT_ACK
+               ? L"display_resize ack_timeout id=%u target=%ux%u actual=%ux%u "
+                 L"retry=%u deadline=%llu"
+               : L"display_resize frame_timeout id=%u target=%ux%u actual=%ux%u "
+                 L"retry=%u deadline=%llu",
+            request_id, requested_width, requested_height, actual_width,
+            actual_height, retry_count, deadline);
     if (retry) {
         idd_log(d, L"display_resize retry id=%u target=%ux%u",
                 request_id, d->desired_width, d->desired_height);
@@ -2915,7 +2965,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     if (capable && d->hwnd)
                         PostMessageW(d->hwnd, WM_IDD_RESIZE_CAPABLE, 0, 0);
                 } else if (control.type == ASB_DISPLAY_CONTROL_RESIZE_ACK) {
-                    idd_handle_resize_ack(d, &control);
+                    idd_handle_resize_ack(d, &control, connection_generation);
                 } else {
                     idd_log(d, L"display_control unexpected type=%u.",
                             control.type);
@@ -3061,6 +3111,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 d->actual_generation = connection_generation;
                 if (d->pending_resize_id &&
                     d->pending_resize_generation == connection_generation &&
+                    d->pending_resize_phase == DISPLAY_RESIZE_PHASE_WAIT_FRAME &&
                     d->pending_resize_width == hdr.width &&
                     d->pending_resize_height == hdr.height) {
                     completed_id = d->pending_resize_id;
@@ -3069,6 +3120,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     d->pending_resize_height = 0;
                     d->pending_resize_generation = 0;
                     d->pending_resize_deadline = 0;
+                    d->pending_resize_phase = DISPLAY_RESIZE_PHASE_NONE;
                     d->pending_resize_retry_count = 0;
                     notify_actual = TRUE;
                 }
