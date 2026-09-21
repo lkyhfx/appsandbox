@@ -1,0 +1,14 @@
+[Unit]
+Description=App Sandbox user-session display mode helper
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/mutter-displayconfig-helper.py
+Restart=on-failure
+RestartSec=2
+PrivateTmp=true
+
+[Install]
+WantedBy=graphical-session.target

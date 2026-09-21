@@ -27,8 +27,11 @@
 #include <fcntl.h>
 #include <time.h>
 #include <signal.h>
+#include <dirent.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
 #include <sys/poll.h>
@@ -43,7 +46,7 @@
 #include "../../../src/core/display_fb_state.h"
 
 #define VSOCK_PORT      2
-#define ASB_DRM_MODE_PATH "/sys/devices/platform/asb_drm.0/mode"
+#define DISPLAY_HELPER_SOCKET "appsandbox/display-control.sock"
 #define FRAME_MAGIC     ASB_DISPLAY_RAW_MAGIC
 #define CURSOR_MAGIC    ASB_DISPLAY_CURSOR_MAGIC
 #define TARGET_FPS      60
@@ -238,29 +241,84 @@ static int send_control_hello(int fd)
                         ASB_DISPLAY_CONTROL_FLAG_DYNAMIC_RESIZE);
 }
 
-static int write_runtime_mode(uint32_t width, uint32_t height, uint32_t refresh)
+static int connect_display_helper(void)
 {
-    char mode[64];
-    int fd;
-    int len;
-    ssize_t written;
+    char candidates[16][sizeof(((struct sockaddr_un *)0)->sun_path)];
+    size_t count = 0, i;
+    const char *runtime = getenv("XDG_RUNTIME_DIR");
 
-    len = snprintf(mode, sizeof(mode), "%ux%u@%u\n", width, height, refresh);
-    if (len <= 0 || (size_t)len >= sizeof(mode)) return -1;
-    fd = open(ASB_DRM_MODE_PATH, O_WRONLY | O_CLOEXEC);
-    if (fd < 0) {
-        agent_log("display_control open %s failed: %s", ASB_DRM_MODE_PATH,
-                  strerror(errno));
+    if (runtime && runtime[0])
+        snprintf(candidates[count++], sizeof(candidates[0]), "%s/%s",
+                 runtime, DISPLAY_HELPER_SOCKET);
+
+    /* The capture daemon is deliberately root. Discover a user-session
+     * helper by its private runtime socket instead of borrowing the session
+     * D-Bus address or impersonating the desktop user. */
+    {
+        DIR *dir = opendir("/run/user");
+        struct dirent *entry;
+        while (dir && count < sizeof(candidates) / sizeof(candidates[0]) &&
+               (entry = readdir(dir)) != NULL) {
+            char *end = NULL;
+            unsigned long uid;
+            if (entry->d_name[0] == '.') continue;
+            uid = strtoul(entry->d_name, &end, 10);
+            if (!end || *end || uid < 100) continue;
+            snprintf(candidates[count++], sizeof(candidates[0]),
+                     "/run/user/%s/%s", entry->d_name, DISPLAY_HELPER_SOCKET);
+        }
+        if (dir) closedir(dir);
+    }
+
+    for (i = 0; i < count; i++) {
+        int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        struct sockaddr_un addr;
+        if (fd < 0) continue;
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        strncpy(addr.sun_path, candidates[i], sizeof(addr.sun_path) - 1);
+        if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0)
+            return fd;
+        close(fd);
+    }
+    return -1;
+}
+
+static int apply_runtime_mode(uint32_t width, uint32_t height, uint32_t refresh)
+{
+    char request[64], response[128] = {0};
+    int helper, len, got = 0;
+    struct timeval timeout = { .tv_sec = 8, .tv_usec = 0 };
+
+    if (!asb_display_is_preset(width, height) || refresh != 60)
+        return -1;
+    helper = connect_display_helper();
+    if (helper < 0) {
+        agent_log("display_control user-session helper is unavailable");
         return -1;
     }
-    written = write(fd, mode, (size_t)len);
-    close(fd);
-    if (written != len) {
-        agent_log("display_control runtime mode %ux%u@%u failed: %s",
-                  width, height, refresh, strerror(errno));
+    setsockopt(helper, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    len = snprintf(request, sizeof(request), "%ux%u@%u\n",
+                   width, height, refresh);
+    if (len <= 0 || (size_t)len >= sizeof(request) ||
+        send_all(helper, request, (size_t)len) < 0) {
+        close(helper);
         return -1;
     }
-    agent_log("asb_drm runtime_mode=%ux%u@%uHz", width, height, refresh);
+    while (got < (int)sizeof(response) - 1) {
+        ssize_t n = recv(helper, response + got,
+                         sizeof(response) - 1 - (size_t)got, 0);
+        if (n <= 0) break;
+        got += (int)n;
+        if (memchr(response, '\n', (size_t)got)) break;
+    }
+    close(helper);
+    if (got < 3 || strncmp(response, "OK", 2) != 0) {
+        agent_log("display_control helper rejected %ux%u: %.*s",
+                  width, height, got, response);
+        return -1;
+    }
+    agent_log("mutter_display_config applied=%ux%u@%u", width, height, refresh);
     return 0;
 }
 
@@ -314,14 +372,14 @@ static int poll_display_control(int fd, struct control_rx *rx)
         asb_display_normalize_resolution(&width, &height);
         refresh = msg.refresh_hz ? msg.refresh_hz
                                  : ASB_DISPLAY_CONTROL_DEFAULT_REFRESH;
-        status = (refresh < 24 || refresh > 240)
+        status = (!asb_display_is_preset(width, height) || refresh != 60)
             ? ASB_DISPLAY_CONTROL_STATUS_BAD_REQUEST
             : ASB_DISPLAY_CONTROL_STATUS_ACCEPTED;
         agent_log("display_control resize request=%u requested=%ux%u "
                   "normalized=%ux%u", msg.request_id, msg.width, msg.height,
                   width, height);
         if (status == ASB_DISPLAY_CONTROL_STATUS_ACCEPTED &&
-            write_runtime_mode(width, height, refresh) < 0)
+            apply_runtime_mode(width, height, refresh) < 0)
             status = ASB_DISPLAY_CONTROL_STATUS_MODE_FAILED;
         if (send_control(fd, ASB_DISPLAY_CONTROL_RESIZE_ACK, msg.request_id,
                          width, height, refresh, status) < 0)

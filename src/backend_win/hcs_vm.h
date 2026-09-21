@@ -67,6 +67,8 @@ typedef struct {
     DWORD       ram_mb;
     DWORD       hdd_gb;
     DWORD       cpu_cores;
+    DWORD       display_width;        /* configured guest display mode */
+    DWORD       display_height;
     int         gpu_mode;
     wchar_t     gpu_name[256];
     wchar_t     gpu_id[512];

@@ -9,10 +9,10 @@ Run it from the live GNOME user session, for example:
     DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus \
         ./mutter-displayconfig-probe.py 1920x1080 2560x1440 3840x2160
 
-The target mode must already be present in Mutter's current mode list. For the
-AppSandbox DRM driver, update /sys/devices/platform/asb_drm.0/mode first; the
-probe then actively asks Mutter to apply the enumerated mode through
-org.gnome.Mutter.DisplayConfig.ApplyMonitorsConfig.
+The target mode must already be present in Mutter's stable four-mode list. The
+probe actively asks Mutter to apply the enumerated mode through
+org.gnome.Mutter.DisplayConfig.ApplyMonitorsConfig; it does not rewrite EDID
+or the asb_drm sysfs mode file.
 """
 
 import argparse

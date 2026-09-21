@@ -253,7 +253,9 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
     pos += sprintf_s(out + pos, cap - pos,
         ",\"state\":\"%s\",\"running\":%s,\"agentOnline\":%s,\"installComplete\":%s,"
         "\"building\":%s,\"progress\":%d,\"sshState\":%d,\"sshPort\":%lu,"
-        "\"ramMb\":%lu,\"hddGb\":%lu,\"cpuCores\":%lu,\"gpuMode\":%d,\"networkMode\":%d,"
+        "\"ramMb\":%lu,\"hddGb\":%lu,\"cpuCores\":%lu,"
+        "\"displayWidth\":%lu,\"displayHeight\":%lu,"
+        "\"gpuMode\":%d,\"networkMode\":%d,"
         "\"displayOpen\":%s,\"gpuId\":",
         derive_state(v),
         v->running ? "true" : "false", v->agent_online ? "true" : "false",
@@ -262,6 +264,8 @@ static int append_vm_json(char *out, int cap, int pos, VmInstance *v)
         (v->ssh_key_deployed && v->ssh_state == 2) ? 4 : v->ssh_state,   /* 4 = ready + key deployed */
         (unsigned long)v->ssh_port,
         (unsigned long)v->ram_mb, (unsigned long)v->hdd_gb, (unsigned long)v->cpu_cores,
+        (unsigned long)asb_vm_display_width((AsbVm)v),
+        (unsigned long)asb_vm_display_height((AsbVm)v),
         v->gpu_mode, v->network_mode,
         display_is_open(v->unique_id) ? "true" : "false");
     pos = append_wstr(out, cap, pos, v->gpu_id);

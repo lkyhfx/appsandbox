@@ -20,6 +20,7 @@
 #include "linux_tty.h"
 #include "prereq.h"
 #include "ui.h"
+#include "../core/display_protocol.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -550,6 +551,8 @@ static void save_vm_list(void)
         fwprintf(f, L"RamMB=%lu\n", g_vms[i].ram_mb);
         fwprintf(f, L"HddGB=%lu\n", g_vms[i].hdd_gb);
         fwprintf(f, L"CpuCores=%lu\n", g_vms[i].cpu_cores);
+        fwprintf(f, L"DisplayWidth=%lu\n", g_vms[i].display_width);
+        fwprintf(f, L"DisplayHeight=%lu\n", g_vms[i].display_height);
         fwprintf(f, L"GpuMode=%d\n", g_vms[i].gpu_mode);
         fwprintf(f, L"GpuName=%s\n", g_vms[i].gpu_name);
         if (g_vms[i].gpu_id[0])
@@ -698,6 +701,10 @@ static void load_vm_list(void)
             vm->hdd_gb = (DWORD)_wtoi(line + 6);
         else if (wcsncmp(line, L"CpuCores=", 9) == 0)
             vm->cpu_cores = (DWORD)_wtoi(line + 9);
+        else if (wcsncmp(line, L"DisplayWidth=", 13) == 0)
+            vm->display_width = (DWORD)_wtoi(line + 13);
+        else if (wcsncmp(line, L"DisplayHeight=", 14) == 0)
+            vm->display_height = (DWORD)_wtoi(line + 14);
         else if (wcsncmp(line, L"GpuMode=", 8) == 0)
             vm->gpu_mode = _wtoi(line + 8);
         else if (wcsncmp(line, L"GpuName=", 8) == 0)
@@ -746,6 +753,12 @@ static void load_vm_list(void)
             wchar_t snap_dir[MAX_PATH];
             g_vms[i].handle = NULL;
             g_vms[i].running = FALSE;
+            if (!asb_display_is_preset(g_vms[i].display_width,
+                                       g_vms[i].display_height)) {
+                g_vms[i].display_width = ASB_DISPLAY_DEFAULT_WIDTH;
+                g_vms[i].display_height = ASB_DISPLAY_DEFAULT_HEIGHT;
+                gpu_changed = TRUE;
+            }
             if (resolve_vm_gpu_selection(&g_vms[i])) gpu_changed = TRUE;
             if (vm_load_state_json(g_vms[i].vhdx_path))
                 g_vms[i].install_complete = TRUE;
@@ -3318,6 +3331,8 @@ ASB_API HRESULT asb_vm_create(const AsbVmConfig *config)
     inst = &g_vms[g_vm_count];
     ZeroMemory(inst, sizeof(VmInstance));
     inst->unique_id = g_next_vm_id++;
+    inst->display_width = ASB_DISPLAY_DEFAULT_WIDTH;
+    inst->display_height = ASB_DISPLAY_DEFAULT_HEIGHT;
 
     /* Net adapter */
     if (config->net_adapter && config->net_adapter[0] != L'\0' &&
@@ -4040,6 +4055,20 @@ ASB_API DWORD asb_vm_cpu_cores(AsbVm vm)
     return inst ? inst->cpu_cores : 0;
 }
 
+ASB_API DWORD asb_vm_display_width(AsbVm vm)
+{
+    VmInstance *inst = vm_inst(vm);
+    return inst && inst->display_width ? inst->display_width
+                                       : ASB_DISPLAY_DEFAULT_WIDTH;
+}
+
+ASB_API DWORD asb_vm_display_height(AsbVm vm)
+{
+    VmInstance *inst = vm_inst(vm);
+    return inst && inst->display_height ? inst->display_height
+                                        : ASB_DISPLAY_DEFAULT_HEIGHT;
+}
+
 ASB_API int asb_vm_gpu_mode(AsbVm vm)
 {
     VmInstance *inst = vm_inst(vm);
@@ -4139,6 +4168,22 @@ ASB_API HRESULT asb_vm_set_network(AsbVm vm, int mode)
     if (g_vms[idx].running) return E_ACCESSDENIED;
     if (mode < 0 || mode > 3) return E_INVALIDARG;
     g_vms[idx].network_mode = mode;
+    save_vm_list();
+    if (g_state_cb) g_state_cb(vm, g_vms[idx].running, g_state_ud);
+    return S_OK;
+}
+
+ASB_API HRESULT asb_vm_set_display_resolution(AsbVm vm, DWORD width, DWORD height)
+{
+    int idx = vm_index_of(vm);
+    if (idx < 0 || !asb_display_is_preset(width, height))
+        return E_INVALIDARG;
+
+    /* This function is also used by the IDD completion callback. The running
+     * path reaches it only after a matching ASFR, so a successful call means
+     * the persisted value is the value the guest is actually displaying. */
+    g_vms[idx].display_width = width;
+    g_vms[idx].display_height = height;
     save_vm_list();
     if (g_state_cb) g_state_cb(vm, g_vms[idx].running, g_state_ud);
     return S_OK;

@@ -25,10 +25,23 @@
  *
  * The detailed-timing descriptor for the active mode is computed from CVT
  * (drm_cvt_mode) on the fly so module-param width/height/refresh changes
- * produce a matching EDID.
+ * produce a matching EDID. Issue #9 keeps this list stable for the lifetime
+ * of the driver; userspace selects an existing mode id through Mutter's
+ * DisplayConfig API instead of rebuilding EDID on every request.
  * -------------------------------------------------------------------------- */
 
 static void put_le16(u8 *p, u16 v) { p[0] = v & 0xff; p[1] = v >> 8; }
+
+static const struct {
+	unsigned int width;
+	unsigned int height;
+	unsigned int refresh;
+} asb_stable_modes[] = {
+	{ 1280, 720, 60 },
+	{ 1920, 1080, 60 },
+	{ 2560, 1440, 60 },
+	{ 3840, 2160, 60 },
+};
 
 static void asb_fill_dtd(u8 dtd[18], const struct drm_display_mode *m)
 {
@@ -69,11 +82,8 @@ void asb_build_edid(struct asb_device *asb)
 {
 	u8 *e = asb->edid;
 	struct drm_display_mode m;
-	unsigned int width, height, refresh;
 	int i, sum = 0;
 	const char *name = "AppSandbox";
-
-	asb_mode_snapshot(asb, &width, &height, &refresh, NULL);
 
 	memset(e, 0, ASB_EDID_LEN);
 
@@ -115,11 +125,12 @@ void asb_build_edid(struct asb_device *asb)
 	/* Standard timings — all "unused" markers */
 	for (i = 38; i <= 53; i++) e[i] = 0x01;
 
-	/* DTD #1 (bytes 54..71): the preferred mode, computed from CVT. */
+	/* DTD #1 (bytes 54..71): fixed 1280x720@60 preferred mode. */
 	{
-		struct drm_display_mode *cvt = drm_cvt_mode(NULL, width,
-		                                            height,
-		                                            refresh,
+		struct drm_display_mode *cvt = drm_cvt_mode(NULL,
+		                                            asb_stable_modes[0].width,
+		                                            asb_stable_modes[0].height,
+		                                            asb_stable_modes[0].refresh,
 		                                            false, false, false);
 		if (cvt) {
 			m = *cvt;
@@ -162,58 +173,25 @@ static int asb_connector_get_modes(struct drm_connector *connector)
 {
 	struct asb_device *asb = to_asb(connector->dev);
 	struct drm_display_mode *m;
-	unsigned int width, height, refresh;
-	bool runtime_mode;
-	int count = 0;
-
-	asb_mode_snapshot(asb, &width, &height, &refresh, &runtime_mode);
+    int count = 0, i;
 
 	drm_connector_update_edid_property(connector,
 	                                   (const struct edid *)asb->edid);
 
-	/* Preferred mode first — what the EDID DTD also points at. */
-	m = drm_cvt_mode(connector->dev,
-	                 width, height, refresh,
-	                 false, false, false);
-	if (m) {
-		m->type |= DRM_MODE_TYPE_PREFERRED | DRM_MODE_TYPE_DRIVER;
+	/* The order and mode ids remain stable after startup. */
+	for (i = 0; i < ARRAY_SIZE(asb_stable_modes); i++) {
+		m = drm_cvt_mode(connector->dev,
+		                 asb_stable_modes[i].width,
+		                 asb_stable_modes[i].height,
+		                 asb_stable_modes[i].refresh,
+		                 false, false, false);
+		if (!m)
+			continue;
+		m->type |= DRM_MODE_TYPE_DRIVER;
+		if (i == 0)
+			m->type |= DRM_MODE_TYPE_PREFERRED;
 		drm_mode_probed_add(connector, m);
 		count++;
-	}
-
-	/* Runtime target modes are intentionally the only published mode. Keeping
-	 * stale fallbacks here makes Mutter preserve the old active mode after a
-	 * hotplug instead of applying the target requested by the host. */
-	if (runtime_mode)
-		return count;
-
-	/* Common startup fallbacks. */
-	{
-		static const struct { int w, h, hz; } fallbacks[] = {
-			{ 3840, 2160, 60 },
-			{ 2560, 1440, 60 },
-			{ 1920, 1080, 60 },
-			{ 1920, 1200, 60 },
-			{ 1680, 1050, 60 },
-			{ 1280,  720, 60 },
-			{ 1024,  768, 60 },
-		};
-		size_t i;
-
-		for (i = 0; i < ARRAY_SIZE(fallbacks); i++) {
-			if (fallbacks[i].w == (int)width &&
-			    fallbacks[i].h == (int)height)
-				continue;
-			m = drm_cvt_mode(connector->dev,
-			                 fallbacks[i].w, fallbacks[i].h,
-			                 fallbacks[i].hz,
-			                 false, false, false);
-			if (m) {
-				m->type |= DRM_MODE_TYPE_DRIVER;
-				drm_mode_probed_add(connector, m);
-				count++;
-			}
-		}
 	}
 
 	return count;

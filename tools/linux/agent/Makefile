@@ -27,6 +27,7 @@ SYSTEM_UNITS := systemd/appsandbox-agent.service \
 # pattern as the Windows agent which spawns clipboard.exe /
 # clipboard-reader.exe.
 USER_UNITS   :=
+USER_UNITS   += systemd/appsandbox-display-helper.service
 
 all: $(BINS)
 
@@ -66,6 +67,7 @@ install-pointer:
 install: $(BINS) install-pointer
 	install -d $(DESTDIR)$(BINDIR)
 	install -m 0755 $(BINS) $(DESTDIR)$(BINDIR)/
+	install -m 0755 mutter-displayconfig-helper.py $(DESTDIR)$(BINDIR)/
 	install -d $(DESTDIR)$(SYSTEMDDIR)
 	for u in $(SYSTEM_UNITS); do \
 	    install -m 0644 $$u $(DESTDIR)$(SYSTEMDDIR)/; \

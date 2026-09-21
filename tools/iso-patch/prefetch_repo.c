@@ -272,7 +272,8 @@ int do_prefetch_repo(const wchar_t *branch, const wchar_t *out_dir)
         const wchar_t *files[] = {
             L"appsandbox-agent.c", L"appsandbox-audio.c",
             L"appsandbox-clipboard.c", L"appsandbox-display.c",
-            L"appsandbox-input.c", L"Makefile"
+            L"appsandbox-input.c", L"mutter-displayconfig-helper.py",
+            L"Makefile"
         };
         wchar_t out_agent[MAX_PATH];
         swprintf_s(out_agent, MAX_PATH, L"%s\\agent-src", out_dir);
@@ -323,7 +324,7 @@ int do_prefetch_repo(const wchar_t *branch, const wchar_t *out_dir)
         log_msg(L"prefetch-repo: staged dxgkrnl-src/ (%d files)", c);
     }
 
-    /* systemd/: 6 service files + asb-evict-simpledrm + 2 modules-load.d */
+    /* systemd/: service files + asb-evict-simpledrm + 2 modules-load.d */
     {
         wchar_t systemd_dst[MAX_PATH], s[MAX_PATH], d[MAX_PATH];
         swprintf_s(systemd_dst, MAX_PATH, L"%s\\systemd", out_dir);
@@ -332,7 +333,8 @@ int do_prefetch_repo(const wchar_t *branch, const wchar_t *out_dir)
         const wchar_t *units[] = {
             L"appsandbox-agent.service", L"appsandbox-audio.service",
             L"appsandbox-clipboard.service", L"appsandbox-display.service",
-            L"appsandbox-input.service", L"appsandbox-firstboot.service"
+            L"appsandbox-input.service", L"appsandbox-display-helper.service",
+            L"appsandbox-firstboot.service"
         };
         for (int i = 0; i < (int)(sizeof(units) / sizeof(units[0])); i++) {
             swprintf_s(s, MAX_PATH,

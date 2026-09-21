@@ -296,6 +296,8 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_int(jb, L"ramMb", (int)v->ram_mb);
     jb_int(jb, L"hddGb", (int)v->hdd_gb);
     jb_int(jb, L"cpuCores", (int)v->cpu_cores);
+    jb_int(jb, L"displayWidth", (int)asb_vm_display_width(asb_vm_get(i)));
+    jb_int(jb, L"displayHeight", (int)asb_vm_display_height(asb_vm_get(i)));
     jb_int(jb, L"gpuMode", v->gpu_mode);
     jb_string(jb, L"gpuId", v->gpu_id);
     jb_string(jb, L"gpuName", v->gpu_name);
@@ -1196,6 +1198,31 @@ static void on_webview2_message(const wchar_t *json)
             }
             send_templates();
         }
+    } else if (wcscmp(action, L"setVmRuntimeDisplay") == 0) {
+        int idx, width, height;
+        if (!json_get_int(json, L"vmIndex", &idx) ||
+            !json_get_int(json, L"width", &width) ||
+            !json_get_int(json, L"height", &height) ||
+            idx < 0 || idx >= asb_vm_count()) {
+            webview2_post(L"{\"type\":\"runtimeDisplayResult\",\"success\":false,\"error\":\"Invalid display resolution request.\"}");
+        } else {
+            AsbVm vm = asb_vm_get(idx);
+            VmInstance *inst = asb_vm_instance(vm);
+            BOOL queued = FALSE;
+            if (!inst || !inst->running || inst->building_vhdx) {
+                webview2_post(L"{\"type\":\"runtimeDisplayResult\",\"success\":false,\"error\":\"The VM must be running and finished building.\"}");
+            } else {
+                if (!g_idd_displays[idx] ||
+                    !vm_display_idd_is_open(g_idd_displays[idx]))
+                    do_connect_idd(idx);
+                if (g_idd_displays[idx])
+                    queued = vm_display_idd_set_runtime_display(
+                        g_idd_displays[idx], (DWORD)width, (DWORD)height);
+                if (!queued) {
+                    webview2_post(L"{\"type\":\"runtimeDisplayResult\",\"success\":false,\"error\":\"The guest display helper is not ready or does not support runtime resolution changes.\"}");
+                }
+            }
+        }
     } else if (wcscmp(action, L"editVm") == 0) {
         int idx;
         wchar_t field[64], value[256];
@@ -1222,6 +1249,13 @@ static void on_webview2_message(const wchar_t *json)
                     if (!error) hr = asb_vm_set_gpu_selection(vm, mode, gpu_id);
                 }
                 else if (wcscmp(field, L"networkMode") == 0) hr = asb_vm_set_network(vm, _wtoi(value));
+                else if (wcscmp(field, L"displayResolution") == 0) {
+                    int width = 0, height = 0;
+                    if (swscanf_s(value, L"%dx%d", &width, &height) != 2)
+                        hr = E_INVALIDARG;
+                    else
+                        hr = asb_vm_set_display_resolution(vm, (DWORD)width, (DWORD)height);
+                }
                 if (FAILED(hr)) ui_show_alert(error ? error : L"VM configuration could not be updated.");
                 else asb_save();
             }
@@ -1608,6 +1642,45 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 if (wp == 1) safe_destroy_idd(i);
                 break;
             }
+        }
+        return 0;
+    }
+
+    case WM_VM_DISPLAY_RUNTIME_RESULT:
+    {
+        VmDisplayRuntimeResult *result = (VmDisplayRuntimeResult *)lp;
+        BOOL success = FALSE;
+        const wchar_t *error = L"The guest did not apply the requested resolution.";
+        wchar_t buf[1024];
+        JsonBuilder jb;
+
+        if (result) {
+            int idx = result->vm ? asb_vm_index((AsbVm)result->vm) : -1;
+            VmInstance *inst = (idx >= 0 &&
+                asb_vm_instance(asb_vm_get(idx)) == result->vm)
+                ? asb_vm_instance(asb_vm_get(idx)) : NULL;
+            if (result->success && inst) {
+                HRESULT hr = asb_vm_set_display_resolution(
+                    (AsbVm)inst, result->width, result->height);
+                success = SUCCEEDED(hr);
+                if (!success) error = L"The resolution could not be persisted.";
+            } else if (!inst) {
+                error = L"The VM was removed before the display change completed.";
+            }
+
+            jb_init(&jb, buf, ARRAYSIZE(buf));
+            jb_object_begin(&jb);
+            jb_string(&jb, L"type", L"runtimeDisplayResult");
+            jb_bool(&jb, L"success", success);
+            jb_int(&jb, L"width", (int)result->width);
+            jb_int(&jb, L"height", (int)result->height);
+            if (inst)
+                jb_string(&jb, L"vmName", inst->name);
+            if (!success) jb_string(&jb, L"error", error);
+            jb_object_end(&jb);
+            webview2_post(buf);
+            send_vm_list();
+            HeapFree(GetProcessHeap(), 0, result);
         }
         return 0;
     }

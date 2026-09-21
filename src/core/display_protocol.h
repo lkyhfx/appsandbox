@@ -35,6 +35,19 @@
 #define ASB_DISPLAY_CONTROL_MAX_WIDTH  ASB_DISPLAY_RAW_MAX_WIDTH
 #define ASB_DISPLAY_CONTROL_MAX_HEIGHT ASB_DISPLAY_RAW_MAX_HEIGHT
 #define ASB_DISPLAY_CONTROL_DEFAULT_REFRESH 60u
+
+/* Issue #9 deliberately exposes a small, stable mode list. Keep this table
+ * in the shared protocol header so the host UI, guest helper, and tests all
+ * validate the same values. */
+#define ASB_DISPLAY_PRESET_COUNT 4u
+
+static inline int asb_display_is_preset(uint32_t width, uint32_t height)
+{
+    return (width == 1280u && height == 720u) ||
+           (width == 1920u && height == 1080u) ||
+           (width == 2560u && height == 1440u) ||
+           (width == 3840u && height == 2160u);
+}
 /* Host-side state-machine policy shared with deterministic unit tests. */
 #define ASB_DISPLAY_RESIZE_ACK_TIMEOUT_MS 1250u
 #define ASB_DISPLAY_RESIZE_COMPLETION_TIMEOUT_MS 2500u

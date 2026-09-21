@@ -443,6 +443,21 @@ th.icon-col, td.icon-col {
     flex-shrink: 0;
 }
 #edit-vm-overlay .modal { max-width: 480px; }
+.edit-config-group {
+    border: 1px solid var(--ctrl-border);
+    border-radius: var(--radius);
+    padding: 12px;
+    margin-bottom: 12px;
+}
+.edit-config-group h4 {
+    margin: 0 0 10px;
+    color: var(--text);
+    font-size: 13px;
+}
+.edit-config-group .form-row { gap: 8px; }
+#edit-display-resolution { min-width: 145px; }
+#btn-apply-display { min-width: 74px; }
+#edit-display-status { margin-top: 8px; }
 .modal-form-body {
     min-height: 0;
     overflow-y: auto;

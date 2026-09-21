@@ -280,11 +280,17 @@ struct VmDisplayIdd {
     DisplayResizePhase pending_resize_phase;
     UINT           pending_resize_retry_count;
     BOOL           resize_queued;
-    BOOL           resize_interactive;
-    BOOL           applying_guest_size;
     ULONGLONG      last_resize_send_tick;
     ULONGLONG      frame_connection_generation;
     ULONGLONG      queued_control_generation;
+
+    /* One explicit UI request at a time. The configured resolution is kept
+     * in VmInstance; this transient state is only cleared after ASFR (or a
+     * terminal protocol failure). */
+    HWND           runtime_notify_hwnd;
+    BOOL           runtime_request_active;
+    UINT           runtime_request_width;
+    UINT           runtime_request_height;
 
     /* Input forwarding */
     volatile SOCKET input_socket;   /* input socket for keyboard/mouse forwarding */
@@ -360,7 +366,8 @@ static void idd_schedule_resize(VmDisplayIdd *d, UINT width, UINT height,
                                 BOOL immediate);
 static void idd_flush_resize(VmDisplayIdd *d);
 static void idd_check_resize_timeout(VmDisplayIdd *d);
-static void idd_apply_guest_size(VmDisplayIdd *d);
+static void idd_post_runtime_result(VmDisplayIdd *d, BOOL success,
+                                    UINT width, UINT height);
 static BOOL idd_send_display_control(VmDisplayIdd *d,
                                       const AsbDisplayControl *control,
                                       ULONGLONG generation);
@@ -1535,9 +1542,7 @@ static void idd_flush_resize(VmDisplayIdd *d)
         return;
     now = GetTickCount64();
     AcquireSRWLockExclusive(&d->resize_lock);
-    if (!d->resize_queued || d->pending_resize_id != 0 ||
-        (d->resize_interactive &&
-         now - d->last_resize_send_tick < DISPLAY_RESIZE_DEBOUNCE_MS)) {
+    if (!d->resize_queued || d->pending_resize_id != 0) {
         ReleaseSRWLockExclusive(&d->resize_lock);
         return;
     }
@@ -1576,6 +1581,47 @@ static void idd_flush_resize(VmDisplayIdd *d)
                  DISPLAY_RESIZE_DEBOUNCE_MS, NULL);
 }
 
+static void idd_post_runtime_result(VmDisplayIdd *d, BOOL success,
+                                    UINT width, UINT height)
+{
+    VmDisplayRuntimeResult *result;
+    HWND notify;
+
+    if (!d) return;
+    AcquireSRWLockExclusive(&d->resize_lock);
+    if (!d->runtime_request_active) {
+        ReleaseSRWLockExclusive(&d->resize_lock);
+        return;
+    }
+    if (!width) width = d->runtime_request_width;
+    if (!height) height = d->runtime_request_height;
+    d->runtime_request_active = FALSE;
+    notify = d->runtime_notify_hwnd;
+    if (!success && d->vm) {
+        uint32_t configured_width = d->vm->display_width;
+        uint32_t configured_height = d->vm->display_height;
+        if (!asb_display_is_preset(configured_width, configured_height)) {
+            configured_width = DEFAULT_WIDTH;
+            configured_height = DEFAULT_HEIGHT;
+        }
+        /* A failed explicit request must not become the reconnect target. */
+        d->desired_width = (UINT)configured_width;
+        d->desired_height = (UINT)configured_height;
+    }
+    ReleaseSRWLockExclusive(&d->resize_lock);
+
+    result = (VmDisplayRuntimeResult *)HeapAlloc(
+        GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*result));
+    if (!result) return;
+    result->vm = d->vm;
+    result->width = width;
+    result->height = height;
+    result->success = success;
+    if (!notify || !PostMessageW(notify, WM_VM_DISPLAY_RUNTIME_RESULT,
+                                 0, (LPARAM)result))
+        HeapFree(GetProcessHeap(), 0, result);
+}
+
 static void idd_schedule_resize(VmDisplayIdd *d, UINT width, UINT height,
                                 BOOL immediate)
 {
@@ -1612,54 +1658,11 @@ static void idd_schedule_resize(VmDisplayIdd *d, UINT width, UINT height,
         return;
     }
     now = GetTickCount64();
-    if (immediate || !d->resize_interactive ||
-        now - d->last_resize_send_tick >= DISPLAY_RESIZE_DEBOUNCE_MS) {
+    if (immediate || now - d->last_resize_send_tick >= DISPLAY_RESIZE_DEBOUNCE_MS) {
         idd_flush_resize(d);
     } else if (d->hwnd) {
         SetTimer(d->hwnd, IDT_DISPLAY_RESIZE, DISPLAY_RESIZE_DEBOUNCE_MS, NULL);
     }
-}
-
-static void idd_apply_guest_size(VmDisplayIdd *d)
-{
-    RECT client, outer;
-    DWORD style, exstyle;
-    UINT width, height;
-    BOOL resize_pending;
-
-    if (!d || !d->hwnd || d->fullscreen || d->resize_interactive ||
-        d->applying_guest_size)
-        return;
-    AcquireSRWLockShared(&d->resize_lock);
-    width = d->actual_width;
-    height = d->actual_height;
-    resize_pending = !d->actual_valid ||
-                     d->pending_resize_id != 0 || d->resize_queued;
-    ReleaseSRWLockShared(&d->resize_lock);
-    if (resize_pending)
-        return;
-    if (!width || !height || !GetClientRect(d->hwnd, &client) ||
-        ((UINT)client.right == width && (UINT)client.bottom == height))
-        return;
-
-    style = (DWORD)GetWindowLongW(d->hwnd, GWL_STYLE);
-    exstyle = (DWORD)GetWindowLongW(d->hwnd, GWL_EXSTYLE);
-    outer.left = 0;
-    outer.top = 0;
-    outer.right = (LONG)width;
-    outer.bottom = (LONG)height;
-    if (!AdjustWindowRectEx(&outer, style, FALSE, exstyle))
-        return;
-    if (!GetWindowRect(d->hwnd, &client)) return;
-    d->applying_guest_size = TRUE;
-    SetWindowPos(d->hwnd, NULL, client.left, client.top,
-                 outer.right - outer.left, outer.bottom - outer.top,
-                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
-    d->applying_guest_size = FALSE;
-    d->desired_width = width;
-    d->desired_height = height;
-    idd_log(d, L"display_resize host client corrected to actual=%ux%u",
-            width, height);
 }
 
 static void idd_handle_resize_ack(VmDisplayIdd *d,
@@ -1673,6 +1676,7 @@ static void idd_handle_resize_ack(VmDisplayIdd *d,
     UINT32 pending_id;
     UINT retry_count = 0;
     ULONGLONG now;
+    UINT failed_width = 0, failed_height = 0;
 
     if (!d || !control)
         return;
@@ -1728,6 +1732,10 @@ static void idd_handle_resize_ack(VmDisplayIdd *d,
     }
 
     retry_count = d->pending_resize_retry_count;
+    failed_width = d->runtime_request_width ? d->runtime_request_width
+                                            : d->desired_width;
+    failed_height = d->runtime_request_height ? d->runtime_request_height
+                                               : d->desired_height;
     d->pending_resize_width = 0;
     d->pending_resize_height = 0;
     d->pending_resize_id = 0;
@@ -1746,8 +1754,8 @@ static void idd_handle_resize_ack(VmDisplayIdd *d,
     } else {
         d->pending_resize_retry_count = 0;
         d->resize_queued = FALSE;
-        abandon = control->status_or_flags ==
-            ASB_DISPLAY_CONTROL_STATUS_MODE_FAILED;
+        /* Any non-accepted terminal status completes the UI request. */
+        abandon = TRUE;
         disable_resize = control->status_or_flags ==
             ASB_DISPLAY_CONTROL_STATUS_UNSUPPORTED;
     }
@@ -1766,6 +1774,7 @@ static void idd_handle_resize_ack(VmDisplayIdd *d,
         idd_log(d, L"display_resize abandoned target=%ux%u actual=%ux%u",
                 d->desired_width, d->desired_height,
                 d->actual_width, d->actual_height);
+        idd_post_runtime_result(d, FALSE, failed_width, failed_height);
     }
 }
 
@@ -1778,6 +1787,7 @@ static void idd_check_resize_timeout(VmDisplayIdd *d)
     UINT requested_width, requested_height;
     DisplayResizePhase phase;
     UINT actual_width, actual_height;
+    UINT failed_width, failed_height;
     BOOL retry = FALSE;
     BOOL abandon = FALSE;
 
@@ -1798,6 +1808,10 @@ static void idd_check_resize_timeout(VmDisplayIdd *d)
     retry_count = d->pending_resize_retry_count;
     requested_width = d->pending_resize_width;
     requested_height = d->pending_resize_height;
+    failed_width = d->runtime_request_width ? d->runtime_request_width
+                                            : d->desired_width;
+    failed_height = d->runtime_request_height ? d->runtime_request_height
+                                               : d->desired_height;
     phase = d->pending_resize_phase;
     actual_width = d->actual_width;
     actual_height = d->actual_height;
@@ -1839,6 +1853,7 @@ static void idd_check_resize_timeout(VmDisplayIdd *d)
         idd_log(d, L"display_resize abandoned target=%ux%u actual=%ux%u",
                 d->desired_width, d->desired_height,
                 actual_width, actual_height);
+        idd_post_runtime_result(d, FALSE, failed_width, failed_height);
     }
 }
 
@@ -2973,6 +2988,8 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     idd_log(d, L"display_control hello version=%u flags=0x%08X "
                             L"dynamic_resize=%s.", control.version,
                             control.status_or_flags, capable ? L"yes" : L"no");
+                    if (!capable)
+                        idd_post_runtime_result(d, FALSE, 0, 0);
                     if (capable && d->hwnd)
                         PostMessageW(d->hwnd, WM_IDD_RESIZE_CAPABLE, 0, 0);
                 } else if (control.type == ASB_DISPLAY_CONTROL_RESIZE_ACK) {
@@ -3146,6 +3163,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                             completed_id, hdr.width, hdr.height);
                     idd_log(d, L"display_resize complete id=%u actual=%ux%u",
                             completed_id, hdr.width, hdr.height);
+                    idd_post_runtime_result(d, TRUE, hdr.width, hdr.height);
                 }
                 if (notify_actual && d->hwnd)
                     PostMessageW(d->hwnd, WM_IDD_ACTUAL_SIZE,
@@ -3389,11 +3407,6 @@ static void idd_enter_fullscreen(VmDisplayIdd *d)
                  mi.rcMonitor.right - mi.rcMonitor.left,
                  mi.rcMonitor.bottom - mi.rcMonitor.top,
                  SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
-    {
-        RECT rc;
-        if (GetClientRect(hwnd, &rc))
-            idd_schedule_resize(d, (UINT)rc.right, (UINT)rc.bottom, TRUE);
-    }
     idd_update_kbd_hook(d);
     idd_update_relative_mouse(d);
     idd_log(d, L"Entered borderless fullscreen.");
@@ -3415,11 +3428,6 @@ static void idd_exit_fullscreen(VmDisplayIdd *d)
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
                  SWP_NOOWNERZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
     SetWindowPlacement(hwnd, &d->windowed_placement);
-    {
-        RECT rc;
-        if (GetClientRect(hwnd, &rc))
-            idd_schedule_resize(d, (UINT)rc.right, (UINT)rc.bottom, TRUE);
-    }
     idd_update_kbd_hook(d);
     idd_update_relative_mouse(d);
     idd_log(d, L"Exited borderless fullscreen.");
@@ -3435,12 +3443,12 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
 
     swprintf_s(title, 300, L"%s - IDD Display", d->vm_name);
 
-    /* Compute outer window size so the client area is exactly the shared
-       default resolution. */
+    /* Start at the configured size. Window geometry is independent after
+       creation; resizing only changes the host swap chain/scaling. */
     {
         DWORD style   = WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN;
         DWORD exstyle = 0;
-        RECT wr = { 0, 0, DEFAULT_WIDTH, DEFAULT_HEIGHT };
+        RECT wr = { 0, 0, (LONG)d->desired_width, (LONG)d->desired_height };
         AdjustWindowRectEx(&wr, style, FALSE, exstyle);
 
         d->hwnd = CreateWindowExW(
@@ -3664,6 +3672,10 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (d) {
             BOOL user_initiated = d->open;
 
+            /* Do not leave the configuration modal in Applying... when the
+             * user closes the display or the VM teardown closes it for us. */
+            idd_post_runtime_result(d, FALSE, 0, 0);
+
             RemoveClipboardFormatListener(hwnd);
 
             /* Remove the hotkey hook and release any keys still held in the
@@ -3813,13 +3825,6 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (d->fullscreen_toolbar_visible)
                 idd_layout_fullscreen_toolbar(d);
             d3d_resize_swap_chain(d);
-            if (!d->applying_guest_size && wp != SIZE_MINIMIZED) {
-                RECT target;
-                if (GetClientRect(hwnd, &target))
-                    idd_schedule_resize(d, (UINT)target.right,
-                                        (UINT)target.bottom,
-                                        !d->resize_interactive);
-            }
             if (d->relative_mouse) {
                 AcquireSRWLockExclusive(&g_mouse_capture_lock);
                 if (g_mouse_capture_hwnd == hwnd) idd_clip_mouse(d);
@@ -3842,12 +3847,8 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_EXITSIZEMOVE:
         if (d) {
             d->input_sizing = msg == WM_ENTERSIZEMOVE;
-            d->resize_interactive = msg == WM_ENTERSIZEMOVE;
             if (msg == WM_EXITSIZEMOVE) {
-                RECT rc;
-                if (GetClientRect(hwnd, &rc))
-                    idd_schedule_resize(d, (UINT)rc.right, (UINT)rc.bottom, TRUE);
-                idd_apply_guest_size(d);
+                /* Deliberately no guest mode request here. */
             }
             idd_update_relative_mouse(d);
         }
@@ -3904,9 +3905,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_IDD_RESIZE_CAPABLE:
         if (d) {
-            RECT rc;
-            if (GetClientRect(hwnd, &rc))
-                idd_schedule_resize(d, (UINT)rc.right, (UINT)rc.bottom, TRUE);
+            idd_schedule_resize(d, d->desired_width, d->desired_height, TRUE);
         }
         return 0;
 
@@ -3917,7 +3916,6 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_IDD_ACTUAL_SIZE:
         if (d) {
-            idd_apply_guest_size(d);
             idd_flush_resize(d);
         }
         return 0;
@@ -4253,8 +4251,13 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     d->frame_width  = DEFAULT_WIDTH;
     d->frame_height = DEFAULT_HEIGHT;
     d->frame_stride = DEFAULT_WIDTH * 4;
-    d->desired_width = DEFAULT_WIDTH;
-    d->desired_height = DEFAULT_HEIGHT;
+    d->desired_width = vm->display_width ? vm->display_width : DEFAULT_WIDTH;
+    d->desired_height = vm->display_height ? vm->display_height : DEFAULT_HEIGHT;
+    if (!asb_display_is_preset(d->desired_width, d->desired_height)) {
+        d->desired_width = DEFAULT_WIDTH;
+        d->desired_height = DEFAULT_HEIGHT;
+    }
+    d->runtime_notify_hwnd = main_hwnd;
     d->actual_width = 0;
     d->actual_height = 0;
     d->actual_valid = FALSE;
@@ -4279,6 +4282,40 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     }
 
     return d;
+}
+
+BOOL vm_display_idd_set_runtime_display(VmDisplayIdd *display,
+                                         DWORD width, DWORD height)
+{
+    BOOL already_actual;
+
+    if (!display || !display->open || display->stop ||
+        !asb_display_is_preset(width, height))
+        return FALSE;
+
+    AcquireSRWLockExclusive(&display->resize_lock);
+    if (display->runtime_request_active) {
+        ReleaseSRWLockExclusive(&display->resize_lock);
+        return FALSE;
+    }
+    display->runtime_request_active = TRUE;
+    display->runtime_request_width = width;
+    display->runtime_request_height = height;
+    already_actual = display->actual_valid &&
+                     display->actual_width == width &&
+                     display->actual_height == height &&
+                     InterlockedCompareExchange(&display->resize_capable, 0, 0) != 0;
+    ReleaseSRWLockExclusive(&display->resize_lock);
+
+    if (already_actual) {
+        idd_post_runtime_result(display, TRUE, width, height);
+        return TRUE;
+    }
+
+    /* idd_schedule_resize retains the desired target until HELLO arrives,
+     * so a request made while the frame helper is reconnecting is not lost. */
+    idd_schedule_resize(display, width, height, TRUE);
+    return TRUE;
 }
 
 void vm_display_idd_destroy(VmDisplayIdd *display)

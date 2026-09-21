@@ -68,21 +68,13 @@ void asb_mode_snapshot(struct asb_device *asb, unsigned int *width,
 int asb_mode_set_runtime(struct asb_device *asb, unsigned int width,
                          unsigned int height, unsigned int refresh)
 {
-	bool changed;
-
-	if (width < ASB_MIN_WIDTH || width > ASB_MAX_WIDTH ||
-	    height < ASB_MIN_HEIGHT || height > ASB_MAX_HEIGHT ||
-	    refresh < 24 || refresh > 240)
+	if (!((width == 1280 && height == 720) ||
+	      (width == 1920 && height == 1080) ||
+	      (width == 2560 && height == 1440) ||
+	      (width == 3840 && height == 2160)) || refresh != 60)
 		return -EINVAL;
-	/* Keep direct sysfs writers on the same boundaries as the display
-	 * control protocol. The guest agent normally performs this normalization
-	 * before reaching sysfs, but the kernel entry point must be safe alone. */
-	width = width > ASB_MAX_WIDTH - 7u ? ASB_MAX_WIDTH : (width + 7u) & ~7u;
-	height = height > ASB_MAX_HEIGHT - 1u ? ASB_MAX_HEIGHT : (height + 1u) & ~1u;
 
 	mutex_lock(&asb->mode_lock);
-	changed = !asb->runtime_mode || asb->width != width ||
-	          asb->height != height || asb->refresh != refresh;
 	asb->width = width;
 	asb->height = height;
 	asb->refresh = refresh;
@@ -90,12 +82,9 @@ int asb_mode_set_runtime(struct asb_device *asb, unsigned int width,
 	WRITE_ONCE(asb->vblank_period, ns_to_ktime(NSEC_PER_SEC / refresh));
 	mutex_unlock(&asb->mode_lock);
 
-	if (!changed)
-		return 0;
-
-	/* Publish the new preferred mode before asking userspace to reprobe. */
-	asb_build_edid(asb);
-	drm_kms_helper_hotplug_event(&asb->drm);
+	/* Mode selection is now performed by the user-session Mutter helper from
+	 * an already-enumerated mode list. This sysfs entry remains a validation
+	 * and diagnostics hook; it must not rebuild EDID or emit hotplug events. */
 	return 0;
 }
 

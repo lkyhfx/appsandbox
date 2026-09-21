@@ -19,4 +19,20 @@ BOOL vm_display_idd_is_open(VmDisplayIdd *display);
    Safe to call from any thread; the work is marshaled to the window thread. */
 void vm_display_idd_focus(VmDisplayIdd *display);
 
+/* Request one of the fixed guest display presets while the VM remains
+   running. Completion is reported asynchronously to the main window after a
+   matching ASFR frame, never on ACK alone. */
+BOOL vm_display_idd_set_runtime_display(VmDisplayIdd *display,
+                                         DWORD width, DWORD height);
+
+/* main-window notification sent by the IDD receiver when a runtime request
+   completes. LPARAM owns a HeapAlloc'ed VmDisplayRuntimeResult. */
+#define WM_VM_DISPLAY_RUNTIME_RESULT (WM_APP + 20)
+typedef struct VmDisplayRuntimeResult {
+    VmInstance *vm;
+    DWORD width;
+    DWORD height;
+    BOOL success;
+} VmDisplayRuntimeResult;
+
 #endif /* VM_DISPLAY_IDD_H */

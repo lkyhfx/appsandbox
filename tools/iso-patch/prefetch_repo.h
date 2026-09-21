@@ -12,11 +12,11 @@
  * the manifest writer expects:
  *
  *   <out_dir>/
- *     agent-src/           (5 .c + Makefile from tools/linux/agent/)
+ *     agent-src/           (5 .c + user-session display helper + Makefile)
  *     asb_drm-src/         (tools/linux/asb_drm/* — DKMS source)
  *     dxgkrnl-src/         (tools/linux/dxgkrnl/src/* — DKMS source)
  *     systemd/
- *       appsandbox-{agent,audio,clipboard,display,input,firstboot}.service
+ *       appsandbox-{agent,audio,clipboard,display,input,display-helper,firstboot}.service
  *       asb-evict-simpledrm.service   (renamed from systemd-asb-evict-simpledrm.service)
  *       modules-load.d-asb_drm.conf
  *       modules-load.d-snd-aloop.conf

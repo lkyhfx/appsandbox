@@ -198,37 +198,57 @@
     <div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="edit-vm-title">
         <h3 id="edit-vm-title">Edit</h3>
         <div class="modal-form-body">
-            <div class="form-grid">
-                <label for="edit-ram-size">RAM Size:</label>
-                <div class="form-row">
-                    <input type="number" id="edit-ram-size" min="512" step="2" class="input-sm" aria-describedby="edit-vm-warn"> MB
-                    <span class="host-info" id="edit-host-ram"></span>
+            <section class="edit-config-group">
+                <h4>Runtime configuration</h4>
+                <div class="form-grid">
+                    <label for="edit-display-resolution">Display resolution:</label>
+                    <div class="form-row">
+                        <select id="edit-display-resolution" class="input-sm">
+                            <option value="1280x720">1280 × 720</option>
+                            <option value="1920x1080">1920 × 1080</option>
+                            <option value="2560x1440">2560 × 1440</option>
+                            <option value="3840x2160">3840 × 2160</option>
+                        </select>
+                        <button id="btn-apply-display" type="button" class="primary" onclick="applyRuntimeDisplay()">Apply</button>
+                    </div>
                 </div>
+                <span id="edit-display-status" class="field-warn" aria-live="polite"></span>
+            </section>
 
-                <label for="edit-cpu-cores">CPU Cores:</label>
-                <div class="form-row">
-                    <input type="number" id="edit-cpu-cores" min="1" class="input-sm" aria-describedby="edit-vm-warn">
-                    <span class="host-info" id="edit-host-cpu"></span>
-                </div>
+            <section class="edit-config-group stopped-only-group">
+                <h4>Requires Sandbox stopped</h4>
+                <div class="form-grid">
+                    <label for="edit-ram-size">RAM Size:</label>
+                    <div class="form-row">
+                        <input type="number" id="edit-ram-size" min="512" step="2" class="input-sm" aria-describedby="edit-vm-warn"> MB
+                        <span class="host-info" id="edit-host-ram"></span>
+                    </div>
 
-                <label for="edit-gpu-mode" class="win-only">GPU:</label>
-                <div class="form-row win-only">
-                    <select id="edit-gpu-mode">
-                        <option value="0">None</option>
-                        <option value="1">Default GPU</option>
-                    </select>
-                </div>
+                    <label for="edit-cpu-cores">CPU Cores:</label>
+                    <div class="form-row">
+                        <input type="number" id="edit-cpu-cores" min="1" class="input-sm" aria-describedby="edit-vm-warn">
+                        <span class="host-info" id="edit-host-cpu"></span>
+                    </div>
 
-                <label for="edit-net-mode" class="win-only">Network:</label>
-                <div class="form-row win-only">
-                    <select id="edit-net-mode">
-                        <option value="0">None</option>
-                        <option value="1">NAT</option>
-                        <option value="2">External</option>
-                        <option value="3">Internal</option>
-                    </select>
+                    <label for="edit-gpu-mode" class="win-only">GPU:</label>
+                    <div class="form-row win-only">
+                        <select id="edit-gpu-mode">
+                            <option value="0">None</option>
+                            <option value="1">Default GPU</option>
+                        </select>
+                    </div>
+
+                    <label for="edit-net-mode" class="win-only">Network:</label>
+                    <div class="form-row win-only">
+                        <select id="edit-net-mode">
+                            <option value="0">None</option>
+                            <option value="1">NAT</option>
+                            <option value="2">External</option>
+                            <option value="3">Internal</option>
+                        </select>
+                    </div>
                 </div>
-            </div>
+            </section>
             <span id="edit-vm-warn" class="field-warn" aria-live="polite"></span>
         </div>
         <div class="modal-buttons">

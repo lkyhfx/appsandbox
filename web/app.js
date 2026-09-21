@@ -143,6 +143,7 @@ window.onHostMessage = function(msg) {
         case 'browseResult':  onBrowseResult(msg.path); break;
         case 'diskDirectoryBrowseResult': onDiskDirectoryBrowseResult(msg.path); break;
         case 'diskSpace':     onDiskSpace(msg); break;
+        case 'runtimeDisplayResult': onRuntimeDisplayResult(msg); break;
         case 'confirmResult': if (pendingConfirm) pendingConfirm.resolve(msg.confirmed); break;
         case 'adapters':      populateAdapters(msg.adapters, msg.defaultIndex); break;
         case 'templates':     populateTemplates(msg.templates); break;
@@ -1041,7 +1042,9 @@ function buildRowCells(vm, i, statusTd) {
         makeIconCell('shutdown', '\u23FB', vm.running && !bld, function() { sendCmd('shutdownVm', {vmIndex: i}); }, '', 'Request a graceful shutdown from the guest OS'),
         makeIconCell('stop', '\u2715\uFE0F', vm.running && !bld, function() { onStopVm(i); }, '', 'Force power off the VM immediately (may lose unsaved guest data)'),
         makeIconCell('delete', '\uD83D\uDDD1\uFE0F', !bld, function() { onDeleteVm(i); }, vm.running ? 'running' : '', 'Delete this VM and its virtual disks'),
-        makeIconCell('edit', '\u270F\uFE0F', !vm.running && !bld, function() { openEditVmModal(i); }, '', 'Edit VM configuration — VM must be stopped'),
+        makeIconCell('edit', '\u270F\uFE0F', !bld && (!hostBridge.isMac || !vm.running), function() { openEditVmModal(i); }, '', vm.running
+            ? 'Configure runtime display (CPU/RAM/GPU/network require the VM to be stopped)'
+            : 'Edit VM configuration'),
     );
     return cells;
 }
@@ -1195,17 +1198,24 @@ function vmIndexByName(name) {
 
 function openEditVmModal(idx) {
     var vm = vms[idx];
-    if (!vm || vm.running || vm.buildingVhdx) return;
+    if (!vm || vm.buildingVhdx || (hostBridge.isMac && vm.running)) return;
     editVmState = { name: vm.name, initial: Object.assign({}, vm), previousFocus: rowCache[vm.name].querySelector('.edit') };
+    editVmState.initial.displayWidth = vm.displayWidth || 1280;
+    editVmState.initial.displayHeight = vm.displayHeight || 720;
+    editVmState.runtimeApplying = false;
     document.getElementById('edit-vm-title').textContent = 'Edit ' + vm.name;
     document.getElementById('edit-ram-size').value = vm.ramMb;
     document.getElementById('edit-ram-size').min = hostBridge.isMac ? 512 : 4000;
     document.getElementById('edit-cpu-cores').value = vm.cpuCores;
+    document.getElementById('edit-display-resolution').value =
+        (vm.displayWidth || 1280) + 'x' + (vm.displayHeight || 720);
+    document.getElementById('edit-display-status').textContent = '';
     setGpuSelection('edit-gpu-mode', vm);
     document.getElementById('edit-net-mode').value = String(vm.networkMode);
     updateEditVmModal();
     document.getElementById('edit-vm-overlay').classList.add('active');
-    document.getElementById('edit-ram-size').focus();
+    document.getElementById(vm.running && !hostBridge.isMac
+        ? 'edit-display-resolution' : 'edit-ram-size').focus();
 }
 
 function closeEditVmModal() {
@@ -1226,9 +1236,12 @@ function restoreVmModalFocus(state, selector) {
 }
 
 function editVmValues() {
+    var display = document.getElementById('edit-display-resolution').value.split('x');
     var values = {
         ramMb: document.getElementById('edit-ram-size').valueAsNumber,
-        cpuCores: document.getElementById('edit-cpu-cores').valueAsNumber
+        cpuCores: document.getElementById('edit-cpu-cores').valueAsNumber,
+        displayWidth: Number(display[0]),
+        displayHeight: Number(display[1])
     };
     if (!hostBridge.isMac) {
         Object.assign(values, selectedGpu('edit-gpu-mode'));
@@ -1244,6 +1257,11 @@ function editVmValidationError(values) {
     if (values.ramMb !== editVmState.initial.ramMb &&
         (!Number.isInteger(values.ramMb) || values.ramMb < minRam || values.ramMb > 2147483647))
         return 'RAM must be a whole number of at least ' + minRam + ' MB.';
+    if (!Number.isInteger(values.displayWidth) || !Number.isInteger(values.displayHeight) ||
+        ![[1280, 720], [1920, 1080], [2560, 1440], [3840, 2160]].some(function(pair) {
+            return pair[0] === values.displayWidth && pair[1] === values.displayHeight;
+        }))
+        return 'Choose one of the supported display resolutions.';
     return '';
 }
 
@@ -1251,14 +1269,45 @@ function updateEditVmModal() {
     if (!editVmState) return;
     var vm = vms[vmIndexByName(editVmState.name)];
     if (!vm) { closeEditVmModal(); return; }
-    var disabled = vm.running || vm.buildingVhdx;
-    document.querySelectorAll('#edit-vm-overlay input, #edit-vm-overlay select').forEach(function(el) {
-        el.disabled = !!disabled;
+    var stoppedOnlyDisabled = vm.running || vm.buildingVhdx;
+    var runtimeDisabled = vm.buildingVhdx || !!editVmState.runtimeApplying;
+    document.querySelectorAll('#edit-vm-overlay .stopped-only-group input, #edit-vm-overlay .stopped-only-group select').forEach(function(el) {
+        el.disabled = !!stoppedOnlyDisabled;
     });
+    document.getElementById('edit-display-resolution').disabled = runtimeDisabled;
+    document.getElementById('btn-apply-display').disabled =
+        !vm.running || runtimeDisabled ||
+        (editVmValues().displayWidth === (vm.displayWidth || 1280) &&
+         editVmValues().displayHeight === (vm.displayHeight || 720));
+    document.querySelector('#edit-vm-overlay .edit-config-group').style.display = hostBridge.isMac ? 'none' : '';
     var values = editVmValues();
-    var error = disabled ? 'Stop the VM before editing its configuration.' : editVmValidationError(values);
+    var error = vm.buildingVhdx ? 'Wait for the disk build to finish.' :
+        (!vm.running ? editVmValidationError(values) : 'Stop the Sandbox to edit CPU, RAM, GPU, or network.');
     document.getElementById('edit-vm-warn').textContent = error;
-    document.getElementById('btn-save-edit-vm').disabled = !!error;
+    document.getElementById('btn-save-edit-vm').disabled = !!error || vm.running;
+}
+
+function applyRuntimeDisplay() {
+    if (!editVmState || editVmState.runtimeApplying) return;
+    var idx = vmIndexByName(editVmState.name);
+    var vm = vms[idx];
+    var values = editVmValues();
+    if (!vm || !vm.running) return;
+    editVmState.runtimeApplying = true;
+    document.getElementById('edit-display-status').textContent = 'Applying...';
+    updateEditVmModal();
+    sendCmd('setVmRuntimeDisplay', {
+        vmIndex: idx, width: values.displayWidth, height: values.displayHeight
+    });
+}
+
+function onRuntimeDisplayResult(msg) {
+    if (!editVmState || (msg.vmName && msg.vmName !== editVmState.name)) return;
+    editVmState.runtimeApplying = false;
+    document.getElementById('edit-display-status').textContent = msg.success
+        ? 'Applied: ' + msg.width + 'x' + msg.height
+        : 'Failed: ' + (msg.error || 'display helper unavailable');
+    updateEditVmModal();
 }
 
 function saveEditVm() {
@@ -1273,14 +1322,21 @@ function saveEditVm() {
         gpuSelectionValue(values) !== gpuSelectionValue(vms[idx]);
     var fields = Object.keys(values).filter(function(field) {
         return field !== 'gpuMode' && field !== 'gpuId' &&
+            field !== 'displayWidth' && field !== 'displayHeight' &&
             values[field] !== editVmState.initial[field] && values[field] !== vms[idx][field];
     });
+    var displayChanged = !hostBridge.isMac &&
+                         (values.displayWidth !== editVmState.initial.displayWidth ||
+                         values.displayHeight !== editVmState.initial.displayHeight);
     closeEditVmModal();
     fields.forEach(function(field) {
         sendCmd('editVm', { vmIndex: idx, field: field, value: String(values[field]) });
     });
     if (gpuChanged)
         sendCmd('editVm', { vmIndex: idx, field: 'gpuMode', value: String(values.gpuMode), gpuId: values.gpuId });
+    if (displayChanged)
+        sendCmd('editVm', { vmIndex: idx, field: 'displayResolution',
+            value: values.displayWidth + 'x' + values.displayHeight });
 }
 
 document.getElementById('edit-vm-overlay').addEventListener('input', updateEditVmModal);

@@ -183,6 +183,8 @@ ASB_API BOOL    asb_vm_is_building(AsbVm vm);
 ASB_API DWORD   asb_vm_ram_mb(AsbVm vm);
 ASB_API DWORD   asb_vm_hdd_gb(AsbVm vm);
 ASB_API DWORD   asb_vm_cpu_cores(AsbVm vm);
+ASB_API DWORD   asb_vm_display_width(AsbVm vm);
+ASB_API DWORD   asb_vm_display_height(AsbVm vm);
 ASB_API int     asb_vm_gpu_mode(AsbVm vm);
 ASB_API int     asb_vm_network_mode(AsbVm vm);
 ASB_API BOOL    asb_vm_ssh_enabled(AsbVm vm);
@@ -196,6 +198,9 @@ ASB_API HRESULT asb_vm_set_cpu(AsbVm vm, DWORD cores);
 ASB_API HRESULT asb_vm_set_gpu(AsbVm vm, int gpu_mode);
 ASB_API HRESULT asb_vm_set_gpu_selection(AsbVm vm, int gpu_mode, const wchar_t *gpu_id);
 ASB_API HRESULT asb_vm_set_network(AsbVm vm, int mode);
+/* Persist one of the fixed Issue #9 display presets. The running-VM path
+   calls this only after the IDD receiver has observed the matching ASFR. */
+ASB_API HRESULT asb_vm_set_display_resolution(AsbVm vm, DWORD width, DWORD height);
 
 /* ---- Snapshots ---- */
 
