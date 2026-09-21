@@ -5,6 +5,9 @@
 CC      ?= gcc
 CFLAGS  ?= -O2 -Wall -Wextra -pthread -D_GNU_SOURCE
 LDFLAGS ?=
+CORE_DIR ?= core
+CPPFLAGS ?=
+CPPFLAGS += -I$(CORE_DIR)
 
 PREFIX        ?= /usr/local
 DESTDIR       ?=
@@ -35,30 +38,30 @@ test: $(TEST_BINS)
 	./tests/test_display_snapshot
 
 tests/test_display_snapshot: tests/test_display_snapshot.c \
-		../../../src/core/display_snapshot.h ../../../src/core/display_protocol.h \
-		../../../src/core/display_fb_state.h
-	$(CC) $(CFLAGS) -I../../../src/core -o $@ $<
+		$(CORE_DIR)/display_snapshot.h $(CORE_DIR)/display_protocol.h \
+		$(CORE_DIR)/display_fb_state.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $<
 
 appsandbox-agent: appsandbox-agent.c
-	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
 # Display daemon needs libdrm for drmModeGetFB2 + drmPrimeHandleToFD.
 appsandbox-display: appsandbox-display.c
-	$(CC) $(CFLAGS) $(shell pkg-config --cflags libdrm) -o $@ $< \
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(shell pkg-config --cflags libdrm) -o $@ $< \
 	       $(LDFLAGS) $(shell pkg-config --libs libdrm)
 
-appsandbox-input: appsandbox-input.c $(wildcard protocol.h ../../../src/core/protocol.h)
-	$(CC) $(CFLAGS) -I../../../src/core -o $@ $< $(LDFLAGS) -lsystemd
+appsandbox-input: appsandbox-input.c $(CORE_DIR)/protocol.h
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< $(LDFLAGS) -lsystemd
 
 # Audio daemon uses libasound to talk to the kernel snd-aloop driver.
 appsandbox-audio: appsandbox-audio.c
-	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS) -lasound
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< $(LDFLAGS) -lasound
 
 # Clipboard daemon: XCB (with XFIXES) for X11 selection ownership,
 # libc iconv for text format conversion. libpng would be added when
 # we wire the DIB ↔ PNG path; today CF_DIB → image/bmp is header-munge.
 appsandbox-clipboard: appsandbox-clipboard.c
-	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS) -lxcb -lxcb-xfixes
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $< $(LDFLAGS) -lxcb -lxcb-xfixes
 
 install-pointer:
 	install -d $(DESTDIR)$(EXTENSIONDIR)

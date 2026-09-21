@@ -9,13 +9,12 @@ After=appsandbox-agent.service
 Wants=network-online.target
 After=network-online.target
 # Idempotent guard: cloud-init touches this marker once at install time;
-# ExecStartPost removes it. Subsequent boots skip the service entirely.
+# the firstboot script removes it only after all gates and STEP 99 succeed.
 ConditionPathExists=/etc/appsandbox-firstboot.marker
 
 [Service]
 Type=oneshot
 ExecStart=/opt/appsandbox/setup.sh
-ExecStartPost=/bin/rm -f /etc/appsandbox-firstboot.marker
 # apt install of ubuntu-desktop-minimal can take 10-15 min on a slow link.
 TimeoutStartSec=45min
 # Keep the journal copy and mirror the service's output to the kernel console

@@ -32,9 +32,11 @@
 KVER  := $(shell uname -r)
 ARCH  := $(shell uname -m)
 DISTDIR := $(CURDIR)/dist
+AGENT_CORE_DIR := $(CURDIR)/.agent-core
+CORE_HEADERS := protocol.h display_protocol.h display_snapshot.h display_fb_state.h
 
-.PHONY: all compile agents modules dxgkrnl asb_drm install-agents install-modules \
-        clean distclean copy-help
+.PHONY: all compile prepare-agent-core agents modules dxgkrnl asb_drm \
+        install-agents install-modules clean distclean copy-help
 
 all: compile install-agents install-modules copy-help
 
@@ -45,8 +47,14 @@ compile: agents modules
 # Re-uses the existing tools/linux/agent/Makefile which knows how to compile
 # each daemon with the right libs (libdrm for display, libasound for audio,
 # libxcb for clipboard).
-agents:
-	$(MAKE) -C agent
+prepare-agent-core:
+	@install -d $(AGENT_CORE_DIR)
+	@for header in $(CORE_HEADERS); do \
+	    install -m 0644 $(CURDIR)/../../src/core/$$header $(AGENT_CORE_DIR)/$$header; \
+	done
+
+agents: prepare-agent-core
+	$(MAKE) -C agent CORE_DIR=$(AGENT_CORE_DIR)
 
 install-agents: agents
 	@install -d $(DISTDIR)
@@ -89,9 +97,10 @@ install-modules: modules
 # ---- cleanup ----------------------------------------------------------------
 
 clean:
-	-$(MAKE) -C agent clean
+	-$(MAKE) -C agent CORE_DIR=$(AGENT_CORE_DIR) clean
 	-$(MAKE) -C /lib/modules/$(KVER)/build M=$(CURDIR)/dxgkrnl/src clean
 	-$(MAKE) -C /lib/modules/$(KVER)/build M=$(CURDIR)/asb_drm clean
+	rm -rf $(AGENT_CORE_DIR)
 
 distclean: clean
 	rm -rf $(DISTDIR)

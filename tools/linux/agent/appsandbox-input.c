@@ -9,7 +9,7 @@
  * full keyboard. GNOME / Mutter (Wayland) and Xorg both pick it up via
  * libinput automatically because uinput presents a real evdev node.
  *
- * Wire protocol: src/core/protocol.h.
+ * Wire protocol: core/protocol.h (staged beside this source tree).
  */
 
 #include <stdio.h>
@@ -32,7 +32,7 @@
 #include <linux/uinput.h>
 #include <linux/vm_sockets.h>
 #include <systemd/sd-login.h>
-#include "protocol.h"
+#include "core/protocol.h"
 
 #define VSOCK_PORT          3
 

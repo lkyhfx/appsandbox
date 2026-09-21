@@ -420,10 +420,22 @@ int do_prefetch_repo(const wchar_t *repo, const wchar_t *ref,
             swprintf_s(dst, _countof(dst), L"%s\\%s", out_agent, files[i]);
             if (u_cp_file(s, dst) != 0) goto cleanup;
         }
-        wchar_t protocol_src[PREFETCH_PATH_CAP];
-        swprintf_s(protocol_src, _countof(protocol_src), L"%s\\src\\core\\protocol.h", extracted_root);
-        swprintf_s(dst, _countof(dst), L"%s\\protocol.h", out_agent);
-        if (u_cp_file(protocol_src, dst) != 0) goto cleanup;
+        wchar_t core_src[PREFETCH_PATH_CAP], out_core[PREFETCH_PATH_CAP];
+        swprintf_s(core_src, _countof(core_src), L"%s\\src\\core", extracted_root);
+        swprintf_s(out_core, _countof(out_core), L"%s\\core", out_agent);
+        if (!u_mkdir_p(out_core)) goto cleanup;
+        {
+            const wchar_t *core_files[] = {
+                L"protocol.h", L"display_protocol.h",
+                L"display_snapshot.h", L"display_fb_state.h"
+            };
+            for (int i = 0; i < (int)(sizeof(core_files) / sizeof(core_files[0])); i++) {
+                wchar_t s[PREFETCH_PATH_CAP], d[PREFETCH_PATH_CAP];
+                swprintf_s(s, _countof(s), L"%s\\%s", core_src, core_files[i]);
+                swprintf_s(d, _countof(d), L"%s\\%s", out_core, core_files[i]);
+                if (u_cp_file(s, d) != 0) goto cleanup;
+            }
+        }
         wchar_t gnome_src[PREFETCH_PATH_CAP];
         swprintf_s(gnome_src, _countof(gnome_src),
                    L"%s\\gnome\\appsandbox-pointer@appsandbox", agent_src);
