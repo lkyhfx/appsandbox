@@ -362,14 +362,14 @@ static void idd_flush_resize(VmDisplayIdd *d);
 static void idd_check_resize_timeout(VmDisplayIdd *d);
 static void idd_apply_guest_size(VmDisplayIdd *d);
 static BOOL idd_send_display_control(VmDisplayIdd *d,
-                                     const AsbDisplayControl *control,
-                                     ULONGLONG generation);
+                                      const AsbDisplayControl *control,
+                                      ULONGLONG generation);
 static void idd_handle_resize_ack(VmDisplayIdd *d,
                                   const AsbDisplayControl *control,
                                   ULONGLONG connection_generation);
-static void idd_mark_resize_sent(VmDisplayIdd *d,
-                                  const AsbDisplayControl *control,
-                                  ULONGLONG generation);
+static BOOL idd_prepare_resize_send(VmDisplayIdd *d,
+                                    const AsbDisplayControl *control,
+                                    ULONGLONG generation);
 static void idd_invalidate_resize_connection(VmDisplayIdd *d);
 static DWORD WINAPI idd_control_send_thread_proc(LPVOID param);
 static void window_to_vm_coords(HWND hwnd, int wx, int wy, UINT vm_w, UINT vm_h,
@@ -1346,6 +1346,14 @@ static BOOL idd_send_display_control(VmDisplayIdd *d,
         InterlockedCompareExchange(&d->resize_capable, 0, 0) == 0)
         return FALSE;
 
+    /* Prepare before taking frame_send_lock so the lock order remains
+     * resize_lock -> frame_send_lock, matching idd_flush_resize(). */
+    if (control->type == ASB_DISPLAY_CONTROL_RESIZE_REQUEST &&
+        !idd_prepare_resize_send(d, control, generation)) {
+        idd_log(d, L"display_control resize state was superseded before send.");
+        return FALSE;
+    }
+
     AcquireSRWLockShared(&d->frame_send_lock);
     s = d->frame_socket;
     current_generation = d->frame_connection_generation;
@@ -1361,8 +1369,6 @@ static BOOL idd_send_display_control(VmDisplayIdd *d,
             sent += n;
         }
         ok = sent == (int)sizeof(*control);
-        if (ok && control->type == ASB_DISPLAY_CONTROL_RESIZE_REQUEST)
-            idd_mark_resize_sent(d, control, generation);
         if (!ok)
             shutdown(s, SD_BOTH);
     }
@@ -1491,25 +1497,30 @@ static DWORD WINAPI idd_control_send_thread_proc(LPVOID param)
     return 0;
 }
 
-/* A request is not eligible for timeout handling until the sender thread has
- * written the complete control message to the current frame connection. */
-static void idd_mark_resize_sent(VmDisplayIdd *d,
-                                 const AsbDisplayControl *control,
-                                 ULONGLONG generation)
+/* A request becomes eligible for ACK handling immediately before the first
+ * control byte is written. The guest may ACK before the final send() call
+ * returns, so this transition must happen before the write, not after it. */
+static BOOL idd_prepare_resize_send(VmDisplayIdd *d,
+                                    const AsbDisplayControl *control,
+                                    ULONGLONG generation)
 {
     ULONGLONG now;
+    BOOL prepared = FALSE;
 
     if (!d || !control || control->type != ASB_DISPLAY_CONTROL_RESIZE_REQUEST)
-        return;
+        return TRUE;
 
     now = GetTickCount64();
     AcquireSRWLockExclusive(&d->resize_lock);
     if (d->pending_resize_id == control->request_id &&
-        d->pending_resize_generation == generation) {
+        d->pending_resize_generation == generation &&
+        d->pending_resize_phase == DISPLAY_RESIZE_PHASE_NONE) {
         d->pending_resize_phase = DISPLAY_RESIZE_PHASE_WAIT_ACK;
         d->pending_resize_deadline = now + ASB_DISPLAY_RESIZE_ACK_TIMEOUT_MS;
+        prepared = TRUE;
     }
     ReleaseSRWLockExclusive(&d->resize_lock);
+    return prepared;
 }
 
 static void idd_flush_resize(VmDisplayIdd *d)

@@ -25,6 +25,7 @@ typedef struct ResizeModel {
     uint32_t pending_height;
     uint32_t retry_count;
     uint64_t deadline;
+    bool send_completed;
     enum {
         PHASE_NONE = 0,
         PHASE_WAIT_ACK,
@@ -138,15 +139,32 @@ static bool model_timeout(ResizeModel *s, uint64_t now)
 
 static void begin_request(ResizeModel *s, uint32_t request_id,
                           uint64_t generation, uint32_t width,
-                          uint32_t height, uint64_t now)
+                          uint32_t height)
 {
     s->queued = false;
     s->pending_id = request_id;
     s->pending_generation = generation;
     s->pending_width = width;
     s->pending_height = height;
+    s->phase = PHASE_NONE;
+    s->deadline = 0;
+    s->send_completed = false;
+}
+
+/* Mirrors the Windows sender's prepare step. This deliberately happens before
+ * the simulated send completes so a guest ACK can race with the final write. */
+static bool model_prepare_send(ResizeModel *s, uint64_t now)
+{
+    if (!s->pending_id || s->phase != PHASE_NONE)
+        return false;
     s->phase = PHASE_WAIT_ACK;
     s->deadline = now + ASB_DISPLAY_RESIZE_ACK_TIMEOUT_MS;
+    return true;
+}
+
+static void model_send_complete(ResizeModel *s)
+{
+    s->send_completed = true;
 }
 
 int main(void)
@@ -165,34 +183,41 @@ int main(void)
 
     /* MODE_FAILED clears pending and permits only bounded retries. */
     s.connection_generation = 1;
-    begin_request(&s, 10, 1, 1920, 1080, 0);
+    begin_request(&s, 10, 1, 1920, 1080);
+    assert(model_prepare_send(&s, 0));
     assert(!model_ack(&s, 10, ASB_DISPLAY_CONTROL_STATUS_MODE_FAILED,
                       1920, 1080, 1, 1));
     assert(s.pending_id == 0 && s.queued && s.retry_count == 1);
 
     /* No ACK: old-size frames do not keep a sent request pending forever. */
     s.retry_count = 0;
-    begin_request(&s, 20, 1, 1920, 1080, 100);
+    begin_request(&s, 20, 1, 1920, 1080);
+    assert(model_prepare_send(&s, 100));
+    model_send_complete(&s);
     assert(!model_frame(&s, 1280, 720, 1));
     assert(model_timeout(&s, 100 + ASB_DISPLAY_RESIZE_ACK_TIMEOUT_MS));
     assert(s.pending_id == 0 && s.queued && s.retry_count == 1);
-    begin_request(&s, 21, 1, 1920, 1080, 1500);
+    begin_request(&s, 21, 1, 1920, 1080);
+    assert(model_prepare_send(&s, 1500));
     /* A late ACK for id=20 cannot resurrect the timed-out request. */
     assert(!model_ack(&s, 20, ASB_DISPLAY_CONTROL_STATUS_ACCEPTED,
                       1920, 1080, 1, 1600));
     assert(s.pending_id == 21 && s.phase == PHASE_WAIT_ACK);
     assert(model_timeout(&s, 1500 + ASB_DISPLAY_RESIZE_ACK_TIMEOUT_MS));
     assert(s.pending_id == 0 && s.queued && s.retry_count == 2);
-    begin_request(&s, 22, 1, 1920, 1080, 3000);
+    begin_request(&s, 22, 1, 1920, 1080);
+    assert(model_prepare_send(&s, 3000));
     assert(model_timeout(&s, 3000 + ASB_DISPLAY_RESIZE_ACK_TIMEOUT_MS));
     assert(s.pending_id == 0 && !s.queued && s.retry_count == 0);
 
     /* A later request remains usable after the bounded abandon. */
-    begin_request(&s, 23, 1, 1920, 1080, 10);
+    begin_request(&s, 23, 1, 1920, 1080);
+    assert(model_prepare_send(&s, 10));
     assert(s.pending_id == 23 && s.phase == PHASE_WAIT_ACK);
 
     /* Completion uses the normalized ACK target, not the raw request. */
-    begin_request(&s, 24, 1, 1573, 887, 100);
+    begin_request(&s, 24, 1, 1573, 887);
+    assert(model_prepare_send(&s, 100));
     assert(model_ack(&s, 24, ASB_DISPLAY_CONTROL_STATUS_ACCEPTED,
                      1576, 888, 1, 100));
     assert(model_frame(&s, 1576, 888, 1));
@@ -200,27 +225,47 @@ int main(void)
            s.actual_height == 888);
 
     /* Accepted ACK without ASFR times out and retries, then abandons. */
-    begin_request(&s, 25, 1, 1920, 1080, 200);
+    begin_request(&s, 25, 1, 1920, 1080);
+    assert(model_prepare_send(&s, 200));
     assert(model_ack(&s, 25, ASB_DISPLAY_CONTROL_STATUS_ACCEPTED,
                      1920, 1080, 1, 200));
     assert(model_timeout(&s, 200 + ASB_DISPLAY_RESIZE_COMPLETION_TIMEOUT_MS));
     assert(s.pending_id == 0 && s.queued && s.retry_count == 1);
-    begin_request(&s, 26, 1, 1920, 1080, 500);
+    begin_request(&s, 26, 1, 1920, 1080);
+    assert(model_prepare_send(&s, 500));
     assert(model_ack(&s, 26, ASB_DISPLAY_CONTROL_STATUS_ACCEPTED,
                      1920, 1080, 1, 500));
     assert(model_timeout(&s, 500 + ASB_DISPLAY_RESIZE_COMPLETION_TIMEOUT_MS));
-    begin_request(&s, 27, 1, 1920, 1080, 800);
+    begin_request(&s, 27, 1, 1920, 1080);
+    assert(model_prepare_send(&s, 800));
     assert(model_ack(&s, 27, ASB_DISPLAY_CONTROL_STATUS_ACCEPTED,
                      1920, 1080, 1, 800));
     assert(model_timeout(&s, 800 + ASB_DISPLAY_RESIZE_COMPLETION_TIMEOUT_MS));
     assert(s.pending_id == 0 && !s.queued && s.retry_count == 0);
 
     /* Disconnect while pending invalidates the old generation completely. */
-    begin_request(&s, 28, 1, 2560, 1440, 900);
+    begin_request(&s, 28, 1, 2560, 1440);
+    assert(model_prepare_send(&s, 900));
     model_disconnect(&s);
     s.connection_generation = 2;
     model_schedule(&s, 2560, 1440);
     assert(s.pending_id == 0 && s.queued && !s.actual_valid);
+
+    /* ACK race: WAIT_ACK is armed before the guest can observe the request.
+     * The guest replies before send() returns; the ACK must be accepted and
+     * the later send completion must not overwrite WAIT_FRAME. */
+    s = (ResizeModel){0};
+    s.connection_generation = 7;
+    begin_request(&s, 29, 7, 1920, 1080);
+    assert(model_prepare_send(&s, 1000));
+    assert(s.phase == PHASE_WAIT_ACK);
+    assert(model_ack(&s, 29, ASB_DISPLAY_CONTROL_STATUS_ACCEPTED,
+                     1920, 1080, 7, 1001));
+    assert(s.phase == PHASE_WAIT_FRAME);
+    model_send_complete(&s);
+    assert(s.send_completed && s.phase == PHASE_WAIT_FRAME);
+    assert(model_frame(&s, 1920, 1080, 7));
+    assert(s.pending_id == 0 && s.phase == PHASE_NONE);
 
     return 0;
 }
