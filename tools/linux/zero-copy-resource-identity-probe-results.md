@@ -134,5 +134,5 @@ supported by the evidence: both medium and elevated processes were denied.
 B0 (ordinary AppSandbox/IDD process): BLOCKED — reproducible STATUS_ACCESS_DENIED
 Gate A:                              NOT RUN (B0 prerequisite unavailable)
 Gate B:                              NOT RUN
-Gate C:                              independent; may continue separately
+Gate C0:                             PASS — LOCAL_SHMEM, dxg identity absent
 ```

@@ -40,6 +40,8 @@
 static unsigned int width_param   = ASB_DEFAULT_WIDTH;
 static unsigned int height_param  = ASB_DEFAULT_HEIGHT;
 static unsigned int refresh_param = ASB_DEFAULT_REFRESH;
+bool asb_c0_trace;
+unsigned int asb_c0_sample_every = 1;
 
 module_param_named(width,   width_param,   uint, 0444);
 MODULE_PARM_DESC(width,   "Initial display width  (default 1920)");
@@ -47,6 +49,12 @@ module_param_named(height,  height_param,  uint, 0444);
 MODULE_PARM_DESC(height,  "Initial display height (default 1080)");
 module_param_named(refresh, refresh_param, uint, 0444);
 MODULE_PARM_DESC(refresh, "Refresh rate in Hz     (default 60)");
+module_param_named(c0_trace, asb_c0_trace, bool, 0644);
+MODULE_PARM_DESC(c0_trace,
+	"Log Gate C0 primary-framebuffer provenance (default false)");
+module_param_named(c0_sample_every, asb_c0_sample_every, uint, 0644);
+MODULE_PARM_DESC(c0_sample_every,
+	"Log every Nth primary atomic update while c0_trace is enabled (default 1)");
 
 /* --------------------------------------------------------------------------
  * drm_driver

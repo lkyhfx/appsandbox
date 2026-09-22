@@ -16,6 +16,7 @@
 #ifndef _ASB_DRM_H_
 #define _ASB_DRM_H_
 
+#include <linux/atomic.h>
 #include <linux/hrtimer.h>
 #include <linux/platform_device.h>
 
@@ -74,7 +75,20 @@ struct asb_device {
 	struct hrtimer          vblank_timer;
 	ktime_t                 vblank_period;
 	bool                    vblank_enabled;
+
+	/* Gate C0 scanout-provenance counters. c0_last_obj is identity-only and
+	 * never dereferenced after the commit that supplied it. */
+	atomic64_t              c0_seq;
+	atomic64_t              c0_local_count;
+	atomic64_t              c0_imported_count;
+	atomic64_t              c0_disabled_count;
+	atomic64_t              c0_identity_changes;
+	struct drm_gem_object  *c0_last_obj;
 };
+
+/* Runtime Gate C0 tracing controls (module parameters in asb_drm_drv.c). */
+extern bool asb_c0_trace;
+extern unsigned int asb_c0_sample_every;
 
 static inline struct asb_device *to_asb(struct drm_device *drm)
 {

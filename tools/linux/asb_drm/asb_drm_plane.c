@@ -21,10 +21,12 @@
 #include <drm/drm_blend.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
+#include <drm/drm_gem.h>
 #include <drm/drm_gem_atomic_helper.h>
 #include <drm/drm_plane.h>
 #include <drm/drm_plane_helper.h>
 #include <drm/drm_print.h>
+#include <linux/dma-buf.h>
 
 #include "asb_drm.h"
 
@@ -88,11 +90,79 @@ static int asb_primary_atomic_check(struct drm_plane *plane,
 static void asb_primary_atomic_update(struct drm_plane *plane,
                                       struct drm_atomic_state *state)
 {
-	/* Virtual driver: nothing to push to hardware. The atomic helpers
-	 * have already updated plane->state with the new fb pointer, which
-	 * is what the userland daemon reads via drmModeGetPlane. */
-	(void)plane;
-	(void)state;
+	struct asb_device *asb = to_asb(plane->dev);
+	struct drm_plane_state *new_state;
+	struct drm_framebuffer *fb;
+	struct drm_gem_object *obj = NULL;
+	struct dma_buf_attachment *attach = NULL;
+	struct dma_buf *dmabuf = NULL;
+	const char *provenance;
+	const char *creation_path;
+	bool identity_changed;
+	u64 seq, local_count, imported_count, disabled_count, identity_changes;
+
+	/* This callback observes the exact state accepted by the atomic commit,
+	 * rather than racing a later userspace drmModeGetPlane/GetFB2 query. */
+	new_state = drm_atomic_get_new_plane_state(state, plane);
+	fb = new_state ? new_state->fb : NULL;
+	seq = atomic64_inc_return(&asb->c0_seq);
+
+	if (fb)
+		obj = fb->obj[0];
+
+	identity_changed = obj != xchg(&asb->c0_last_obj, obj);
+	if (identity_changed)
+		atomic64_inc(&asb->c0_identity_changes);
+
+	if (!obj) {
+		atomic64_inc(&asb->c0_disabled_count);
+		if (asb_c0_trace &&
+		    (asb_c0_sample_every == 0 || seq % asb_c0_sample_every == 0)) {
+			local_count = atomic64_read(&asb->c0_local_count);
+			imported_count = atomic64_read(&asb->c0_imported_count);
+			disabled_count = atomic64_read(&asb->c0_disabled_count);
+			identity_changes = atomic64_read(&asb->c0_identity_changes);
+			drm_info(plane->dev,
+				 "ASB_C0 seq=%llu fb=none provenance=DISABLED identity_changed=%s local=%llu imported=%llu disabled=%llu changes=%llu\n",
+				 seq, identity_changed ? "yes" : "no",
+				 local_count, imported_count, disabled_count,
+				 identity_changes);
+		}
+		return;
+	}
+
+	attach = obj->import_attach;
+	if (attach)
+		dmabuf = attach->dmabuf;
+
+	if (attach) {
+		atomic64_inc(&asb->c0_imported_count);
+		provenance = "IMPORTED_DMABUF";
+		creation_path = "prime_import";
+	} else {
+		atomic64_inc(&asb->c0_local_count);
+		provenance = "LOCAL";
+		/* The driver installs DRM_GEM_SHMEM_DRIVER_OPS and has no custom
+		 * GEM allocation callback. gem_funcs is logged as a runtime check. */
+		creation_path = "drm_gem_shmem_helpers";
+	}
+
+	if (!asb_c0_trace ||
+	    (asb_c0_sample_every != 0 && seq % asb_c0_sample_every != 0))
+		return;
+	local_count = atomic64_read(&asb->c0_local_count);
+	imported_count = atomic64_read(&asb->c0_imported_count);
+	disabled_count = atomic64_read(&asb->c0_disabled_count);
+	identity_changes = atomic64_read(&asb->c0_identity_changes);
+
+	drm_info(plane->dev,
+		 "ASB_C0 seq=%llu fb_id=%u width=%u height=%u fourcc=0x%08x modifier=0x%016llx pitch0=%u offset0=%u gem_obj=%px gem_size=%zu gem_funcs=%ps import_attach=%px provenance=%s creation_path=%s dmabuf=%px exp_name=%s dmabuf_size=%zu identity_changed=%s local=%llu imported=%llu disabled=%llu changes=%llu\n",
+		 seq, fb->base.id, fb->width, fb->height, fb->format->format,
+		 fb->modifier, fb->pitches[0], fb->offsets[0], obj, obj->size,
+		 obj->funcs, attach, provenance, creation_path, dmabuf,
+		 dmabuf && dmabuf->exp_name ? dmabuf->exp_name : "-",
+		 dmabuf ? dmabuf->size : 0, identity_changed ? "yes" : "no",
+		 local_count, imported_count, disabled_count, identity_changes);
 }
 
 static const struct drm_plane_helper_funcs asb_primary_helper_funcs = {
